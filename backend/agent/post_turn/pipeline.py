@@ -38,6 +38,7 @@ class PostTurnPipeline:
         crystallizer: Optional[Any] = None,
         tool_loop_runner: Optional["ToolLoopRunner"] = None,
         registry: Optional["ToolRegistry"] = None,
+        proposal_store: Optional[Any] = None,
         review_enabled: bool = True,
         review_min_steps: int = 2,
         review_max_iterations: int = 3,
@@ -48,6 +49,7 @@ class PostTurnPipeline:
         self._crystallizer = crystallizer
         self._tool_loop_runner = tool_loop_runner
         self._registry = registry
+        self._proposal_store = proposal_store
         self._review_enabled = review_enabled
         self._review_min_steps = review_min_steps
         self._review_max_iterations = review_max_iterations
@@ -117,6 +119,15 @@ class PostTurnPipeline:
                 "skill_hint": invoked_skill_id or "",
             },
             outcome=outcome,
+        )
+        self._schedule_compose_recipe_proposal(
+            outcome=outcome,
+            safe_text=safe_text,
+            session_id=session_id,
+            platform=platform,
+            user_id=user_id,
+            invoked_skill_id=invoked_skill_id or "",
+            history=history,
         )
         if (
             self._wiki_store is not None
@@ -457,6 +468,59 @@ class PostTurnPipeline:
         )
         self._pending_reviews.add(task)
         task.add_done_callback(self._pending_reviews.discard)
+
+    def _schedule_compose_recipe_proposal(
+        self,
+        *,
+        outcome: "LoopOutcome",
+        safe_text: str,
+        session_id: str,
+        platform: str,
+        user_id: str,
+        invoked_skill_id: str,
+        history: "list[LLMMessage]",
+    ) -> None:
+        if self._proposal_store is None:
+            return
+        if outcome.tool_call_count < 2 and len(outcome.invoked_tool_names) < 2:
+            return
+        try:
+            proposal = self._proposal_store.create(
+                target_type="workflow",
+                action="compose_recipe",
+                payload={
+                    "name": f"{invoked_skill_id or 'turn'}-{session_id.split(':')[-1]}",
+                    "goal": safe_text[:500],
+                    "skill_hint": invoked_skill_id,
+                    "session_id": session_id,
+                    "platform": platform,
+                    "user_id": user_id,
+                    "steps": [
+                        {
+                            "tool": name,
+                            "ok": bool(ok),
+                            "error": error or "",
+                        }
+                        for name, ok, error in outcome.tool_outcomes
+                    ],
+                    "summary": self.summarize_main_turn(history),
+                    "final_text": (outcome.final_text or "")[:2000],
+                },
+                evidence={
+                    "invoked_tools": list(outcome.invoked_tool_names),
+                    "tool_call_count": outcome.tool_call_count,
+                    "session_id": session_id,
+                },
+                confidence=0.65,
+                risk_level="low",
+                source="post_turn",
+            )
+            logger.info(
+                "[evolution] queued compose recipe proposal #{} for session {}",
+                proposal["id"], session_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[evolution] compose recipe proposal skipped: {}", exc)
 
     def _schedule_wiki_write(
         self,

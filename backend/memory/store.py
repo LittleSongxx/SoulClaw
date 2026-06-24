@@ -23,6 +23,8 @@ without dragging ORM proxies out of session.
 """
 from __future__ import annotations
 
+import json
+import re
 from datetime import datetime
 from difflib import SequenceMatcher
 from typing import Any, Iterable, Optional
@@ -30,7 +32,7 @@ from typing import Any, Iterable, Optional
 from loguru import logger
 from sqlalchemy import and_, or_
 
-from ..db.models import UserMemory
+from ..db.models import EpisodicTurn, SemanticMemoryIndex, UserMemory
 from ..db.session import session_scope
 
 # -----------------------------------------------------------------------------
@@ -78,15 +80,51 @@ def _row_to_dict(row: UserMemory) -> dict[str, Any]:
     return {
         "id": row.id,
         "kind": row.kind,
+        "knowledge_base_id": row.knowledge_base_id,
         "content": row.content,
         "source": row.source,
         "pinned": bool(row.pinned),
         "archived": bool(row.archived),
         "recall_count": int(row.recall_count or 0),
+        "importance": float(row.importance or 0.5),
+        "confidence": float(row.confidence or 0.5),
+        "stability": float(row.stability or 0.5),
+        "last_verified_at": row.last_verified_at.isoformat() if row.last_verified_at else None,
+        "supersedes": row.supersedes,
+        "source_turn_id": row.source_turn_id,
+        "metadata": _safe_json_load(row.metadata_json, {}),
         "last_recalled_at": row.last_recalled_at.isoformat() if row.last_recalled_at else None,
         "created_at": row.created_at.isoformat() if row.created_at else None,
         "updated_at": row.updated_at.isoformat() if row.updated_at else None,
     }
+
+
+def _safe_json_dump(value: Any) -> str:
+    try:
+        return json.dumps(value if value is not None else {}, ensure_ascii=False, sort_keys=True)
+    except TypeError:
+        return json.dumps({"repr": repr(value)}, ensure_ascii=False, sort_keys=True)
+
+
+def _safe_json_load(raw: str, default: Any) -> Any:
+    try:
+        parsed = json.loads(raw or "")
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed is not None else default
+
+
+_TERM_RE = re.compile(r"[a-zA-Z0-9_\-]+|[\u4e00-\u9fff]")
+
+
+def _lexical_terms(text: str) -> str:
+    raw = [m.group(0).lower() for m in _TERM_RE.finditer(text or "")]
+    terms = {t for t in raw if len(t) >= 2 or ("\u4e00" <= t <= "\u9fff")}
+    cjk = "".join(t for t in raw if len(t) == 1 and "\u4e00" <= t <= "\u9fff")
+    for n in (2, 3):
+        for i in range(0, max(0, len(cjk) - n + 1)):
+            terms.add(cjk[i:i + n])
+    return " ".join(sorted(terms))
 
 
 # -----------------------------------------------------------------------------
@@ -164,6 +202,7 @@ class MemoryStore:
             # Pinned first → newest first → stable id tiebreak.
             q = q.order_by(
                 UserMemory.pinned.desc(),
+                UserMemory.importance.desc(),
                 UserMemory.created_at.desc(),
                 UserMemory.id.desc(),
             )
@@ -205,6 +244,8 @@ class MemoryStore:
                     )
             q = q.order_by(
                 UserMemory.pinned.desc(),
+                UserMemory.importance.desc(),
+                UserMemory.confidence.desc(),
                 UserMemory.recall_count.desc(),
                 UserMemory.created_at.desc(),
             ).limit(max(1, limit))
@@ -240,6 +281,35 @@ class MemoryStore:
             "max_entries": self._max_entries,
             "max_entry_chars": self._max_entry_chars,
         }
+
+    def record_turn(
+        self,
+        *,
+        user_content: str,
+        assistant_content: str,
+        session_id: str = "",
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> Optional[int]:
+        """Append one episodic turn row for future review mining."""
+        metadata = dict(metadata or {})
+        invoked_tools = metadata.get("invoked_tools") or ()
+        if not isinstance(invoked_tools, (list, tuple)):
+            invoked_tools = [str(invoked_tools)]
+        with session_scope() as session:
+            row = EpisodicTurn(
+                session_id=session_id or "",
+                platform=str(metadata.get("platform") or ""),
+                user_id=str(metadata.get("user_id") or ""),
+                skill_hint=str(metadata.get("skill_hint") or ""),
+                user_content=(user_content or "")[:20_000],
+                assistant_content=(assistant_content or "")[:20_000],
+                invoked_tools_json=_safe_json_dump([str(t) for t in invoked_tools]),
+                metadata_json=_safe_json_dump(metadata),
+            )
+            session.add(row)
+            session.flush()
+            session.refresh(row)
+            return row.id
 
     def compact(self) -> int:
         """Archive old non-pinned agent notes first when over capacity."""
@@ -281,6 +351,12 @@ class MemoryStore:
         source: str = SOURCE_EXPLICIT,
         pinned: bool = False,
         knowledge_base_id: str = "default",
+        importance: float = 0.5,
+        confidence: float = 0.5,
+        stability: float = 0.5,
+        source_turn_id: Optional[str] = None,
+        supersedes: Optional[int] = None,
+        metadata: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         """Insert a new row, enforcing kind/source/length/capacity rules."""
         cleaned = (content or "").strip()
@@ -329,10 +405,17 @@ class MemoryStore:
                 content=cleaned,
                 source=source,
                 pinned=pinned,
+                importance=max(0.0, min(1.0, float(importance))),
+                confidence=max(0.0, min(1.0, float(confidence))),
+                stability=max(0.0, min(1.0, float(stability))),
+                source_turn_id=source_turn_id,
+                supersedes=supersedes,
+                metadata_json=_safe_json_dump(metadata or {}),
             )
             session.add(row)
             session.flush()
             session.refresh(row)
+            self._upsert_semantic_index(session, row)
             return _row_to_dict(row)
 
     def remove(self, memory_id: int, *, allow_pinned: bool = False) -> bool:
@@ -447,6 +530,27 @@ class MemoryStore:
                 "[memory] evicted #{} (kind={} source={} recall={}) — capacity",
                 row.id, row.kind, row.source, row.recall_count,
             )
+
+    def _upsert_semantic_index(self, session, row: UserMemory) -> None:  # noqa: ANN001
+        terms = _lexical_terms(row.content or "")
+        existing = (
+            session.query(SemanticMemoryIndex)
+            .filter(SemanticMemoryIndex.memory_id == row.id)
+            .first()
+        )
+        if existing is None:
+            session.add(SemanticMemoryIndex(
+                memory_id=row.id,
+                embedding_model="lexical-v1",
+                lexical_terms=terms,
+                metadata_json=_safe_json_dump({
+                    "kind": row.kind,
+                    "knowledge_base_id": row.knowledge_base_id,
+                }),
+            ))
+        else:
+            existing.lexical_terms = terms
+            existing.updated_at = datetime.utcnow()
 
     # =================================================================
     # Consolidation (v0.15)

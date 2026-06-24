@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Optional
 
 from croniter import croniter
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 
@@ -155,7 +155,7 @@ def update_job(
     return job
 
 
-@router.delete("/{job_id}", status_code=204)
+@router.delete("/{job_id}", status_code=204, response_class=Response, response_model=None)
 def delete_job(job_id: int, db: Session = Depends(get_db)) -> None:
     job = db.get(CronJob, job_id)
     if job is None:

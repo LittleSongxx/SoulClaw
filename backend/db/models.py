@@ -190,6 +190,16 @@ class UserMemory(Base):
     archived: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     recall_count: Mapped[int] = mapped_column(Integer, default=0)
     last_recalled_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    # v1.3 personal-AI OS metadata. These fields let the memory layer
+    # distinguish durable facts from tentative review output without
+    # changing the existing L1/L2/L3 kind model.
+    importance: Mapped[float] = mapped_column(Float, default=0.5)
+    confidence: Mapped[float] = mapped_column(Float, default=0.5)
+    stability: Mapped[float] = mapped_column(Float, default=0.5)
+    last_verified_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    supersedes: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    source_turn_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True, index=True)
+    metadata_json: Mapped[str] = mapped_column(Text, default="{}")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, default=_utcnow, onupdate=_utcnow,
@@ -245,6 +255,75 @@ class MCPServerRegistration(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, default=_utcnow, onupdate=_utcnow
     )
+
+
+class EpisodicTurn(Base):
+    """Append-only turn log for long-horizon self-review.
+
+    This is intentionally separate from ``user_memories``: turns are
+    evidence, not durable facts. Review jobs can mine this table to
+    propose new memories, wiki facts, or compose recipes without
+    polluting the always-injected memory snapshot.
+    """
+
+    __tablename__ = "episodic_turns"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    session_id: Mapped[str] = mapped_column(String(256), default="", index=True)
+    platform: Mapped[str] = mapped_column(String(32), default="", index=True)
+    user_id: Mapped[str] = mapped_column(String(256), default="", index=True)
+    skill_hint: Mapped[str] = mapped_column(String(128), default="", index=True)
+    user_content: Mapped[str] = mapped_column(Text, default="")
+    assistant_content: Mapped[str] = mapped_column(Text, default="")
+    invoked_tools_json: Mapped[str] = mapped_column(Text, default="[]")
+    metadata_json: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
+
+
+class SemanticMemoryIndex(Base):
+    """Optional semantic sidecar for memory retrieval.
+
+    v1 keeps this dependency-free by storing lexical terms plus an
+    optional JSON embedding payload. Deployments that later add Qdrant,
+    Milvus, or pgvector can treat this row as the durable bookkeeping
+    source while the actual ANN index lives elsewhere.
+    """
+
+    __tablename__ = "semantic_memory_index"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    memory_id: Mapped[int] = mapped_column(Integer, index=True)
+    embedding_model: Mapped[str] = mapped_column(String(128), default="")
+    embedding_json: Mapped[str] = mapped_column(Text, default="[]")
+    lexical_terms: Mapped[str] = mapped_column(Text, default="")
+    metadata_json: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+
+class EvolutionProposal(Base):
+    """Unified review queue for self-evolving memory, skills, wiki, workflows."""
+
+    __tablename__ = "evolution_proposals"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    target_type: Mapped[str] = mapped_column(String(32), index=True)
+    action: Mapped[str] = mapped_column(String(64), index=True)
+    payload_json: Mapped[str] = mapped_column(Text, default="{}")
+    evidence_json: Mapped[str] = mapped_column(Text, default="{}")
+    before_json: Mapped[str] = mapped_column(Text, default="{}")
+    after_json: Mapped[str] = mapped_column(Text, default="{}")
+    result_json: Mapped[str] = mapped_column(Text, default="{}")
+    confidence: Mapped[float] = mapped_column(Float, default=0.5)
+    risk_level: Mapped[str] = mapped_column(String(16), default="medium", index=True)
+    status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
+    source: Mapped[str] = mapped_column(String(64), default="post_turn", index=True)
+    error: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow)
+    reviewed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    applied_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    rolled_back_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
 
 def create_all(engine) -> None:
@@ -518,6 +597,21 @@ def apply_lightweight_migrations(engine) -> None:
         # ── Graph / knowledge base isolation.
         ("user_memories", "knowledge_base_id",
          "knowledge_base_id VARCHAR(64) NOT NULL DEFAULT 'default'"),
+        # v1.3 personal-AI OS memory metadata.
+        ("user_memories", "importance",
+         "importance REAL NOT NULL DEFAULT 0.5"),
+        ("user_memories", "confidence",
+         "confidence REAL NOT NULL DEFAULT 0.5"),
+        ("user_memories", "stability",
+         "stability REAL NOT NULL DEFAULT 0.5"),
+        ("user_memories", "last_verified_at",
+         "last_verified_at DATETIME"),
+        ("user_memories", "supersedes",
+         "supersedes INTEGER"),
+        ("user_memories", "source_turn_id",
+         "source_turn_id VARCHAR(128)"),
+        ("user_memories", "metadata_json",
+         "metadata_json TEXT NOT NULL DEFAULT '{}'"),
         # ── Geo path tagging.  Empty default so existing
         # rows on a pre-v0.39.1 DB are correctly marked as
         # "untagged" rather than NULL.

@@ -126,6 +126,14 @@ class SkillManifest:
     streaming_parallel: int = 1
     rich_output: bool = False
     crystallize: bool = False
+    capabilities: list[str] = field(default_factory=list)
+    inputs: list[str] = field(default_factory=list)
+    outputs: list[str] = field(default_factory=list)
+    required_tools: list[str] = field(default_factory=list)
+    compose_examples: list[dict[str, Any]] = field(default_factory=list)
+    test_cases: list[dict[str, Any]] = field(default_factory=list)
+    approval_level: str = "review"
+    related_skills: list[str] = field(default_factory=list)
 
 
 class SkillLoader:
@@ -339,6 +347,14 @@ class SkillLoader:
         # any truthy value enables. See the SkillManifest docstring
         # for the full lifecycle.
         crystallize = bool(zlagent_meta.get("crystallize", False))
+        capabilities = _string_list(zlagent_meta.get("capabilities"))
+        inputs = _string_list(zlagent_meta.get("inputs"))
+        outputs = _string_list(zlagent_meta.get("outputs"))
+        required_tools = _string_list(zlagent_meta.get("required_tools"))
+        approval_level = str(zlagent_meta.get("approval_level") or "review").strip() or "review"
+        related_skills = _string_list(zlagent_meta.get("related_skills"))
+        compose_examples = _dict_list(zlagent_meta.get("compose_examples"))
+        test_cases = _dict_list(zlagent_meta.get("test_cases"))
         return SkillManifest(
             id=str(meta.get("name") or folder.name),
             name=str(meta.get("name") or folder.name),
@@ -356,6 +372,14 @@ class SkillLoader:
             streaming_parallel=streaming_parallel,
             rich_output=rich_output,
             crystallize=crystallize,
+            capabilities=capabilities,
+            inputs=inputs,
+            outputs=outputs,
+            required_tools=required_tools,
+            compose_examples=compose_examples,
+            test_cases=test_cases,
+            approval_level=approval_level,
+            related_skills=related_skills,
         )
 
     def _load_legacy(self, manifest_path: Path, folder: Path) -> Optional[SkillManifest]:
@@ -385,4 +409,24 @@ class SkillLoader:
             rich_output=bool(data.get("rich_output", False)),
             # ditto for crystallize.
             crystallize=bool(data.get("crystallize", False)),
+            capabilities=_string_list(data.get("capabilities")),
+            inputs=_string_list(data.get("inputs")),
+            outputs=_string_list(data.get("outputs")),
+            required_tools=_string_list(data.get("required_tools")),
+            compose_examples=_dict_list(data.get("compose_examples")),
+            test_cases=_dict_list(data.get("test_cases")),
+            approval_level=str(data.get("approval_level") or "review"),
+            related_skills=_string_list(data.get("related_skills")),
         )
+
+
+def _string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def _dict_list(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [dict(item) for item in value if isinstance(item, dict)]

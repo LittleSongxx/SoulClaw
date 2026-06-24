@@ -176,6 +176,7 @@ class AgentLoop:
         # Defaults to 4; clamped to >=1 by the runner.
         tool_loop_parallel_max_concurrency: int = 4,
         permission_policy: Optional["PermissionPolicy"] = None,
+        proposal_store: Optional[object] = None,
     ) -> None:
         self._llm = llm
         self._registry = tool_registry
@@ -246,6 +247,7 @@ class AgentLoop:
             review_enabled=review_enabled,
             review_min_steps=review_min_steps,
             review_max_iterations=review_max_iterations,
+            proposal_store=proposal_store,
         )
         self._confirmation_flow = ConfirmationFlow(
             store=confirmation_store,

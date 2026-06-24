@@ -335,6 +335,15 @@ class MemoryManager:
                 len(assistant_content or ""), len(assistant_clean),
                 session_id,
             )
+        try:
+            self._store.record_turn(
+                user_content=user_content,
+                assistant_content=assistant_clean,
+                session_id=session_id,
+                metadata=dict(metadata or {}),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[memory] episodic turn log failed: {}", exc)
         for provider in self._providers:
             name = str(getattr(provider, "name", "") or provider.__class__.__name__)
             try:

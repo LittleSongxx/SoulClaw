@@ -7,6 +7,7 @@ from minimal inputs) and to compose well (``web_search`` discovers URLs that
 its own workspace artifacts).
 """
 from .code_execution import CodeExecutionTool
+from .compose_planner import ComposePlannerTool
 from .cron_manage import CronManageTool
 from .delegate_tool import DelegateTool
 from .knowledge_ingest import KnowledgeIngestTool
@@ -23,6 +24,7 @@ from .write_file import WriteFileTool
 
 __all__ = [
     "CodeExecutionTool",
+    "ComposePlannerTool",
     "CronManageTool",
     "DelegateTool",
     "KnowledgeIngestTool",

@@ -97,6 +97,7 @@ def build_agent(
     memory_store: Any,
     wiki_store: Any,
     geo_store: Any,
+    proposal_store: Any = None,
 ) -> AgentLoop:
     failure_learner = build_failure_learner(settings, memory_store)
     tool_guardrails = build_tool_guardrails(settings)
@@ -138,4 +139,5 @@ def build_agent(
         workspace_dir=settings.workspace_dir,
         tool_loop_parallel_max_concurrency=settings.tool_loop_parallel_max_concurrency,
         permission_policy=permission_policy,
+        proposal_store=proposal_store,
     )

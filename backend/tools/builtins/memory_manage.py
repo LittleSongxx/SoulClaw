@@ -25,7 +25,7 @@ from __future__ import annotations
 import re
 from typing import Any, Optional
 
-from ...core.provenance import is_background_review
+from ...core.provenance import get_current_write_origin, is_background_review
 from ...memory.scanner import scan_content
 from ...memory.store import (
     KIND_AGENT_NOTE,
@@ -255,10 +255,12 @@ class MemoryManageTool(Tool):
         store: MemoryStore,
         memory_manager: Optional[Any] = None,
         *,
+        proposal_store: Optional[Any] = None,
         max_fact_chars: int = 280,
     ) -> None:
         self._store = store
         self._memory_manager = memory_manager
+        self._proposal_store = proposal_store
         # v0.45 — hard cap on a single fact entry. Hermes' built-in
         # curator keeps each MEMORY.md / USER.md line under Twitter
         # length so the snapshot fits in the system prompt cheaply.
@@ -378,11 +380,53 @@ class MemoryManageTool(Tool):
             content=stripped,
             source=source,
         )
+        importance, confidence, stability = self._memory_scores(
+            arguments,
+            kind=kind,
+            source=source,
+        )
+        source_turn_id = self._optional_str(arguments.get("source_turn_id"))
+        supersedes = self._optional_int(arguments.get("supersedes"))
+        metadata = arguments.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+        metadata = dict(metadata)
+        metadata.setdefault("write_origin", get_current_write_origin())
+
+        if self._should_propose_mutation():
+            return self._create_memory_proposal(
+                action="remember",
+                payload={
+                    "kind": kind,
+                    "content": stripped,
+                    "source": source,
+                    "knowledge_base_id": knowledge_base_id,
+                    "importance": importance,
+                    "confidence": confidence,
+                    "stability": stability,
+                    "source_turn_id": source_turn_id,
+                    "supersedes": supersedes,
+                    "metadata": metadata,
+                },
+                evidence={
+                    "write_origin": get_current_write_origin(),
+                    "guardrails": ["scan_content", "max_fact_chars", "performative_veto"],
+                },
+                confidence=confidence,
+                risk_level="medium",
+            )
+
         row = self._store.add(
             content,
             kind=kind,
             source=source,
             knowledge_base_id=knowledge_base_id,
+            importance=importance,
+            confidence=confidence,
+            stability=stability,
+            source_turn_id=source_turn_id,
+            supersedes=supersedes,
+            metadata=metadata,
         )
         self._notify_memory_write("add", kind, row["content"], row)
         return ToolResult(
@@ -509,6 +553,21 @@ class MemoryManageTool(Tool):
                     ok=False, content="",
                     error="similarity_threshold must be between 0.5 and 1.0",
                 )
+        if self._should_propose_mutation():
+            return self._create_memory_proposal(
+                action="consolidate",
+                payload={
+                    "kind": kind,
+                    "similarity_threshold": threshold,
+                    "max_pairs": int(arguments.get("max_pairs") or 50),
+                },
+                evidence={
+                    "write_origin": get_current_write_origin(),
+                    "note": "background review requested deterministic memory consolidation",
+                },
+                confidence=0.7,
+                risk_level="medium",
+            )
         report = self._store.consolidate(
             kind=kind, similarity_threshold=threshold,
         )
@@ -567,6 +626,42 @@ class MemoryManageTool(Tool):
         except Exception:
             return
 
+    def _should_propose_mutation(self) -> bool:
+        """Route autonomous review writes through the evolution queue."""
+        return self._proposal_store is not None and is_background_review()
+
+    def _create_memory_proposal(
+        self,
+        *,
+        action: str,
+        payload: dict[str, Any],
+        evidence: dict[str, Any],
+        confidence: float,
+        risk_level: str,
+    ) -> ToolResult:
+        if self._proposal_store is None:
+            return ToolResult(ok=False, content="", error="proposal store unavailable")
+        try:
+            proposal = self._proposal_store.create(
+                target_type="memory",
+                action=action,
+                payload=payload,
+                evidence=evidence,
+                confidence=confidence,
+                risk_level=risk_level,
+                source="memory_manage",
+            )
+        except Exception as exc:  # noqa: BLE001
+            return ToolResult(ok=False, content="", error=f"proposal create failed: {exc}")
+        return ToolResult(
+            ok=True,
+            content=(
+                f"Memory change proposed as review proposal #{proposal['id']} "
+                f"(action={action}, risk={risk_level}). No memory rows were changed."
+            ),
+            raw={"proposal_id": proposal["id"], "proposal": proposal},
+        )
+
     def _infer_knowledge_base_id(
         self,
         *,
@@ -586,6 +681,47 @@ class MemoryManageTool(Tool):
             if any(token in text for token in ("旅游", "旅行", "酒店", "机票", "景点", "攻略")):
                 return "travel"
         return "default"
+
+    @staticmethod
+    def _memory_scores(
+        arguments: dict[str, Any],
+        *,
+        kind: str,
+        source: str,
+    ) -> tuple[float, float, float]:
+        base_importance = 0.7 if kind == KIND_USER_FACT else 0.6
+        base_confidence = 0.8 if source == SOURCE_EXPLICIT else 0.65
+        base_stability = 0.75 if kind == KIND_USER_FACT else 0.55
+        return (
+            MemoryManageTool._float_between(arguments.get("importance"), base_importance),
+            MemoryManageTool._float_between(arguments.get("confidence"), base_confidence),
+            MemoryManageTool._float_between(arguments.get("stability"), base_stability),
+        )
+
+    @staticmethod
+    def _float_between(raw: Any, default: float) -> float:
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            value = default
+        return max(0.0, min(1.0, value))
+
+    @staticmethod
+    def _optional_int(raw: Any) -> Optional[int]:
+        if raw in (None, ""):
+            return None
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+
+    @staticmethod
+    def _optional_str(raw: Any) -> Optional[str]:
+        if raw is None:
+            return None
+        value = str(raw).strip()
+        return value or None
 
     @staticmethod
     def _format_row(row: dict[str, Any]) -> str:

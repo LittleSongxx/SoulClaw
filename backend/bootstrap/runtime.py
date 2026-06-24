@@ -22,6 +22,7 @@ from ..skills.loader import SkillLoader
 from ..tools import ToolRegistry
 from ..tools.builtins import (
     CodeExecutionTool,
+    ComposePlannerTool,
     DelegateTool,
     KnowledgeIngestTool,
     KnowledgeInspectTool,
@@ -56,6 +57,7 @@ class RuntimeContainer:
     memory_store: Any
     memory_manager: Any
     graph_extractor: Any
+    proposal_store: Any
     tool_registry: ToolRegistry
     confirmation_store: ConfirmationStore
     agent: AgentLoop
@@ -94,6 +96,9 @@ async def build_runtime_container(
         redis_backend=redis_backend,
     )
     graph_extractor = _build_graph_extractor(settings, llm_client)
+    from ..evolution import EvolutionProposalStore
+
+    proposal_store = EvolutionProposalStore()
 
     tool_registry = _build_tool_registry(
         settings=settings,
@@ -104,6 +109,7 @@ async def build_runtime_container(
         memory_store=memory_store,
         memory_manager=memory_manager,
         graph_extractor=graph_extractor,
+        proposal_store=proposal_store,
     )
     _register_travel_domain(
         app=app,
@@ -166,6 +172,7 @@ async def build_runtime_container(
         memory_store=memory_store,
         memory_manager=memory_manager,
         graph_extractor=graph_extractor,
+        proposal_store=proposal_store,
         tool_registry=tool_registry,
         confirmation_store=confirmation_store,
         agent=agent,
@@ -233,11 +240,13 @@ def attach_harness_facilities(runtime: RuntimeContainer) -> None:
 
 def bind_runtime_state(app: Any, runtime: RuntimeContainer) -> None:
     """把核心运行时对象写入 FastAPI state。"""
+    app.state.settings = runtime.settings
     app.state.redis_backend = runtime.redis_backend
     app.state.harness = runtime.harness
     app.state.agent = runtime.agent
     app.state.llm = runtime.llm_client
     app.state.graph_extractor = runtime.graph_extractor
+    app.state.proposal_store = runtime.proposal_store
     app.state.tool_registry = runtime.tool_registry
     app.state.confirmation_store = runtime.confirmation_store
     app.state.skill_loader = runtime.skill_loader
@@ -281,6 +290,7 @@ def _build_tool_registry(
     memory_store: Any,
     memory_manager: Any,
     graph_extractor: Any,
+    proposal_store: Any,
 ) -> ToolRegistry:
     """创建并填充核心工具注册表。"""
     tool_registry = ToolRegistry()
@@ -295,6 +305,7 @@ def _build_tool_registry(
                 usage_store=usage_store,
                 history_store=skill_history_store,
                 guard=skill_guard,
+                proposal_store=proposal_store,
             ),
             KnowledgeIngestTool(settings.workspace_dir, graph_extractor=graph_extractor),
             KnowledgeInspectTool(settings.workspace_dir),
@@ -302,7 +313,13 @@ def _build_tool_registry(
             MemoryManageTool(
                 memory_store,
                 memory_manager=memory_manager,
+                proposal_store=proposal_store,
                 max_fact_chars=settings.memory_max_fact_chars,
+            ),
+            ComposePlannerTool(
+                registry=tool_registry,
+                skill_loader=skill_loader,
+                proposal_store=proposal_store,
             ),
             CodeExecutionTool(settings.workspace_dir),
         ]

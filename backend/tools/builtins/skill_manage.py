@@ -63,6 +63,17 @@ MAX_NAME_LENGTH = 64
 MAX_DESCRIPTION_LENGTH = 1024
 ALLOWED_SUBDIRS = ("references", "templates", "scripts", "assets")
 _SKILL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+PROPOSAL_GATED_ACTIONS = frozenset({
+    "create",
+    "edit",
+    "patch",
+    "write_file",
+    "remove_file",
+    "delete",
+    "archive",
+    "import_from_url",
+})
+VALID_ACTIONS = PROPOSAL_GATED_ACTIONS | frozenset({"pin", "unpin"})
 
 
 class SkillManageTool(Tool):
@@ -72,10 +83,9 @@ class SkillManageTool(Tool):
         "Use this for reusable procedures, recurring automations, or fixes worth keeping. "
         "Prefer `patch` for small edits; use `edit` only when replacing the full `SKILL.md`."
     )
-    # Personal-AI mode: the operator owns the skills, so writes don't
-    # need an IM yes/no per turn. Vetting still happens via the
-    # ``skill-vetter`` skill before publishing complex skills, but the
-    # initial CRUD calls are immediate.
+    # Personal-AI OS mode: skill evolution is safe to *propose* from
+    # the agent loop, but writes are applied only after the review API
+    # approves and calls ``apply_approved``.
     permission = ToolPermission.SAFE
     is_read_only = False
     is_concurrency_safe = False
@@ -171,6 +181,16 @@ class SkillManageTool(Tool):
                     " otherwise it is read from the YAML frontmatter."
                 ),
             },
+            "review_mode": {
+                "type": "string",
+                "enum": ["propose", "apply_approved"],
+                "default": "propose",
+                "description": (
+                    "Default propose: create an EvolutionProposal and do not"
+                    " write files. The review API uses apply_approved after"
+                    " an operator approves the proposal."
+                ),
+            },
         },
         "required": ["action", "skill_name"],
     }
@@ -182,6 +202,7 @@ class SkillManageTool(Tool):
         usage_store: Optional[UsageStore] = None,
         history_store: Optional[SkillHistoryStore] = None,
         guard: Optional[SkillGuard] = None,
+        proposal_store: Optional[Any] = None,
     ) -> None:
         self._root = Path(skills_root).resolve()
         self._usage = usage_store
@@ -193,6 +214,7 @@ class SkillManageTool(Tool):
         # so smoke tests that don't pass a guard still pass. Production
         # always wires a SkillGuard with strict-for-agent enabled.
         self._guard = guard
+        self._proposal_store = proposal_store
 
     # -- v0.20 SkillGuard helper ----------------------------------------
 
@@ -301,7 +323,7 @@ class SkillManageTool(Tool):
         return direct
 
     async def execute(self, arguments: dict[str, Any]) -> ToolResult:
-        action = str(arguments.get("action") or "").strip()
+        action = str(arguments.get("action") or "").strip().lower()
         skill_name = str(arguments.get("skill_name") or "").strip()
 
         if not action:
@@ -316,6 +338,16 @@ class SkillManageTool(Tool):
                     " [a-z0-9][a-z0-9._-]{0,63}"
                 ),
             )
+        if action not in VALID_ACTIONS:
+            return ToolResult(ok=False, content="", error=f"unknown action: {action}")
+
+        review_mode = str(arguments.get("review_mode") or "propose").strip().lower()
+        if (
+            self._proposal_store is not None
+            and action in PROPOSAL_GATED_ACTIONS
+            and review_mode != "apply_approved"
+        ):
+            return self._create_skill_proposal(skill_name, action, arguments)
 
         root_resolved = self._root.resolve()
         skill_dir = (root_resolved / skill_name).resolve()
@@ -375,6 +407,53 @@ class SkillManageTool(Tool):
         if action == "import_from_url":
             return await self._import_from_url(skill_name, arguments)
         return ToolResult(ok=False, content="", error=f"unknown action: {action}")
+
+    async def apply_approved(self, arguments: dict[str, Any]) -> ToolResult:
+        """Apply a previously approved proposal without re-proposing it."""
+        args = dict(arguments or {})
+        args["review_mode"] = "apply_approved"
+        return await self.execute(args)
+
+    def _create_skill_proposal(
+        self,
+        skill_name: str,
+        action: str,
+        arguments: dict[str, Any],
+    ) -> ToolResult:
+        if self._proposal_store is None:
+            return ToolResult(ok=False, content="", error="proposal store unavailable")
+        payload = dict(arguments)
+        payload["action"] = action
+        payload["skill_name"] = skill_name
+        payload.pop("review_mode", None)
+        risk = "critical" if action in {"delete", "remove_file"} else "high"
+        if action in {"create", "write_file", "archive", "import_from_url"}:
+            risk = "medium"
+        try:
+            proposal = self._proposal_store.create(
+                target_type="skill",
+                action=action,
+                payload=payload,
+                evidence={
+                    "skill_name": skill_name,
+                    "write_origin": str(get_current_write_origin()),
+                    "note": "skill_manage defaults to proposal-review-apply",
+                },
+                confidence=0.7,
+                risk_level=risk,
+                source="skill_manage",
+            )
+        except Exception as exc:  # noqa: BLE001
+            return ToolResult(ok=False, content="", error=f"proposal create failed: {exc}")
+        return ToolResult(
+            ok=True,
+            content=(
+                f"Skill change proposed as review proposal #{proposal['id']} "
+                f"(action={action}, skill={skill_name}, risk={risk}). "
+                "No files were changed. Approve and apply via /api/review/proposals."
+            ),
+            raw={"proposal_id": proposal["id"], "proposal": proposal},
+        )
 
     # -- v0.11 helpers -------------------------------------------------
 
@@ -984,6 +1063,15 @@ class SkillManageTool(Tool):
         if tags:
             tags_inline = ", ".join(json.dumps(t, ensure_ascii=False) for t in tags)
             lines.append(f"    tags: [{tags_inline}]")
+        lines.append("  zlagent:")
+        lines.append("    capabilities: []")
+        lines.append("    inputs: []")
+        lines.append("    outputs: []")
+        lines.append("    required_tools: []")
+        lines.append("    compose_examples: []")
+        lines.append("    test_cases: []")
+        lines.append("    approval_level: review")
+        lines.append("    related_skills: []")
         lines.append("---")
         lines.append("")
         lines.append(body.rstrip() + "\n")

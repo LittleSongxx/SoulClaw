@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, HTTPException, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
 
 from ..memory.scanner import scan_content
@@ -55,6 +55,12 @@ class MemoryIn(BaseModel):
     content: str = Field(min_length=1, max_length=2000)
     pinned: bool = False
     knowledge_base_id: str = Field(default="default")
+    importance: float = Field(default=0.5, ge=0.0, le=1.0)
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    stability: float = Field(default=0.5, ge=0.0, le=1.0)
+    source_turn_id: Optional[str] = None
+    supersedes: Optional[int] = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class MemoryOut(BaseModel):
@@ -67,6 +73,14 @@ class MemoryOut(BaseModel):
     pinned: bool
     archived: bool
     recall_count: int
+    knowledge_base_id: str = "default"
+    importance: float = 0.5
+    confidence: float = 0.5
+    stability: float = 0.5
+    last_verified_at: Optional[str] = None
+    supersedes: Optional[int] = None
+    source_turn_id: Optional[str] = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
     last_recalled_at: Optional[str] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
@@ -116,6 +130,12 @@ def add_memory(payload: MemoryIn, request: Request) -> dict[str, Any]:
             source=SOURCE_IMPORT,
             pinned=payload.pinned,
             knowledge_base_id=payload.knowledge_base_id,
+            importance=payload.importance,
+            confidence=payload.confidence,
+            stability=payload.stability,
+            source_turn_id=payload.source_turn_id,
+            supersedes=payload.supersedes,
+            metadata=payload.metadata,
         )
     except MemoryError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -167,7 +187,7 @@ def get_memory(memory_id: int, request: Request) -> dict[str, Any]:
     return row
 
 
-@router.delete("/{memory_id}", status_code=204)
+@router.delete("/{memory_id}", status_code=204, response_class=Response, response_model=None)
 def delete_memory(
     memory_id: int,
     request: Request,

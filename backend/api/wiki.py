@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, HTTPException, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
 
 from ..wiki.store import WikiStore
@@ -51,6 +51,13 @@ class WikiEntryOut(BaseModel):
     last_hit_at: Optional[str] = None
     hit_count: int
     expires_at: Optional[str] = None
+    confidence: float = 0.5
+    sources: list[str] = Field(default_factory=list)
+    aliases: list[str] = Field(default_factory=list)
+    superseded_by: Optional[int] = None
+    last_confirmed_at: Optional[str] = None
+    crystal_kind: str = "answer"
+    geo_path: str = ""
 
 
 class WikiListOut(BaseModel):
@@ -63,6 +70,11 @@ class WikiListOut(BaseModel):
 
 class WikiRefreshOut(BaseModel):
     removed: int
+
+
+class WikiExportIn(BaseModel):
+    skill_id: Optional[str] = None
+    limit: int = Field(default=500, ge=1, le=5000)
 
 
 # -----------------------------------------------------------------------------
@@ -84,7 +96,7 @@ def list_entries(
     return WikiListOut(items=items, count=len(items))
 
 
-@router.delete("/{entry_id}", status_code=204)
+@router.delete("/{entry_id}", status_code=204, response_class=Response, response_model=None)
 def delete_entry(entry_id: int, request: Request) -> None:
     removed = _store(request).delete(entry_id)
     if not removed:
@@ -102,5 +114,20 @@ def refresh(request: Request) -> WikiRefreshOut:
     """
     removed = _store(request).expire_stale()
     return WikiRefreshOut(removed=removed)
+
+
+@router.post("/export-durable")
+def export_durable(payload: WikiExportIn, request: Request) -> dict[str, Any]:
+    settings = getattr(request.app.state, "settings", None)
+    if settings is None:
+        raise HTTPException(status_code=503, detail="settings unavailable")
+    from ..wiki.durable_exporter import export_durable_wiki
+
+    return export_durable_wiki(
+        wiki_store=_store(request),
+        knowledge_dir=settings.workspace_dir / "knowledge",
+        skill_id=payload.skill_id,
+        limit=payload.limit,
+    )
 
 

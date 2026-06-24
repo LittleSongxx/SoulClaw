@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 
@@ -85,7 +85,7 @@ def update_target(
     return target
 
 
-@router.delete("/{target_id}", status_code=204)
+@router.delete("/{target_id}", status_code=204, response_class=Response, response_model=None)
 def delete_target(target_id: int, db: Session = Depends(get_db)) -> None:
     target = db.get(DeliveryTarget, target_id)
     if target is None:
