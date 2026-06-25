@@ -14,7 +14,6 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Optional
 
 from loguru import logger
 
@@ -25,7 +24,6 @@ from .policy import (
     SandboxPolicy,
     check_path_under,
 )
-
 
 _ALLOWED_SCRIPT_SUFFIXES = (".py", ".sh")
 
@@ -53,16 +51,16 @@ class HostTaskRuntime(TaskRuntime):
         *,
         kind: str,
         payload: str,
-        policy: Optional[SandboxPolicy] = None,
-        env: Optional[dict[str, str]] = None,
-        cwd: Optional[str] = None,
-        labels: Optional[dict[str, str]] = None,
+        policy: SandboxPolicy | None = None,
+        env: dict[str, str] | None = None,
+        cwd: str | None = None,
+        labels: dict[str, str] | None = None,
     ) -> RuntimeResult:
         pol = policy or DEFAULT_POLICY
         labels = dict(labels or {})
 
         # Resolve the on-disk path from kind/payload ----------------------
-        cleanup_path: Optional[Path] = None
+        cleanup_path: Path | None = None
         try:
             if kind == "script":
                 target = check_path_under(self._workspace_dir, payload)
@@ -113,7 +111,7 @@ class HostTaskRuntime(TaskRuntime):
         run_cwd = str(self._resolve_cwd(cwd))
 
         started = time.monotonic()
-        proc: Optional[asyncio.subprocess.Process] = None
+        proc: asyncio.subprocess.Process | None = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 *argv,
@@ -126,13 +124,13 @@ class HostTaskRuntime(TaskRuntime):
                 stdout_b, stderr_b = await asyncio.wait_for(
                     proc.communicate(), timeout=timeout,
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 # Best-effort terminate then kill.
                 with _suppress():
                     proc.terminate()
                 try:
                     await asyncio.wait_for(proc.wait(), timeout=2.0)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     with _suppress():
                         proc.kill()
                     await proc.wait()
@@ -187,13 +185,13 @@ class HostTaskRuntime(TaskRuntime):
         # Should be unreachable thanks to the suffix check above.
         raise ValueError(f"unsupported extension {suffix!r}")
 
-    def _merged_env(self, env: Optional[dict[str, str]]) -> dict[str, str]:
+    def _merged_env(self, env: dict[str, str] | None) -> dict[str, str]:
         merged = dict(os.environ)
         for key, val in (env or {}).items():
             merged[str(key)] = str(val)
         return merged
 
-    def _resolve_cwd(self, cwd: Optional[str]) -> Path:
+    def _resolve_cwd(self, cwd: str | None) -> Path:
         if cwd is None:
             return self._workspace_dir
         target = check_path_under(self._workspace_dir, cwd)
@@ -214,7 +212,7 @@ def _truncate(data: bytes, limit: int) -> tuple[str, bool]:
 class _suppress:
     """Tiny context manager to swallow exceptions without importing contextlib."""
 
-    def __enter__(self) -> "_suppress":
+    def __enter__(self) -> _suppress:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> bool:

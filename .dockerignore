@@ -19,7 +19,11 @@ data/
 config/local.yaml
 workspace/credentials/
 workspace/files/
-workspace/knowledge/
+workspace/knowledge/*
+!workspace/knowledge/wiki/
+!workspace/knowledge/wiki/**
+frontend/node_modules/
+frontend/dist/
 workspace/knowledge_modes/
 workspace/logs/
 workspace/memory/

@@ -17,13 +17,13 @@ from __future__ import annotations
 
 import abc
 from dataclasses import dataclass, field
-from enum import Enum
-from typing import Any, Optional
+from enum import StrEnum
+from typing import Any
 
 from .policy import SandboxPolicy
 
 
-class RuntimeKind(str, Enum):
+class RuntimeKind(StrEnum):
     """Identifies the concrete runtime flavour."""
 
     HOST = "host"        # in-process subprocess on the same OS
@@ -49,8 +49,8 @@ class RuntimeResult:
     ok: bool = False
     stdout: str = ""
     stderr: str = ""
-    error: Optional[str] = None
-    exit_code: Optional[int] = None
+    error: str | None = None
+    exit_code: int | None = None
     duration_ms: int = 0
     truncated_stdout: bool = False
     truncated_stderr: bool = False
@@ -91,10 +91,10 @@ class TaskRuntime(abc.ABC):
         *,
         kind: str,
         payload: str,
-        policy: Optional[SandboxPolicy] = None,
-        env: Optional[dict[str, str]] = None,
-        cwd: Optional[str] = None,
-        labels: Optional[dict[str, str]] = None,
+        policy: SandboxPolicy | None = None,
+        env: dict[str, str] | None = None,
+        cwd: str | None = None,
+        labels: dict[str, str] | None = None,
     ) -> RuntimeResult:
         """Run ``payload`` under ``policy`` and return a :class:`RuntimeResult`.
 

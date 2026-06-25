@@ -8,6 +8,7 @@ services:
       args:
         PIP_INDEX_URL: ${PIP_INDEX_URL:-}
         APT_MIRROR_URL: ${APT_MIRROR_URL:-}
+        NPM_CONFIG_REGISTRY: ${NPM_CONFIG_REGISTRY:-}
     image: zlagent:local
     container_name: zlagent
     restart: unless-stopped
@@ -26,6 +27,8 @@ services:
         condition: service_healthy
       postgres:
         condition: service_healthy
+      qdrant:
+        condition: service_started
     environment:
       ZLAGENT_HOST: 0.0.0.0
       ZLAGENT_PORT: 8020
@@ -34,13 +37,19 @@ services:
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
       OPENAI_MODEL: ${OPENAI_MODEL:-}
       NPM_CONFIG_REGISTRY: ${NPM_CONFIG_REGISTRY:-}
-      ZLAGENT_REDIS_URL: ${ZLAGENT_REDIS_URL:-redis://redis:6379/0}
+      ZLAGENT_REDIS_URL: redis://redis:6379/0
+      ZLAGENT_DATABASE_URL: postgresql+psycopg://zlagent:zlagent@postgres:5432/zlagent
+      ZLAGENT_QDRANT_URL: http://qdrant:6333
+      ZLAGENT_FASTEMBED_CACHE_DIR: /app/data/fastembed
+      ZLAGENT_ADMIN_USERNAME: ${ZLAGENT_ADMIN_USERNAME:-admin}
+      ZLAGENT_ADMIN_PASSWORD: ${ZLAGENT_ADMIN_PASSWORD:-zlagent-admin}
+      ZLAGENT_JWT_SECRET: ${ZLAGENT_JWT_SECRET:-change-me-for-production}
       ZLAGENT_SEARXNG_URL: ${ZLAGENT_SEARXNG_URL:-}
-      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://zlagent:zlagent@postgres:5432/zlagent}
     env_file:
-      - .env
+      - path: .env
+        required: false
     ports:
-      - "8020:8020"
+      - "${ZLAGENT_HOST_PORT:-8020}:8020"
     volumes:
       - zlagent_data:/app/data
       - zlagent_config:/app/config
@@ -118,9 +127,19 @@ services:
       retries: 10
       start_period: 10s
     ports:
-      - "5432:5432"
+      - "${ZLAGENT_POSTGRES_PORT:-5432}:5432"
     volumes:
       - zlagent_postgres:/var/lib/postgresql/data
+
+  qdrant:
+    image: qdrant/qdrant:v1.12.6
+    container_name: zlagent-qdrant
+    restart: unless-stopped
+    ports:
+      - "${ZLAGENT_QDRANT_HTTP_PORT:-6333}:6333"
+      - "${ZLAGENT_QDRANT_GRPC_PORT:-6334}:6334"
+    volumes:
+      - zlagent_qdrant:/qdrant/storage
 
 volumes:
   zlagent_data:
@@ -129,3 +148,4 @@ volumes:
   zlagent_redis:
   zlagent_packages:
   zlagent_postgres:
+  zlagent_qdrant:

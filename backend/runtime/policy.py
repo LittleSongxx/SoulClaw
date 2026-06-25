@@ -12,10 +12,9 @@ without changing observable behaviour.
 """
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
-
 
 # Hard global ceilings — even an explicit `SandboxPolicy(timeout_seconds=99999)`
 # is clamped to these in the runtime. They mirror v0.10/v0.13 caps so we
@@ -65,7 +64,7 @@ class SandboxPolicy:
     def effective_max_output_bytes(self) -> int:
         return max(1024, min(GLOBAL_OUTPUT_CEILING_BYTES, int(self.max_output_bytes)))
 
-    def with_overrides(self, **changes) -> "SandboxPolicy":
+    def with_overrides(self, **changes) -> SandboxPolicy:
         """Return a copy of self with fields replaced by ``changes``."""
         from dataclasses import replace
         return replace(self, **changes)

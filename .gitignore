@@ -4,6 +4,7 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+node_modules/
 .env
 .env.*
 !.env.example
@@ -19,7 +20,9 @@ data/
 config/local.yaml
 workspace/credentials/
 workspace/files/
-workspace/knowledge/
+workspace/knowledge/*
+!workspace/knowledge/wiki/
+!workspace/knowledge/wiki/**
 workspace/knowledge_modes/
 workspace/logs/
 workspace/memory/

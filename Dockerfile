@@ -2,6 +2,7 @@ FROM python:3.11-slim-bookworm AS runtime
 
 ARG PIP_INDEX_URL
 ARG APT_MIRROR_URL
+ARG NPM_CONFIG_REGISTRY
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -14,6 +15,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     ZLAGENT_CONFIG_DIR=/app/config \
     ZLAGENT_WORKSPACE_DIR=/app/workspace \
     ZLAGENT_PACKAGES_DIR=/app/.packages \
+    ZLAGENT_FASTEMBED_CACHE_DIR=/app/data/fastembed \
     NPM_CONFIG_PREFIX=/app/.packages/npm \
     NPM_CONFIG_IGNORE_SCRIPTS=true \
     NPM_CONFIG_CACHE=/app/.packages/npm-cache \
@@ -93,6 +95,17 @@ RUN if [ -n "$PIP_INDEX_URL" ]; then \
         pip install --no-cache-dir --retries 5 --timeout 120 uv; \
     fi
 
+COPY frontend ./frontend
+RUN if [ -n "${NPM_CONFIG_REGISTRY:-}" ]; then \
+        npm config set registry "$NPM_CONFIG_REGISTRY"; \
+    fi; \
+    if [ -f frontend/package.json ]; then \
+        cd frontend \
+        && NPM_CONFIG_IGNORE_SCRIPTS=false npm install --no-audit --no-fund \
+        && npm run build \
+        && rm -rf node_modules; \
+    fi
+
 RUN groupadd --gid 10001 zlagent \
     && useradd --uid 10001 --gid 10001 --home /app \
         --no-create-home --shell /usr/sbin/nologin zlagent \
@@ -108,10 +121,13 @@ RUN groupadd --gid 10001 zlagent \
 USER root
 
 COPY backend ./backend
+COPY alembic.ini ./alembic.ini
+COPY alembic ./alembic
 COPY workspace ./workspace_seed
 COPY docker-entrypoint.py ./docker-entrypoint.py
-RUN chown -R zlagent:zlagent /app/backend /app/workspace_seed /app/docker-entrypoint.py \
-    && chmod -R u=rwX,go=rX /app/backend /app/workspace_seed \
+RUN chown -R zlagent:zlagent /app/backend /app/alembic /app/alembic.ini /app/frontend /app/workspace_seed /app/docker-entrypoint.py \
+    && chmod -R u=rwX,go=rX /app/backend /app/alembic /app/frontend /app/workspace_seed \
+    && chmod 0444 /app/alembic.ini \
     && chmod 0555 /app/docker-entrypoint.py
 
 USER zlagent
