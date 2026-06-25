@@ -2,7 +2,7 @@ id: example-ping
 name: example-ping
 description: |
   Seed skill used by smoke tests and by humans to verify the skill loader
-  round-trips the legacy `skill.yaml` + `instructions.md` pair correctly.
+  round-trips the `skill.yaml` + `instructions.md` pair correctly.
 tags:
   - example
   - smoke

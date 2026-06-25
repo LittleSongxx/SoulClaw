@@ -4,9 +4,8 @@ description: >
   Generate a single rich-card travel itinerary on demand. The user names a
   destination plus a duration ("<DEST>三日游", "<DEST>赏樱攻略", "<DEST>美食推荐")
   and the agent returns ONE structured RichMessage covering route, food,
-  transport, stay, budget, pitfalls, and packing. v0.38 replaced the
-  v0.37.5 multi-section streaming flow with a single rich-content card,
-  which (a) avoids WeChat rate limits (used to fan out 6+ messages),
+  transport, stay, budget, pitfalls, and packing. The single rich-content
+  card avoids WeChat rate limits that can be triggered by multi-message output,
   (b) renders as a clean markdown card on wecom_bot, (c) renders as
   CJK-aligned plain text on weixin (no more broken markdown tables).
 version: 0.3.0
@@ -82,18 +81,13 @@ metadata:
       # accurate a month from now. The ttl_days alias is recognized
       # by the loader and converted to seconds.
       ttl_days: 30
-    # v0.38 — opt into RichMessage output. The agent loop appends the
-    # ``rich-content`` fence protocol to the system prompt, parses
-    # the LLM's structured payload, and dispatches it through each
-    # gateway's native renderer (wecom_bot markdown card, weixin
-    # CJK-aligned plain text, etc). Token-level streaming is
-    # automatically suppressed for this skill so the user never sees
-    # a half-rendered JSON fence mid-stream. The v0.37.5 multi-
-    # section streaming has been retired for travel-guide because
-    # it fanned out 6+ messages and tripped WeChat rate limits.
+    # RichMessage output: the agent parses the LLM's structured payload
+    # and dispatches it through each gateway's native renderer. Token-level
+    # streaming is suppressed for this skill so users never see a
+    # half-rendered JSON fence mid-stream.
     rich_output: true
-    # v0.39 — atomic-fact crystallization. After each successful
-    # answer is written to the wiki, a small follow-up LLM call
+    # Atomic-fact crystallization. After each successful answer is
+    # written to the Wiki, a small follow-up LLM call
     # extracts 3-5 atomic facts ("京沪高铁约 4.5 小时" / "二等座
     # 553-650 元") and stores each as its own atomic_fact wiki
     # row. Future short queries hit the atomic row directly without

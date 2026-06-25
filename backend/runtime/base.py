@@ -1,10 +1,10 @@
 """Abstract :class:`TaskRuntime` and :class:`RuntimeResult`.
 
 Common interface for executing scripts / inline snippets under a
-:class:`SandboxPolicy`. v0.25 ships only the host (in-process)
-implementation; future flavours (docker, e2b, firecracker) plug into
+:class:`SandboxPolicy`. The current runtime ships a host (in-process)
+implementation; future flavours (docker, e2b, firecracker) can plug into
 the same protocol so the call sites in ``pre_script`` / ``code_execution``
-stay unchanged when the sandbox flavour rotates.
+the same protocol.
 
 Interface intentionally narrow: ``execute(kind, payload, policy, ...)``
 returns a :class:`RuntimeResult` and never raises into the caller —
@@ -100,7 +100,7 @@ class TaskRuntime(abc.ABC):
 
         ``kind``:
           * ``"script"``  — ``payload`` is a workspace-relative path
-            (e.g. ``"scripts/digest.py"``).
+            to an operator-managed file.
           * ``"snippet"`` — ``payload`` is the full source to execute.
 
         ``env`` is merged with the host env by the runtime; concrete

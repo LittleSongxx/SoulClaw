@@ -30,17 +30,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# v0.35 — Install Node.js LTS so the mcp-discovery skill can shell out
-# to ``npx -y mcporter ...`` and to the broader npm-distributed MCP
-# server ecosystem (``@modelcontextprotocol/server-*``, ``mcp-*``).
-# v0.45.1 — bumped from Bookworm-default 18.x to NodeSource Node 20
-# LTS so MCP packages declaring ``engines: { node: '20 || >=22' }``
-# (e.g. @kevinwatt/yt-dlp-mcp, lru-cache v11, rimraf v6) stop printing
-# EBADENGINE warnings. v0.45.1 also adds ffmpeg (used by yt-dlp to mux
-# audio/video) and creates /app/Downloads so the yt-dlp MCP server
-# passes its boot-time validateConfig() check.
-# Layer placed BEFORE the Python deps + app code so a
-# requirements.txt or backend/* change doesn't bust this cache.
+# Install Node.js LTS so the mcp-discovery skill can shell out to
+# ``npx -y mcporter ...`` and the broader npm-distributed MCP server
+# ecosystem. ffmpeg is included for media-oriented MCP servers, and
+# /app/Downloads exists for servers that validate a download directory
+# at startup. This layer sits before app code to keep rebuilds fast.
 #
 # APT_MIRROR_URL build-arg follows the PIP_INDEX_URL pattern: pass it
 # from a network where the default Debian mirrors are slow or
@@ -84,11 +78,8 @@ RUN if [ -n "$PIP_INDEX_URL" ]; then \
         pip install --no-cache-dir --retries 5 --timeout 120 -r requirements.txt; \
     fi
 
-# v1.1.0 — Pre-install ``uv`` (and therefore ``uvx``) into the system
-# Python so the MCP install tool can manage Python-flavour MCP servers
-# without an extra bootstrap roundtrip. Lives in /usr/local/bin which is
-# already on PATH for every user. The ``uvx`` command resolves to ``uv
-# tool run`` under the hood; both binaries land here.
+# Pre-install ``uv`` and ``uvx`` so Python-flavour MCP servers can be
+# managed without an extra bootstrap roundtrip.
 RUN if [ -n "$PIP_INDEX_URL" ]; then \
         pip install --no-cache-dir --retries 5 --timeout 120 -i "$PIP_INDEX_URL" uv; \
     else \
@@ -115,9 +106,8 @@ RUN groupadd --gid 10001 zlagent \
         /app/.packages/uv-cache /app/.packages/uv/tools /app/.packages/uv/python \
     && chown -R zlagent:zlagent /app/data /app/config /app/workspace /app/Downloads /app/.packages
 
-# v1.1.0 — Keep build layers lean. MCP servers can be installed at
-# runtime into the persisted /app/.packages volume via mcp_manage,
-# which avoids a large and slow Docker build layer here.
+# Keep build layers lean. MCP servers can be installed at runtime into
+# the persisted /app/.packages volume, avoiding a large build layer.
 USER root
 
 COPY backend ./backend

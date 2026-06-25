@@ -1,4 +1,4 @@
-"""SQLAlchemy models for the v2 Postgres schema."""
+"""SQLAlchemy models for the ZLAgent Postgres schema."""
 
 from __future__ import annotations
 

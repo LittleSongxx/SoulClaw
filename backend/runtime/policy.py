@@ -6,9 +6,8 @@ directories, network policy hint, allow/deny tool lists. The bag does
 not by itself enforce anything; runtimes call :func:`check_path` and
 their own check helpers to apply each rule.
 
-Defaults match the existing v0.10 ``pre_script`` / v0.13
-``code_execution`` semantics so v0.25.1 can swap them onto the runtime
-without changing observable behaviour.
+Defaults keep execution bounded without widening the local runtime's
+attack surface.
 """
 from __future__ import annotations
 
@@ -17,8 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 # Hard global ceilings — even an explicit `SandboxPolicy(timeout_seconds=99999)`
-# is clamped to these in the runtime. They mirror v0.10/v0.13 caps so we
-# don't accidentally widen the attack surface by introducing the runtime.
+# is clamped to these in the runtime.
 GLOBAL_TIMEOUT_CEILING_SECONDS = 300
 GLOBAL_OUTPUT_CEILING_BYTES = 256 * 1024
 
@@ -42,7 +40,7 @@ class SandboxPolicy:
     max_output_bytes: int = 64 * 1024
     allow_network: bool = True
     # Paths the script may write to. Empty tuple = enforced read-only
-    # (the runtime caller decides whether to actually enforce it; v0.25
+    # (the runtime caller decides whether to actually enforce it; this
     # records the intent without filesystem-level locking, since real
     # path locking needs a docker/seccomp later).
     writable_paths: tuple[str, ...] = ()

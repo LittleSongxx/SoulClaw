@@ -1,4 +1,4 @@
-"""Platform settings for the greenfield v2 runtime."""
+"""Platform settings for the current ZLAgent runtime."""
 
 from __future__ import annotations
 
@@ -12,8 +12,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     """Runtime configuration loaded from environment and `.env`.
 
-    The canonical v2 variables use the `ZLAGENT_` prefix. `DATABASE_URL`
-    remains accepted as a compatibility alias, but docs and compose use
+    The canonical variables use the `ZLAGENT_` prefix. `DATABASE_URL`
+    remains accepted as a backup alias, but docs and compose use
     `ZLAGENT_DATABASE_URL`.
     """
 
@@ -30,6 +30,8 @@ class Settings(BaseSettings):
     port: int = 8020
     log_level: str = "INFO"
     auto_migrate: bool = True
+    bootstrap_wiki_on_startup: bool = True
+    bootstrap_skills_on_startup: bool = True
 
     data_dir: Path = Path("data")
     config_dir: Path = Path("config")
@@ -71,6 +73,12 @@ class Settings(BaseSettings):
     mcp_refresh_on_startup: bool = True
     mcp_discovery_timeout_seconds: float = 8.0
     mcp_call_timeout_seconds: float = 60.0
+
+    dream_review_enabled: bool = True
+    dream_review_cron: str = "30 3 * * *"
+    dream_review_timezone: str = "Asia/Shanghai"
+    dream_review_window_hours: int = 24
+    dream_review_limit: int = 50
 
     @field_validator("data_dir", "config_dir", "workspace_dir", "packages_dir", "fastembed_cache_dir", mode="before")
     @classmethod

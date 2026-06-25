@@ -1,4 +1,4 @@
-"""Tool registry, safety floor, and auditable execution for v2 runtime."""
+"""Tool registry, safety floor, and auditable execution for ZLAgent."""
 
 from __future__ import annotations
 

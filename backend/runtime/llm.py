@@ -1,4 +1,4 @@
-"""OpenAI-compatible chat client for the v2 runtime."""
+"""OpenAI-compatible chat client for the ZLAgent runtime."""
 
 from __future__ import annotations
 

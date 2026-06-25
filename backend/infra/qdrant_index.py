@@ -54,6 +54,16 @@ class QdrantHybridIndex:
             self._client = client
         return self._client
 
+    def health(self) -> dict[str, Any]:
+        if not self.enabled:
+            return {"enabled": False, "available": False, "status": "disabled", "error": ""}
+        try:
+            client = self._get_client()
+            client.get_collections()
+        except Exception as exc:  # noqa: BLE001
+            return {"enabled": True, "available": False, "status": "degraded", "error": str(exc)}
+        return {"enabled": True, "available": True, "status": "available", "error": ""}
+
     def _ensure_models(self) -> Any:
         client = self._get_client()
         if not self._models_configured:

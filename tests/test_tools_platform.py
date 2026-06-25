@@ -48,6 +48,9 @@ class FakeDB:
                 item.id = uuid.uuid4()
 
     def scalar(self, statement):
+        text = str(statement)
+        if "cron_jobs" in text:
+            return next((item for item in self.objects if item.__class__.__name__ == "CronJob"), None)
         return None
 
 
@@ -106,6 +109,36 @@ def test_platform_cron_upsert_sets_next_run_when_enabled() -> None:
     job = service.upsert_cron_job(db, name="daily", cron_expr="0 3 * * *", enabled=True)
 
     assert job.next_run_at is not None
+
+
+def test_platform_system_cron_preserves_disabled_state() -> None:
+    db = FakeDB()
+    service = PlatformService()
+    job = service.ensure_system_cron_job(
+        db,
+        name="system-dream-review",
+        cron_expr="30 3 * * *",
+        timezone="Asia/Shanghai",
+        instruction="Run Dream review.",
+        metadata={"system_task": "dream_review"},
+        enabled=True,
+    )
+    job.enabled = False
+    job.next_run_at = None
+
+    updated = service.ensure_system_cron_job(
+        db,
+        name="system-dream-review",
+        cron_expr="30 3 * * *",
+        timezone="Asia/Shanghai",
+        instruction="Run Dream review.",
+        metadata={"system_task": "dream_review"},
+        enabled=True,
+    )
+
+    assert updated is job
+    assert updated.enabled is False
+    assert updated.next_run_at is None
 
 
 def test_tool_executor_creates_approval_for_gated_tool() -> None:

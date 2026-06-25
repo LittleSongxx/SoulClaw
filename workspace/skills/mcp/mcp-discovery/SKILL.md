@@ -4,7 +4,7 @@ description: |
   When the user wants something the agent doesn't have a tool for yet
   (travel planning, GitHub issues, Linear, weather, filesystem, ...),
   search the live MCP ecosystem for an existing server, propose
-  installing it, and on confirm wire it up via mcp_manage. Adapted from
+  installing it, and on confirm wire it up through the MCP control plane. Adapted from
   Hermes' mcporter skill — same flow, ZLAgent-tool-aware.
 version: 0.1.0
 tags:
@@ -21,7 +21,7 @@ metadata:
       # / English text is negligible.)
       - MCP
       - mcp server
-      - mcp_manage
+      - MCP control plane
       # Action verbs that fire when user hints at extending capability.
       - 接入
       - 装一个
@@ -63,7 +63,7 @@ Do NOT use this skill when:
   first; only fall back to discovery if it's clearly the wrong fit.
 - The user explicitly named the MCP server they want
   (`帮我装 GitHub MCP`). In that case skip discovery and go straight
-  to `mcp_manage(action='add', ...)`.
+  to the MCP server add flow.
 - The capability is about reading the user's local disk, secrets, or
   payment systems. Refuse and explain.
 - The host is offline (no internet) and you've already failed to
@@ -72,10 +72,10 @@ Do NOT use this skill when:
 ## Iron Law
 
 **Never install without a confirmation.** Discovery is read-only and
-cheap; install is destructive (spawns a subprocess, touches the
-registry, persists to SQLite). Always show the user the candidate +
-the install command, then call `mcp_manage(action='add', ...)` which
-itself triggers a `confirm` permission check.
+cheap; install is mutating (spawns a subprocess, touches the registry,
+and persists server state). Always show the user the candidate and the
+install command, then use the MCP control plane so Approval can guard
+the change.
 
 **Never install with secrets the user did not give you.** If a server
 needs an API key, ask once, with a clear note about where it goes
@@ -175,15 +175,14 @@ needs an API key, ask once, with a clear note about where it goes
 
 ### Phase 4 — Install
 
-The v1.1.0 workflow has **three logical steps**: `install` → `add` →
-optional `promote`. Each is a separate `mcp_manage` action; this
-decoupling means a failed install doesn't leave the registry
-half-attached.
+The workflow has **three logical steps**: `install` → `add` →
+optional `promote`. Keep them decoupled so a failed install doesn't
+leave the registry half-attached.
 
 **Shortcut**: when you have both the package name AND the desired
-server `name` / `command`, prefer `mcp_manage(action='install_and_add')`
-— it does steps 8 and 9 in a single yes/no with the same validation
-guards. Skip to step 10 after it succeeds. Use the long-form
+server `name` / `command`, prefer the combined install-and-add path.
+It does steps 8 and 9 in a single Approval flow with the same
+validation guards. Skip to step 10 after it succeeds. Use the long-form
 install → add path only when you want to inspect the install output
 before deciding whether to attach.
 
@@ -201,9 +200,7 @@ before deciding whether to attach.
      `https://github.com/sugarforever/amap-mcp-server`).
 
    ```text
-   mcp_manage(action='install',
-              package_manager='npm',
-              package='@modelcontextprotocol/server-filesystem')
+   Add an MCP server proposal for @modelcontextprotocol/server-filesystem.
    ```
 
    ZLAgent will pop a confirm prompt; the user replies `yes`. The
@@ -227,8 +224,7 @@ before deciding whether to attach.
 
 9. **Second**, attach the now-installed binary. Translate the install
    command (which is in CLI form like
-   `npx -y @modelcontextprotocol/server-X`) into `mcp_manage(add)`
-   arguments:
+   `npx -y @modelcontextprotocol/server-X`) into MCP server fields:
 
    - `transport='stdio'`
    - `command='@modelcontextprotocol/server-filesystem'` (the binary
@@ -237,23 +233,22 @@ before deciding whether to attach.
      when the binary is already on PATH from step 8; for `npx` it's
      `['-y', '@modelcontextprotocol/server-X']`.
    - `env={...}` — only the env vars the user explicitly authorised.
-     **Do not** fill in NODE_OPTIONS, PYTHONSTARTUP, or anything in
-     v0.34.1's blocklist; ZLAgent's validator will refuse those.
+     **Do not** fill in dangerous process-control env vars such as
+     NODE_OPTIONS or PYTHONSTARTUP.
    - `description` — operator-supplied, plain ASCII, ≤ 80 chars.
    - `tool_override_permission` — only for tools the user explicitly
      said are read-only and should be auto-allowed.
 
-   Call `mcp_manage(action='add', ...)`. ZLAgent will pop another
-   confirm prompt; the user replies `yes`. The server then spawns, the
-   wrapper tools become live, and the next agent turn can call them.
+   Add the server through the MCP control plane. ZLAgent records the
+   server definition, refreshes discovery, and exposes wrapper tools
+   after the server connects.
 
 10. **Third (optional)**, if the server's tools are mostly query / read
     operations (maps, search, get, list, find), promote them to `safe`
     so each call doesn't ask the user yes/no:
 
     ```text
-    mcp_manage(action='promote', name='filesystem',
-               tool_pattern='read_*', permission='safe')
+    Promote the filesystem read tools to the safe permission tier.
     ```
 
     Glob `*` is allowed but **only use it when every tool is
@@ -267,14 +262,13 @@ before deciding whether to attach.
 
 ### Phase 5 — Verify
 
-11. After install + add, immediately call
-    `mcp_manage(action='inspect', name='<server>')` to confirm:
+11. After install + add, immediately inspect the server to confirm:
     - `connected: true`
     - the expected tools are listed
     - the override permissions stuck
 
-12. If anything looks wrong (`connected: false`, missing tools), call
-    `mcp_manage(action='remove', name='<server>')` to roll back, and
+12. If anything looks wrong (`connected: false`, missing tools), remove
+    the server definition to roll back, and
     tell the user what failed (usually: missing env var, network
     issue, or version mismatch). The installed package itself is left
     on disk; if you want to reclaim space, the operator can shell into
@@ -286,12 +280,12 @@ before deciding whether to attach.
 
 ## Verification
 
-- The user agreed to the install before `mcp_manage(action='add')` was
+- The user agreed to the install before the MCP server add flow was
   called.
 - The server's `connected` is `true` after install.
 - At least one wrapper tool with the expected `mcp__<name>__<tool>`
   shape is in the registry.
-- No env keys from the v0.34.1 blocklist were passed.
+- No dangerous env keys were passed.
 - The original user request can now proceed (e.g., agent can actually
   call `mcp__google_maps__directions` for the travel question).
 

@@ -94,6 +94,37 @@ class PlatformService:
             self.events.emit("cron.upsert", {"name": name, "enabled": enabled})
         return job
 
+    def ensure_system_cron_job(
+        self,
+        db: Session,
+        *,
+        name: str,
+        cron_expr: str,
+        timezone: str,
+        instruction: str,
+        metadata: dict[str, Any],
+        enabled: bool = True,
+    ) -> CronJob:
+        if not croniter.is_valid(cron_expr):
+            raise ValueError("invalid cron expression")
+        job = db.scalar(select(CronJob).where(CronJob.name == name))
+        if job is None:
+            job = CronJob(name=name, cron_expr=cron_expr)
+            db.add(job)
+            job.enabled = enabled
+            job.next_run_at = compute_next_run(cron_expr, timezone) if enabled else None
+        schedule_changed = job.cron_expr != cron_expr or job.timezone != timezone
+        job.cron_expr = cron_expr
+        job.timezone = timezone
+        job.instruction = instruction
+        job.metadata_json = metadata
+        if job.enabled and (schedule_changed or job.next_run_at is None):
+            job.next_run_at = compute_next_run(cron_expr, timezone)
+        db.flush()
+        if self.events:
+            self.events.emit("cron.system.ensure", {"name": name, "enabled": job.enabled})
+        return job
+
     def list_mcp_servers(self, db: Session, *, enabled: bool | None = None, limit: int = 100) -> list[MCPServer]:
         stmt = select(MCPServer).order_by(MCPServer.name).limit(max(1, min(limit, 500)))
         if enabled is not None:

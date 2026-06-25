@@ -83,6 +83,14 @@ const lastTurn = ref<Record<string, unknown> | null>(null);
 
 const loggedIn = computed(() => Boolean(token.value));
 const pageTitle = computed(() => navItems.find((item) => item.key === active.value)?.label || "Dashboard");
+const qdrantLabel = computed(() => {
+  if (!settingsData.value.qdrant_enabled) return "Off";
+  return settingsData.value.qdrant_available ? "Available" : "Degraded";
+});
+const dreamLabel = computed(() => {
+  if (!settingsData.value.dream_review_enabled) return "Off";
+  return settingsData.value.dream_review_job_enabled ? "Scheduled" : "Not scheduled";
+});
 const displayedWikiItems = computed(() => {
   const items = wikiSearchResults.value.length ? wikiSearchResults.value : wikiPages.value;
   return items.map((item) => {
@@ -325,7 +333,11 @@ onMounted(refreshAll);
           </article>
           <article>
             <span>Qdrant</span>
-            <strong>{{ settingsData.qdrant_enabled ? "On" : "Off" }}</strong>
+            <strong>{{ qdrantLabel }}</strong>
+          </article>
+          <article>
+            <span>Dream Review</span>
+            <strong>{{ dreamLabel }}</strong>
           </article>
         </div>
         <section class="tool-surface">

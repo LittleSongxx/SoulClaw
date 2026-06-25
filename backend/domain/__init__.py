@@ -1,2 +1,1 @@
-"""Domain services for ZLAgent v2."""
-
+"""Domain services for ZLAgent."""

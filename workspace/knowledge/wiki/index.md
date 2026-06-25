@@ -6,7 +6,7 @@ tags:
   - zlagent
   - platform
 confidence: 0.8
-summary: ZLAgent v2 uses Markdown as the authoritative LLM Wiki source and rebuilds Postgres and Qdrant indexes from it.
+summary: ZLAgent uses Markdown as the authoritative LLM Wiki source and rebuilds Postgres and Qdrant indexes from it.
 ---
 
 # ZLAgent Platform Wiki
@@ -19,4 +19,3 @@ The compiler mirrors page metadata, links, compile status, and error-book record
 - Keep human-authored knowledge in Markdown.
 - Treat Postgres and Qdrant as rebuildable mirrors.
 - Use links such as [[index]] to form an explicit knowledge graph.
-

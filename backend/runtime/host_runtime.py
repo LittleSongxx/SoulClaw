@@ -1,9 +1,9 @@
 """Concrete :class:`HostTaskRuntime` — runs scripts / snippets in-process.
 
-Mirrors the v0.10 ``pre_script`` runner's hard caps: bounded timeout,
-bounded stdout, extension allowlist, workspace-relative path, no
-shell expansion. A snippet path is wrapped in a temporary file before
-execution so the same path-validation rules can apply uniformly.
+Uses bounded timeout, bounded stdout, extension allowlist,
+workspace-relative paths, and no shell expansion. A snippet path is
+wrapped in a temporary file before execution so the same path-validation
+rules can apply uniformly.
 """
 from __future__ import annotations
 

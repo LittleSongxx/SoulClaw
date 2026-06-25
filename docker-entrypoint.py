@@ -23,7 +23,7 @@ def copy_missing_tree(src: Path, dst: Path) -> int:
     """Merge ``src`` into ``dst`` without overwriting existing files.
 
     Recurses into directories that already exist in the destination so that
-    newly-shipped seed content (e.g. v0.7's ``skills/arxiv/``) lands in a
+            newly-shipped seed content (for example ``skills/arxiv/``) lands in a
     workspace that was created by an older image and already has
     ``skills/example-ping/``.
     """

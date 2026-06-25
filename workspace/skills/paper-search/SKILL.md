@@ -122,8 +122,8 @@ Resolve from the user message before fetching:
 
 - Semantic Scholar 429 is common; honour the `Retry-After` header
   and degrade silently to arxiv-only.
-- DDG / Bing captcha will trigger the v0.45 provider chain in
-  `web_search`; if all 3 web providers fail, fall back to whatever
+- DDG / Bing captcha can make `web_search` unreliable; if all web
+  providers fail, fall back to whatever
   arxiv + S2 produced even if `< count`.
 - "顶刊" sometimes means **journal** (TPAMI / TMLR) and "顶会" means
   **conference** (CVPR / NeurIPS); when the user uses both,

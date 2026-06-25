@@ -4,9 +4,7 @@ Public re-exports so callers can write::
 
     from backend.runtime import TaskRuntime, SandboxPolicy, HostTaskRuntime
 
-without caring which submodule a name lives in. v0.25.1 will route
-``pre_script`` / ``code_execution`` through these abstractions; v0.25
-delivers the surface only.
+without caring which submodule a name lives in.
 """
 from .base import RuntimeKind, RuntimeResult, TaskRuntime
 from .host_runtime import HostTaskRuntime

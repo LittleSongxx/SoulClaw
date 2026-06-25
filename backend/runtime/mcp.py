@@ -1,4 +1,4 @@
-"""MCP discovery and transient tool execution for the v2 runtime."""
+"""MCP discovery and transient tool execution for the ZLAgent runtime."""
 
 from __future__ import annotations
 
@@ -67,7 +67,7 @@ def safe_tool_token(value: str) -> str:
 
 
 class MCPRuntimeManager:
-    """Discovers MCP tools from configured servers and exposes v2 tool wrappers.
+    """Discovers MCP tools from configured servers and exposes tool wrappers.
 
     Connections are intentionally transient in this cut. Discovery stores a
     cache in Postgres; execution opens a fresh MCP client session, calls one

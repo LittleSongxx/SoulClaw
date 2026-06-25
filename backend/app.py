@@ -1,4 +1,4 @@
-"""FastAPI entry point for the ZLAgent v2 platform runtime."""
+"""FastAPI entry point for the ZLAgent platform runtime."""
 
 from __future__ import annotations
 
@@ -82,7 +82,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     gateway_runtime = GatewayRuntimeManager(agent=agent_runtime, events=events)
     tool_registry.install_gateway(gateway_runtime)
     dream_runtime = DreamRuntime(skills=skill_service, events=events)
-    cron_scheduler = CronScheduler(agent=agent_runtime, events=events)
+    cron_scheduler = CronScheduler(agent=agent_runtime, dream=dream_runtime, events=events)
 
     app.state.settings = settings
     app.state.event_bus = events
@@ -102,6 +102,41 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.cron_scheduler = cron_scheduler
 
     events.emit("runtime.started", {"version": __version__, "environment": settings.environment})
+    with session_scope() as db:
+        if settings.bootstrap_wiki_on_startup:
+            try:
+                result = wiki_service.compile(db)
+                events.emit("wiki.bootstrap.succeeded", result)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[wiki] startup compile failed: {}", exc)
+                events.emit("wiki.bootstrap.failed", {"error": str(exc)}, severity="warning")
+        if settings.bootstrap_skills_on_startup:
+            try:
+                result = skill_service.scan(db)
+                events.emit("skills.bootstrap.succeeded", result)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[skills] startup scan failed: {}", exc)
+                events.emit("skills.bootstrap.failed", {"error": str(exc)}, severity="warning")
+        if settings.dream_review_enabled:
+            try:
+                platform_service.ensure_system_cron_job(
+                    db,
+                    name="system-dream-review",
+                    cron_expr=settings.dream_review_cron,
+                    timezone=settings.dream_review_timezone,
+                    instruction="Run Dream review and create pending improvement proposals.",
+                    metadata={
+                        "system_task": "dream_review",
+                        "managed_by": "zlagent",
+                        "window_hours": settings.dream_review_window_hours,
+                        "limit": settings.dream_review_limit,
+                        "auto_apply": False,
+                    },
+                    enabled=True,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[dream] startup cron ensure failed: {}", exc)
+                events.emit("dream.bootstrap.failed", {"error": str(exc)}, severity="warning")
     cron_scheduler.schedule_missing()
     cron_scheduler.start()
     try:

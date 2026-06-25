@@ -135,7 +135,7 @@ class GatewayRuntimeManager:
                 response = client.post(url, json=payload)
                 response.raise_for_status()
             return {"mode": "http_post", "status_code": response.status_code}
-        raise NotImplementedError(f"gateway kind '{gateway.kind}' is configured but no v2 outbound adapter is active")
+        raise NotImplementedError(f"gateway kind '{gateway.kind}' is configured but no outbound adapter is active")
 
     @staticmethod
     def _session_id(gateway_name: str, channel_id: str, external_user_id: str) -> str:

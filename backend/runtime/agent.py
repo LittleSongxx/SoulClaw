@@ -1,4 +1,4 @@
-"""Minimal v2 agent turn pipeline."""
+"""Minimal agent turn pipeline."""
 
 import json
 import uuid
@@ -126,7 +126,7 @@ class AgentRuntime:
             {
                 "role": "system",
                 "content": (
-                    "You are ZLAgent v2. Use retrieved Wiki and Memory context. "
+                    "You are ZLAgent. Use retrieved Wiki and Memory context. "
                     "Call tools only when they materially improve the answer."
                 ),
             },
@@ -201,7 +201,7 @@ class AgentRuntime:
         memory_context: dict[str, Any],
         tool_results: list[dict[str, Any]],
     ) -> str:
-        parts = ["ZLAgent v2 runtime is online."]
+        parts = ["ZLAgent runtime is online."]
         if wiki_hits:
             parts.append(f"Retrieved {len(wiki_hits)} Wiki item(s).")
         dynamic_memory = memory_context.get("dynamic", [])

@@ -1,6 +1,6 @@
 # example-ping
 
-This is the seed skill bundled with ZLAgent. It exercises the legacy
+This is the seed skill bundled with ZLAgent. It exercises the
 `skill.yaml` + `instructions.md` loader path and gives humans a known-good
 reference for the on-disk layout.
 

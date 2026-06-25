@@ -1,2 +1,1 @@
-"""Infrastructure adapters for the v2 platform runtime."""
-
+"""Infrastructure adapters for the ZLAgent platform runtime."""

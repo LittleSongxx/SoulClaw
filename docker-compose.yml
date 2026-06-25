@@ -23,8 +23,6 @@ services:
           memory: 512M
           cpus: '0.5'
     depends_on:
-      redis:
-        condition: service_healthy
       postgres:
         condition: service_healthy
       qdrant:
@@ -41,6 +39,11 @@ services:
       ZLAGENT_DATABASE_URL: postgresql+psycopg://zlagent:zlagent@postgres:5432/zlagent
       ZLAGENT_QDRANT_URL: http://qdrant:6333
       ZLAGENT_FASTEMBED_CACHE_DIR: /app/data/fastembed
+      ZLAGENT_BOOTSTRAP_WIKI_ON_STARTUP: ${ZLAGENT_BOOTSTRAP_WIKI_ON_STARTUP:-true}
+      ZLAGENT_BOOTSTRAP_SKILLS_ON_STARTUP: ${ZLAGENT_BOOTSTRAP_SKILLS_ON_STARTUP:-true}
+      ZLAGENT_DREAM_REVIEW_ENABLED: ${ZLAGENT_DREAM_REVIEW_ENABLED:-true}
+      ZLAGENT_DREAM_REVIEW_CRON: "${ZLAGENT_DREAM_REVIEW_CRON:-30 3 * * *}"
+      ZLAGENT_DREAM_REVIEW_TIMEZONE: ${ZLAGENT_DREAM_REVIEW_TIMEZONE:-Asia/Shanghai}
       ZLAGENT_ADMIN_USERNAME: ${ZLAGENT_ADMIN_USERNAME:-admin}
       ZLAGENT_ADMIN_PASSWORD: ${ZLAGENT_ADMIN_PASSWORD:-zlagent-admin}
       ZLAGENT_JWT_SECRET: ${ZLAGENT_JWT_SECRET:-change-me-for-production}
@@ -55,41 +58,6 @@ services:
       - zlagent_config:/app/config
       - zlagent_workspace:/app/workspace
       - zlagent_packages:/app/.packages
-
-  # ---------------------------------------------------------------------
-  # On-demand utility: scan QR + auto-register a Weixin DeliveryTarget.
-  #
-  # Not started by `docker compose up` (gated by the ``setup`` profile).
-  # Invoke it when you need to (re-)bind a personal-WeChat identity:
-  #
-  #     docker compose run --rm weixin-login
-  #
-  # Reuses zlagent's image (no extra build) and mounts the same
-  # ``zlagent_workspace`` named volume, so saved credentials land where
-  # the running zlagent service can immediately pick them up. The CLI's
-  # auto-register step talks to the running zlagent over the compose
-  # network at http://zlagent:8020.
-  # ---------------------------------------------------------------------
-  weixin-login:
-    image: zlagent:local
-    profiles: ["setup"]
-    depends_on:
-      zlagent:
-        condition: service_started
-    environment:
-      ZLAGENT_HOST: 0.0.0.0
-      ZLAGENT_PORT: 8020
-    volumes:
-      - zlagent_workspace:/app/workspace
-      - zlagent_config:/app/config
-    command:
-      - python
-      - -m
-      - backend.cli.weixin_login
-      - --api-base
-      - http://zlagent:8020
-    tty: true
-    stdin_open: true
 
   redis:
     image: redis:7-alpine

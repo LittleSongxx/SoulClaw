@@ -40,7 +40,7 @@ Activate when:
 - A recurring workflow is about to be repeated a third time — promote
   it to a skill (via `skill-authoring`) OR to a doc.
 - A design decision is made that future sessions would want to know
-  ("we chose SQLite over Redis for this because...").
+  ("we chose Postgres as the system record because...").
 - The user explicitly asks for a README / ADR / decision record.
 - A feature lands and the deployment behaviour would surprise a new
   operator.
@@ -75,7 +75,8 @@ Activate when:
 3. Name concrete commands / file paths / links. No "see the diagram"
    without a diagram.
 4. Include a "revisit when..." trigger so the doc has a life-cycle
-   signal ("revisit when the SQLite row count > 100k").
+   signal ("revisit when table growth makes retrieval latency exceed
+   the target").
 5. Write via `write_file` to the correct path; `skill_manage` for
    embedded skill docs.
 
