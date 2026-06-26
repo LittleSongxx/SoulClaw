@@ -32,6 +32,7 @@ class MCPToolDescriptor:
     tool_name: str
     description: str
     input_schema: dict[str, Any]
+    permission: str = "write"
 
     @property
     def registry_name(self) -> str:
@@ -44,6 +45,7 @@ class MCPToolDescriptor:
             "registry_name": self.registry_name,
             "description": self.description,
             "input_schema": self.input_schema,
+            "permission": self.permission,
         }
 
     @classmethod
@@ -53,6 +55,7 @@ class MCPToolDescriptor:
             tool_name=str(item.get("tool_name") or ""),
             description=str(item.get("description") or ""),
             input_schema=item.get("input_schema") if isinstance(item.get("input_schema"), dict) else {},
+            permission=str(item.get("permission") or "write"),
         )
 
 
@@ -183,6 +186,7 @@ class MCPRuntimeManager:
         tools = getattr(result, "tools", []) or []
         descriptors: list[MCPToolDescriptor] = []
         server_name = str(config["name"])
+        overrides = _permission_overrides(config)
         for tool in tools:
             tool_name = str(getattr(tool, "name", ""))
             if not tool_name:
@@ -194,6 +198,7 @@ class MCPRuntimeManager:
                     tool_name=tool_name,
                     description=str(getattr(tool, "description", "") or ""),
                     input_schema=input_schema if isinstance(input_schema, dict) else {},
+                    permission=str(overrides.get(tool_name) or "write"),
                 )
             )
         return descriptors
@@ -271,11 +276,12 @@ class MCPRuntimeManager:
             del db
             return self.call_tool_sync(descriptor.server_name, descriptor.tool_name, arguments)
 
+        is_safe = descriptor.permission == "safe"
         return ToolDefinition(
             name=descriptor.registry_name,
             description=descriptor.description or f"MCP tool {descriptor.tool_name} from {descriptor.server_name}.",
-            scope="external.write",
-            requires_approval=True,
+            scope="external.read" if is_safe else "external.write",
+            requires_approval=not is_safe,
             available=available,
             parameters=normalize_json_schema(descriptor.input_schema),
             handler=handler,
@@ -301,6 +307,16 @@ def _server_config(server: MCPServer) -> dict[str, Any]:
         "args": args or [],
         "url": str(config.get("url") or server.url),
     }
+
+
+def _permission_overrides(config: dict[str, Any]) -> dict[str, str]:
+    tools = config.get("tools")
+    if not isinstance(tools, dict):
+        return {}
+    overrides = tools.get("override_permission")
+    if not isinstance(overrides, dict):
+        return {}
+    return {str(key): str(value) for key, value in overrides.items()}
 
 
 def normalize_json_schema(schema: dict[str, Any]) -> dict[str, Any]:

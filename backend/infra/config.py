@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from functools import lru_cache
 from pathlib import Path
+from typing import Annotated
 
 from pydantic import AliasChoices, Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -32,27 +34,25 @@ class Settings(BaseSettings):
     auto_migrate: bool = True
     bootstrap_wiki_on_startup: bool = True
     bootstrap_skills_on_startup: bool = True
+    cors_origins: Annotated[list[str], NoDecode] = ["*"]
+    require_production_secrets: bool = True
+    login_rate_limit_enabled: bool = True
 
     data_dir: Path = Path("data")
     config_dir: Path = Path("config")
     workspace_dir: Path = Path("workspace")
+    workspace_seed_dir: Path = Path("workspace_seed")
     packages_dir: Path = Path(".packages")
-    fastembed_cache_dir: Path = Path("data/fastembed")
 
     database_url: str = Field(
-        default="postgresql+psycopg://zlagent:zlagent@localhost:5432/zlagent",
+        default="sqlite:///data/zlagent.sqlite3",
         validation_alias=AliasChoices("ZLAGENT_DATABASE_URL", "DATABASE_URL"),
     )
     redis_url: str = "redis://localhost:6379/0"
-
-    qdrant_enabled: bool = True
-    qdrant_url: str = "http://localhost:6333"
-    qdrant_api_key: str | None = None
-    qdrant_wiki_collection: str = "zlagent_wiki_chunks"
-    qdrant_memory_collection: str = "zlagent_memory_items"
-    qdrant_skill_collection: str = "zlagent_skill_chunks"
-    qdrant_dense_model: str = "BAAI/bge-small-en-v1.5"
-    qdrant_sparse_model: str = "Qdrant/bm25"
+    celery_broker_url: str | None = None
+    celery_result_backend: str | None = None
+    api_scheduler_enabled: bool = False
+    queue_eager: bool = False
 
     wiki_root: Path | None = None
     skills_root: Path | None = None
@@ -79,8 +79,32 @@ class Settings(BaseSettings):
     dream_review_timezone: str = "Asia/Shanghai"
     dream_review_window_hours: int = 24
     dream_review_limit: int = 50
+    heartbeat_enabled: bool = True
+    heartbeat_cron: str = "*/30 * * * *"
+    heartbeat_timezone: str = "Asia/Shanghai"
+    gateway_heartbeat_timeout_seconds: int = 120
 
-    @field_validator("data_dir", "config_dir", "workspace_dir", "packages_dir", "fastembed_cache_dir", mode="before")
+    @property
+    def resolved_celery_broker_url(self) -> str:
+        return self.celery_broker_url or self.redis_url
+
+    @property
+    def resolved_celery_result_backend(self) -> str:
+        return self.celery_result_backend or self.redis_url
+
+    @field_validator("cors_origins", mode="before")
+    @classmethod
+    def _split_cors_origins(cls, value: str | list[str]) -> list[str]:
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped.startswith("["):
+                loaded = json.loads(stripped)
+                if isinstance(loaded, list):
+                    return [str(item).strip() for item in loaded if str(item).strip()]
+            return [item.strip() for item in value.split(",") if item.strip()]
+        return value
+
+    @field_validator("data_dir", "config_dir", "workspace_dir", "workspace_seed_dir", "packages_dir", mode="before")
     @classmethod
     def _expand_path(cls, value: str | Path) -> Path:
         return Path(value).expanduser()
@@ -100,12 +124,23 @@ class Settings(BaseSettings):
             self.data_dir,
             self.config_dir,
             self.workspace_dir,
+            self.workspace_seed_dir,
             self.packages_dir,
-            self.fastembed_cache_dir,
             self.resolved_wiki_root,
             self.resolved_skills_root,
+            self.workspace_dir / "memory",
         ):
             path.mkdir(parents=True, exist_ok=True)
+
+    def validate_runtime_secrets(self) -> None:
+        if self.environment.lower() not in {"production", "prod"} or not self.require_production_secrets:
+            return
+        if self.jwt_secret == "change-me-for-production":
+            raise RuntimeError("ZLAGENT_JWT_SECRET must be changed in production")
+        if self.admin_password == "zlagent-admin":
+            raise RuntimeError("ZLAGENT_ADMIN_PASSWORD must be changed in production")
+        if not self.cors_origins or "*" in self.cors_origins:
+            raise RuntimeError("ZLAGENT_CORS_ORIGINS must be explicit in production")
 
 
 @lru_cache(maxsize=1)

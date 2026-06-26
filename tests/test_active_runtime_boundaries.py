@@ -32,8 +32,7 @@ def test_project_copy_does_not_use_generation_labels() -> None:
         Path("docker-entrypoint.py"),
         Path("config"),
         Path("backend"),
-        Path("workspace/knowledge"),
-        Path("workspace/skills"),
+        Path("workspace_seed"),
         Path("tests"),
     ]
     allowed_patterns = (

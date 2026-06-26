@@ -62,6 +62,18 @@ def get_skill_service(request: Request):
     return request.app.state.skill_service
 
 
+def get_conversation_service(request: Request):
+    return request.app.state.conversation_service
+
+
+def get_job_service(request: Request):
+    return request.app.state.job_service
+
+
+def get_evolution_service(request: Request):
+    return request.app.state.evolution_service
+
+
 def get_platform_service(request: Request):
     return request.app.state.platform_service
 
@@ -92,3 +104,11 @@ def get_gateway_runtime(request: Request):
 
 def get_dream_runtime(request: Request):
     return request.app.state.dream_runtime
+
+
+def get_workspace_service(request: Request):
+    return request.app.state.workspace_service
+
+
+def get_heartbeat_runtime(request: Request):
+    return request.app.state.heartbeat_runtime

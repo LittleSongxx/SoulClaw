@@ -17,20 +17,10 @@ Thumbs.db
 # Do not ship local runtime data into the image
 data/
 config/local.yaml
-workspace/credentials/
-workspace/files/
-workspace/knowledge/*
-!workspace/knowledge/wiki/
-!workspace/knowledge/wiki/**
+workspace/
 frontend/node_modules/
 frontend/dist/
-workspace/knowledge_modes/
-workspace/logs/
-workspace/memory/
-workspace/runtime/
-workspace/tmp/
-workspace/skills/.usage.json
-workspace/.zlagent/
+workspace_seed/**/history.jsonl
 
 # Logs / DB
 *.log

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -15,12 +16,21 @@ from sqlalchemy.orm import Session
 
 from backend.infra.config import Settings, get_settings
 from backend.infra.events import RuntimeEventBus
-from backend.infra.models import WikiCompileRun, WikiErrorBook, WikiLink, WikiPage, WikiSource
-from backend.infra.qdrant_index import IndexDocument, QdrantHybridIndex
+from backend.infra.models import (
+    EvolutionProposal,
+    WikiCompileRun,
+    WikiErrorBook,
+    WikiLink,
+    WikiPage,
+    WikiSource,
+)
 
 FRONTMATTER_RE = re.compile(r"\A---\s*\n(?P<yaml>.*?)\n---\s*\n(?P<body>.*)\Z", re.DOTALL)
 WIKILINK_RE = re.compile(r"\[\[([^\]|#]+)(?:#[^\]|]+)?(?:\|([^\]]+))?\]\]")
 HEADING_RE = re.compile(r"^#\s+(.+)$", re.MULTILINE)
+CANONICAL_WIKI_FILES = {"SCHEMA.md", "index.md", "log.md"}
+SPECIAL_WIKI_DIRS = {"raw", "entities", "concepts", "comparisons", "queries", "_archive"}
+WIKI_PROPOSAL_ACTIONS = {"create_page", "update_page", "archive_page", "fix_link", "update_index", "append_log"}
 
 
 def normalize_page_key(value: str) -> str:
@@ -130,30 +140,13 @@ def parse_markdown_page(path: Path, root: Path) -> ParsedWikiPage:
     )
 
 
-def chunk_text(text: str, *, max_chars: int = 1200, overlap: int = 160) -> list[str]:
-    text = text.strip()
-    if not text:
-        return []
-    chunks: list[str] = []
-    start = 0
-    while start < len(text):
-        end = min(len(text), start + max_chars)
-        chunks.append(text[start:end].strip())
-        if end >= len(text):
-            break
-        start = max(0, end - overlap)
-    return [chunk for chunk in chunks if chunk]
-
-
 class WikiService:
     def __init__(
         self,
         settings: Settings | None = None,
-        qdrant: QdrantHybridIndex | None = None,
         events: RuntimeEventBus | None = None,
     ) -> None:
         self.settings = settings or get_settings()
-        self.qdrant = qdrant
         self.events = events
 
     @property
@@ -166,6 +159,34 @@ class WikiService:
         for path in self._markdown_paths():
             pages.append(parse_markdown_page(path, self.root))
         return pages
+
+    def orientation(self, db: Session, *, recent_log_lines: int = 40) -> dict[str, Any]:
+        schema = self._read_optional_file("SCHEMA.md")
+        index = self._read_optional_file("index.md")
+        log = self._read_optional_file("log.md")
+        pages = self.list_pages(db, limit=500)
+        recent_log = "\n".join(log.splitlines()[-max(1, min(recent_log_lines, 200)) :])
+        return {
+            "root": str(self.root),
+            "schema": schema,
+            "index": index,
+            "recent_log": recent_log,
+            "page_count": len(pages),
+            "directories": sorted({Path(page.path).parts[0] for page in pages if Path(page.path).parts}),
+            "page_types": sorted({page.page_type for page in pages}),
+            "pages": [
+                {
+                    "page_key": page.page_key,
+                    "title": page.title,
+                    "page_type": page.page_type,
+                    "path": page.path,
+                    "summary": page.summary,
+                    "tags": page.tags,
+                    "confidence": page.confidence,
+                }
+                for page in pages[:120]
+            ],
+        }
 
     def compile(self, db: Session) -> dict[str, Any]:
         run = WikiCompileRun(status="running", pages_seen=0, pages_indexed=0, errors=0, payload={})
@@ -243,7 +264,6 @@ class WikiService:
             else:
                 db.execute(delete(WikiSource))
 
-        qdrant_docs: list[IndexDocument] = []
         for page in parsed_pages:
             source = db.scalar(select(WikiSource).where(WikiSource.source_key == page.relative_path))
             if source is None:
@@ -293,27 +313,6 @@ class WikiService:
                         )
                     )
 
-            full_text = "\n\n".join(part for part in (page.title, page.summary, page.body) if part)
-            for index, chunk in enumerate(chunk_text(full_text)):
-                qdrant_docs.append(
-                    IndexDocument(
-                        key=f"{page.page_key}:chunk:{index}",
-                        text=chunk,
-                        payload={
-                            "page_key": page.page_key,
-                            "title": page.title,
-                            "path": page.relative_path,
-                            "chunk_index": index,
-                            "tags": page.tags,
-                            "page_type": page.page_type,
-                        },
-                    )
-                )
-
-        indexed = False
-        if self.qdrant is not None:
-            indexed = self.qdrant.upsert_documents(self.settings.qdrant_wiki_collection, qdrant_docs)
-
         run.status = "ok" if not errors else "error"
         run.pages_seen = len(source_keys)
         run.pages_indexed = len(parsed_pages)
@@ -322,8 +321,7 @@ class WikiService:
         run.payload = {
             "root": str(self.root),
             "errors": errors,
-            "qdrant_indexed": indexed,
-            "chunks": len(qdrant_docs),
+            "index": "page_mirror",
         }
         if self.events:
             self.events.emit("wiki.compile", run.payload, severity="info" if not errors else "warning")
@@ -332,8 +330,7 @@ class WikiService:
             "pages_seen": run.pages_seen,
             "pages_indexed": run.pages_indexed,
             "errors": run.errors,
-            "qdrant_indexed": indexed,
-            "chunks": len(qdrant_docs),
+            "llm_wiki": self._wiki_shape(),
         }
 
     def list_pages(self, db: Session, limit: int = 200) -> list[WikiPage]:
@@ -345,19 +342,19 @@ class WikiService:
         key = normalize_page_key(page_key)
         return db.scalar(select(WikiPage).where(WikiPage.page_key == key))
 
+    def read_with_graph(self, db: Session, page_key: str) -> dict[str, Any] | None:
+        page = self.read(db, page_key)
+        if page is None:
+            return None
+        return {
+            "page": page,
+            "outlinks": self.follow_links(db, page.page_key, direction="out"),
+            "backlinks": self.follow_links(db, page.page_key, direction="in"),
+        }
+
     def search(self, db: Session, query: str, limit: int = 10) -> list[dict[str, Any]]:
         limit = max(1, min(limit, 50))
         query = query.strip()
-        vector_hits = []
-        if self.qdrant is not None and query:
-            vector_hits = self.qdrant.search(self.settings.qdrant_wiki_collection, query, limit=limit)
-
-        vector_page_keys = [
-            item.get("payload", {}).get("page_key")
-            for item in vector_hits
-            if item.get("payload", {}).get("page_key")
-        ]
-        records: dict[str, dict[str, Any]] = {}
         if query:
             pattern = f"%{query}%"
             stmt = (
@@ -374,21 +371,234 @@ class WikiService:
             )
         else:
             stmt = select(WikiPage).order_by(desc(WikiPage.updated_at)).limit(limit)
+
+        lowered = query.lower()
+        records: list[dict[str, Any]] = []
         for page in db.scalars(stmt).all():
-            records[page.page_key] = {"score": 1.0, "source": "postgres", "page": page}
+            score = 1.0
+            if lowered:
+                title_or_summary = lowered in page.title.lower() or lowered in page.summary.lower()
+                score = 1.0 if title_or_summary else 0.6
+            records.append(
+                {
+                    "score": score,
+                    "source": "page_index",
+                    "page_key": page.page_key,
+                    "title": page.title,
+                    "path": page.path,
+                    "summary": page.summary,
+                    "tags": page.tags or [],
+                    "page_type": page.page_type,
+                    "confidence": page.confidence,
+                    "page": page,
+                }
+            )
 
-        if vector_page_keys:
-            for page in db.scalars(select(WikiPage).where(WikiPage.page_key.in_(vector_page_keys))).all():
-                hit = next(
-                    (item for item in vector_hits if item.get("payload", {}).get("page_key") == page.page_key),
-                    {},
-                )
-                records.setdefault(
-                    page.page_key,
-                    {"score": hit.get("score"), "source": "qdrant", "page": page},
-                )
+        return records[:limit]
 
-        return list(records.values())[:limit]
+    def follow_links(
+        self,
+        db: Session,
+        page_key: str,
+        *,
+        direction: str = "out",
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        key = normalize_page_key(page_key)
+        limit = max(1, min(limit, 200))
+        if direction not in {"out", "in", "both"}:
+            raise ValueError("direction must be out, in, or both")
+        clauses = []
+        if direction in {"out", "both"}:
+            clauses.append(WikiLink.src_page_key == key)
+        if direction in {"in", "both"}:
+            clauses.append(WikiLink.dst_page_key == key)
+        links = list(
+            db.scalars(
+                select(WikiLink)
+                .where(or_(*clauses), WikiLink.status == "resolved")
+                .order_by(WikiLink.created_at.desc())
+                .limit(limit)
+            ).all()
+        )
+        page_keys = {link.dst_page_key if link.src_page_key == key else link.src_page_key for link in links}
+        pages = {
+            page.page_key: page
+            for page in db.scalars(select(WikiPage).where(WikiPage.page_key.in_(page_keys))).all()
+        } if page_keys else {}
+        return [
+            {
+                "src_page_key": link.src_page_key,
+                "dst_page_key": link.dst_page_key,
+                "anchor_text": link.anchor_text,
+                "direction": "out" if link.src_page_key == key else "in",
+                "page": self._page_summary(pages.get(link.dst_page_key if link.src_page_key == key else link.src_page_key)),
+            }
+            for link in links
+        ]
+
+    def lint(self, db: Session) -> dict[str, Any]:
+        pages = self.scan()
+        known = {page.page_key for page in pages}
+        canonical_missing = [
+            filename
+            for filename in CANONICAL_WIKI_FILES
+            if not (self.root / filename).exists()
+        ]
+        indexed_keys = self._indexed_page_keys()
+        errors: list[WikiErrorBook] = []
+        stale_types = {
+            "broken_link",
+            "orphan_page",
+            "missing_index_entry",
+            "low_confidence",
+            "contested_claim",
+            "missing_canonical_file",
+            "stale_page",
+            "source_drift",
+        }
+        now = datetime.now(UTC)
+        for old_error in db.scalars(select(WikiErrorBook).where(WikiErrorBook.error_type.in_(sorted(stale_types)), WikiErrorBook.status == "open")):
+            old_error.status = "fixed"
+            old_error.fixed_at = now
+        for filename in canonical_missing:
+            errors.append(self._error("missing_canonical_file", filename, f"Missing {filename}.", "Create the canonical LLM-Wiki control file.", {"path": filename}))
+        linked_targets = {target for page in pages for target, _anchor in page.links if target in known}
+        for page in pages:
+            if page.relative_path.startswith("_archive/"):
+                continue
+            for target, anchor in page.links:
+                if target not in known:
+                    errors.append(
+                        self._error(
+                            "broken_link",
+                            page.page_key,
+                            f"Unresolved wiki link: {target}",
+                            "Create the target page or fix the wikilink.",
+                            {"target": target, "anchor": anchor},
+                        )
+                    )
+            if page.page_key not in indexed_keys and Path(page.relative_path).name not in CANONICAL_WIKI_FILES:
+                errors.append(
+                    self._error(
+                        "missing_index_entry",
+                        page.page_key,
+                        "Page is not referenced in index.md.",
+                        "Add this page to index.md with a one-line summary.",
+                        {"path": page.relative_path},
+                    )
+                )
+            if page.confidence < 0.35:
+                errors.append(
+                    self._error(
+                        "low_confidence",
+                        page.page_key,
+                        f"Page confidence is low: {page.confidence:.2f}",
+                        "Verify sources or mark the claim as contested.",
+                        {"confidence": page.confidence},
+                    )
+                )
+            if bool(page.metadata.get("contested", False)):
+                errors.append(
+                    self._error(
+                        "contested_claim",
+                        page.page_key,
+                        "Page is marked contested.",
+                        "Resolve the contested claim or keep explicit evidence in the page.",
+                        {"path": page.relative_path},
+                    )
+                )
+            if (
+                page.page_key not in linked_targets
+                and page.page_key not in {"index", "schema", "log"}
+                and Path(page.relative_path).name not in CANONICAL_WIKI_FILES
+            ):
+                errors.append(
+                    self._error(
+                        "orphan_page",
+                        page.page_key,
+                        "Page has no inbound wikilinks.",
+                        "Link it from index.md or a relevant entity/concept page.",
+                        {"path": page.relative_path},
+                    )
+                )
+            source_paths = _listify(page.metadata.get("sources"))
+            for source in source_paths:
+                if source.startswith("raw/") and not (self.root / source).exists():
+                    errors.append(
+                        self._error(
+                            "source_drift",
+                            page.page_key,
+                            f"Declared source is missing: {source}",
+                            "Restore the raw source or update frontmatter sources.",
+                            {"source": source},
+                        )
+                    )
+        for error in errors:
+            db.add(error)
+        if self.events:
+            self.events.emit("wiki.lint", {"errors": len(errors), "canonical_missing": canonical_missing})
+        return {
+            "ok": not errors,
+            "errors": len(errors),
+            "canonical_missing": canonical_missing,
+            "items": [
+                {
+                    "error_type": error.error_type,
+                    "page_key": error.page_key,
+                    "root_cause": error.root_cause,
+                    "constraint": error.constraint,
+                    "payload": error.payload,
+                }
+                for error in errors
+            ],
+        }
+
+    def apply_proposal(self, db: Session, proposal_id: uuid.UUID, *, actor: str = "admin") -> EvolutionProposal:
+        proposal = db.get(EvolutionProposal, proposal_id)
+        if proposal is None:
+            raise KeyError(f"proposal not found: {proposal_id}")
+        if proposal.status not in {"pending", "approved"}:
+            raise ValueError(f"proposal is not applyable: {proposal.status}")
+        if proposal.target_type != "wiki":
+            raise ValueError("only wiki proposals are applyable here")
+        if proposal.action not in WIKI_PROPOSAL_ACTIONS:
+            raise ValueError(f"unsupported wiki proposal action: {proposal.action}")
+        before: dict[str, Any] = {}
+        payload = proposal.payload or {}
+        if proposal.action in {"create_page", "update_page", "fix_link", "update_index"}:
+            path = self._proposal_path(payload, default="index.md" if proposal.action == "update_index" else "")
+            before = {"path": path.as_posix(), "content": self._read_path(path)}
+            self._write_path(path, str(payload.get("content") or ""))
+            changed = path.as_posix()
+        elif proposal.action == "archive_page":
+            path = self._proposal_path(payload)
+            before = {"path": path.as_posix(), "content": self._read_path(path)}
+            archive_path = self.root / "_archive" / path.name
+            archive_path.parent.mkdir(parents=True, exist_ok=True)
+            path.rename(archive_path)
+            changed = archive_path.relative_to(self.root).as_posix()
+        else:
+            log_path = Path("log.md")
+            before = {"path": "log.md", "content": self._read_path(log_path)}
+            self._append_log(str(payload.get("entry") or ""), actor=actor)
+            changed = "log.md"
+        self._append_log(f"Applied wiki proposal {proposal.id}: {proposal.action} {changed}", actor=actor)
+        compile_result = self.compile(db)
+        proposal.status = "applied"
+        proposal.before_snapshot = before
+        proposal.after_snapshot = {"changed": changed, "compile": compile_result}
+        proposal.result = {"ok": True, "action": proposal.action, "changed": changed, "actor": actor}
+        proposal.applied_at = datetime.now(UTC)
+        if self.events:
+            self.events.emit("wiki.proposal.applied", {"proposal_id": str(proposal.id), "action": proposal.action})
+            self.events.audit(
+                "wiki.proposal.apply",
+                "evolution_proposal",
+                target_id=str(proposal.id),
+                payload={"action": proposal.action, "changed": changed, "actor": actor},
+            )
+        return proposal
 
     def error_book(self, db: Session, status: str | None = "open", limit: int = 100) -> list[WikiErrorBook]:
         limit = max(1, min(limit, 500))
@@ -416,6 +626,7 @@ class WikiService:
                 "started_at": last_run.started_at.isoformat() if last_run.started_at else None,
                 "finished_at": last_run.finished_at.isoformat() if last_run.finished_at else None,
             },
+            "llm_wiki": self._wiki_shape(),
         }
 
     def _markdown_paths(self) -> list[Path]:
@@ -426,3 +637,74 @@ class WikiService:
                 continue
             paths.append(path)
         return paths
+
+    def _read_optional_file(self, relative_path: str) -> str:
+        path = self.root / relative_path
+        if not path.exists() or not path.is_file():
+            return ""
+        return path.read_text(encoding="utf-8")
+
+    def _wiki_shape(self) -> dict[str, Any]:
+        return {
+            "canonical_files": {filename: (self.root / filename).exists() for filename in sorted(CANONICAL_WIKI_FILES)},
+            "special_dirs": {dirname: (self.root / dirname).exists() for dirname in sorted(SPECIAL_WIKI_DIRS)},
+        }
+
+    def _indexed_page_keys(self) -> set[str]:
+        return {
+            normalize_page_key(match.group(1))
+            for match in WIKILINK_RE.finditer(self._read_optional_file("index.md"))
+        }
+
+    @staticmethod
+    def _page_summary(page: WikiPage | None) -> dict[str, Any] | None:
+        if page is None:
+            return None
+        return {
+            "page_key": page.page_key,
+            "title": page.title,
+            "page_type": page.page_type,
+            "path": page.path,
+            "summary": page.summary,
+        }
+
+    @staticmethod
+    def _error(error_type: str, page_key: str, root_cause: str, constraint: str, payload: dict[str, Any]) -> WikiErrorBook:
+        return WikiErrorBook(
+            error_type=error_type,
+            page_key=page_key,
+            root_cause=root_cause,
+            constraint=constraint,
+            status="open",
+            payload=payload,
+        )
+
+    def _proposal_path(self, payload: dict[str, Any], *, default: str = "") -> Path:
+        raw = str(payload.get("path") or default)
+        if not raw:
+            page_key = normalize_page_key(str(payload.get("page_key") or ""))
+            raw = f"{page_key}.md" if page_key else ""
+        path = Path(raw)
+        if not raw or path.is_absolute() or ".." in path.parts:
+            raise ValueError("wiki proposal requires a safe relative path")
+        return path
+
+    def _read_path(self, relative_path: Path) -> str:
+        path = self.root / relative_path
+        if not path.exists():
+            return ""
+        return path.read_text(encoding="utf-8")
+
+    def _write_path(self, relative_path: Path, content: str) -> None:
+        path = self.root / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+
+    def _append_log(self, entry: str, *, actor: str = "system") -> None:
+        if not entry.strip():
+            return
+        path = self.root / "log.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now(UTC).isoformat()
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(f"\n- {timestamp} [{actor}] {entry.strip()}\n")

@@ -14,8 +14,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     ZLAGENT_DATA_DIR=/app/data \
     ZLAGENT_CONFIG_DIR=/app/config \
     ZLAGENT_WORKSPACE_DIR=/app/workspace \
+    ZLAGENT_WORKSPACE_SEED_DIR=/app/workspace_seed \
     ZLAGENT_PACKAGES_DIR=/app/.packages \
-    ZLAGENT_FASTEMBED_CACHE_DIR=/app/data/fastembed \
     NPM_CONFIG_PREFIX=/app/.packages/npm \
     NPM_CONFIG_IGNORE_SCRIPTS=true \
     NPM_CONFIG_CACHE=/app/.packages/npm-cache \
@@ -113,7 +113,7 @@ USER root
 COPY backend ./backend
 COPY alembic.ini ./alembic.ini
 COPY alembic ./alembic
-COPY workspace ./workspace_seed
+COPY workspace_seed ./workspace_seed
 COPY docker-entrypoint.py ./docker-entrypoint.py
 RUN chown -R zlagent:zlagent /app/backend /app/alembic /app/alembic.ini /app/frontend /app/workspace_seed /app/docker-entrypoint.py \
     && chmod -R u=rwX,go=rX /app/backend /app/alembic /app/frontend /app/workspace_seed \

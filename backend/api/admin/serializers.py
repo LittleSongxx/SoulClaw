@@ -84,6 +84,32 @@ def probe_to_dict(probe) -> dict[str, Any]:
     }
 
 
+def session_message_to_dict(message) -> dict[str, Any]:
+    return {
+        "id": str(message.id),
+        "session_id": message.session_id,
+        "turn_id": message.turn_id,
+        "role": message.role,
+        "content": message.content,
+        "metadata": message.metadata_json or {},
+        "created_at": dt(message.created_at),
+    }
+
+
+def session_summary_to_dict(summary) -> dict[str, Any] | None:
+    if summary is None:
+        return None
+    return {
+        "id": str(summary.id),
+        "session_id": summary.session_id,
+        "summary": summary.summary,
+        "summarized_message_count": summary.summarized_message_count,
+        "metadata": summary.metadata_json or {},
+        "created_at": dt(summary.created_at),
+        "updated_at": dt(summary.updated_at),
+    }
+
+
 def skill_to_dict(skill) -> dict[str, Any]:
     return {
         "id": str(skill.id),
@@ -125,6 +151,23 @@ def proposal_to_dict(proposal) -> dict[str, Any]:
         "created_at": dt(proposal.created_at),
         "updated_at": dt(proposal.updated_at),
         "applied_at": dt(proposal.applied_at),
+    }
+
+
+def background_job_to_dict(job) -> dict[str, Any]:
+    return {
+        "id": str(job.id),
+        "task_name": job.task_name,
+        "queue_id": job.queue_id,
+        "status": job.status,
+        "payload": job.payload or {},
+        "result": job.result or {},
+        "error": job.error,
+        "triggered_by": job.triggered_by,
+        "cron_job_id": str(job.cron_job_id) if job.cron_job_id else None,
+        "created_at": dt(job.created_at),
+        "started_at": dt(job.started_at),
+        "finished_at": dt(job.finished_at),
     }
 
 
@@ -227,6 +270,10 @@ def gateway_to_dict(gateway) -> dict[str, Any]:
         "enabled": gateway.enabled,
         "last_inbound_at": dt(gateway.last_inbound_at),
         "last_outbound_at": dt(gateway.last_outbound_at),
+        "last_heartbeat_at": dt(getattr(gateway, "last_heartbeat_at", None)),
+        "instance_id": getattr(gateway, "instance_id", ""),
+        "version": getattr(gateway, "version", ""),
+        "capabilities": getattr(gateway, "capabilities", []) or [],
         "last_error": gateway.last_error,
         "inbound_count": gateway.inbound_count,
         "outbound_count": gateway.outbound_count,

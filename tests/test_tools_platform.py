@@ -9,11 +9,43 @@ from backend.domain.tools import ToolDefinition, ToolExecutor, ToolRegistry, Too
 
 
 class DummyWiki:
+    def orientation(self, db, recent_log_lines: int = 40):
+        del db, recent_log_lines
+        return {"index": "[[index]]", "pages": []}
+
     def search(self, db, query: str, limit: int = 10):
-        return []
+        page = type("Page", (), {"page_key": "index", "title": "Index", "summary": "Summary", "path": "index.md", "tags": [], "page_type": "note", "confidence": 0.8})()
+        return [
+            {
+                "page": page,
+                "page_key": "index",
+                "title": "Index",
+                "path": "index.md",
+                "summary": "Summary",
+                "tags": [],
+                "page_type": "note",
+                "confidence": 0.8,
+                "source": "page_index",
+                "score": 1.0,
+            }
+        ]
 
     def read(self, db, page_key: str):
+        if page_key == "index":
+            return type("Page", (), {"page_key": "index", "title": "Index", "summary": "Summary", "body": "Body", "metadata_json": {}})()
         return None
+
+    def read_with_graph(self, db, page_key: str):
+        del db, page_key
+        return {"outlinks": [], "backlinks": []}
+
+    def follow_links(self, db, page_key: str, *, direction: str = "out", limit: int = 50):
+        del db, page_key, direction, limit
+        return [{"dst_page_key": "other"}]
+
+    def lint(self, db):
+        del db
+        return {"ok": True}
 
     def compile(self, db):
         return {"status": "ok"}
@@ -22,6 +54,9 @@ class DummyWiki:
 class DummyMemory:
     def search(self, db, query: str, limit: int = 10):
         return []
+
+    def get(self, db, memory_id):
+        return None
 
     def create(self, db, **kwargs):
         return type("Memory", (), {"id": uuid.uuid4(), "kind": kwargs["kind"], "content": kwargs["content"]})()
@@ -33,6 +68,18 @@ class DummySkills:
 
     def test(self, db, skill_key: str):
         return {"ok": True, "skill_key": skill_key}
+
+
+class DummyEvents:
+    def __init__(self) -> None:
+        self.events = []
+        self.audits = []
+
+    def emit(self, event_type, payload=None, **kwargs):
+        self.events.append((event_type, payload or {}, kwargs))
+
+    def audit(self, action, target_type, **kwargs):
+        self.audits.append((action, target_type, kwargs))
 
 
 class FakeDB:
@@ -70,6 +117,34 @@ def test_tool_executor_records_successful_run() -> None:
 
     assert result["status"] == "succeeded"
     assert any(getattr(item, "tool_name", None) == "wiki_compile" for item in db.objects)
+
+
+def test_wiki_search_tool_returns_page_index_shape() -> None:
+    registry = ToolRegistry(wiki=DummyWiki(), memory=DummyMemory(), skills=DummySkills())
+
+    result = registry.get("wiki_search").handler(None, {"query": "index"})
+
+    assert result["items"][0]["page_key"] == "index"
+    assert result["items"][0]["summary"] == "Summary"
+    assert "chunk_index" not in result["items"][0]
+    assert "candidate_only" not in result["items"][0]
+
+
+def test_wiki_read_tool_returns_page_graph() -> None:
+    registry = ToolRegistry(wiki=DummyWiki(), memory=DummyMemory(), skills=DummySkills())
+
+    result = registry.get("wiki_read").handler(None, {"page_key": "index"})
+
+    assert result["body"] == "Body"
+    assert result["outlinks"] == []
+
+
+def test_wiki_follow_links_tool_returns_neighbors() -> None:
+    registry = ToolRegistry(wiki=DummyWiki(), memory=DummyMemory(), skills=DummySkills())
+
+    result = registry.get("wiki_follow_links").handler(None, {"page_key": "index"})
+
+    assert result["items"][0]["dst_page_key"] == "other"
 
 
 def test_platform_service_validates_cron_expr() -> None:
@@ -159,3 +234,24 @@ def test_tool_executor_creates_approval_for_gated_tool() -> None:
         executor.execute(db, tool_name="dangerous", arguments={"value": 1})
 
     assert any(getattr(item, "subject_type", None) == "tool_run" for item in db.objects)
+
+
+def test_tool_executor_audits_approved_execution() -> None:
+    registry = ToolRegistry(wiki=DummyWiki(), memory=DummyMemory(), skills=DummySkills())
+    registry.register(
+        ToolDefinition(
+            name="gated",
+            description="gated",
+            scope="external.write",
+            requires_approval=True,
+            handler=lambda db, args: {"ok": True},
+        )
+    )
+    events = DummyEvents()
+    db = FakeDB()
+    executor = ToolExecutor(registry, events=events, platform=PlatformService())
+
+    result = executor.execute(db, tool_name="gated", arguments={"value": 1}, approved=True)
+
+    assert result["status"] == "succeeded"
+    assert any(item[0] == "tool.approved_execution" for item in events.audits)

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -47,6 +49,7 @@ class GatewayRuntimeManager:
     def handle_inbound(self, message: InboundGatewayMessage) -> dict[str, Any]:
         with session_scope() as db:
             gateway = self._require_gateway(db, message.gateway_name)
+            self._verify_signature(gateway, message)
             gateway.last_inbound_at = datetime.now(UTC)
             gateway.inbound_count = int(gateway.inbound_count or 0) + 1
             gateway.status = "online"
@@ -136,6 +139,19 @@ class GatewayRuntimeManager:
                 response.raise_for_status()
             return {"mode": "http_post", "status_code": response.status_code}
         raise NotImplementedError(f"gateway kind '{gateway.kind}' is configured but no outbound adapter is active")
+
+    @staticmethod
+    def _verify_signature(gateway: GatewayConnection, message: InboundGatewayMessage) -> None:
+        config = gateway.config or {}
+        secret = str(config.get("secret") or "")
+        if not secret:
+            return
+        signature = str(message.metadata.get("signature") or message.metadata.get("x_zlagent_signature") or "")
+        expected = hmac.new(secret.encode("utf-8"), message.text.encode("utf-8"), hashlib.sha256).hexdigest()
+        if signature.startswith("sha256="):
+            signature = signature.removeprefix("sha256=")
+        if not hmac.compare_digest(signature, expected):
+            raise RuntimeError("invalid gateway signature")
 
     @staticmethod
     def _session_id(gateway_name: str, channel_id: str, external_user_id: str) -> str:

@@ -1,4 +1,4 @@
-"""Postgres-backed Cron scheduler for the ZLAgent runtime."""
+"""DB-backed Cron scheduler for the ZLAgent runtime."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from loguru import logger
 from sqlalchemy import select
 
 from backend.domain.cron_schedule import compute_next_run
+from backend.domain.jobs import BackgroundJobService, enqueue_background_job
 from backend.infra.db import session_scope
 from backend.infra.events import RuntimeEventBus
 from backend.infra.models import CronJob
@@ -23,11 +24,13 @@ class CronScheduler:
         agent: AgentRuntime,
         events: RuntimeEventBus,
         dream: DreamRuntime | None = None,
+        jobs: BackgroundJobService | None = None,
         poll_interval_seconds: float = 15.0,
     ) -> None:
         self.agent = agent
         self.events = events
         self.dream = dream
+        self.jobs = jobs or BackgroundJobService(events=events)
         self.poll_interval_seconds = poll_interval_seconds
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
@@ -72,6 +75,7 @@ class CronScheduler:
                     .where((CronJob.next_run_at.is_(None)) | (CronJob.next_run_at <= now))
                     .order_by(CronJob.next_run_at.asc().nullsfirst(), CronJob.name)
                     .limit(limit)
+                    .with_for_update(skip_locked=True)
                 ).all()
             )
             for job in jobs:
@@ -90,23 +94,46 @@ class CronScheduler:
         self.events.emit("cron.job.started", {"job_id": str(job.id), "name": job.name}, session_id=f"cron:{job.name}")
         try:
             if self._is_dream_review_job(job):
-                if self.dream is None:
-                    raise RuntimeError("Dream runtime is not configured")
-                review = self.dream.run_review(
+                background = enqueue_background_job(
                     db,
-                    window_hours=int((job.metadata_json or {}).get("window_hours") or 24),
-                    limit=int((job.metadata_json or {}).get("limit") or 50),
+                    task_name="dream_review",
+                    payload={
+                        "window_hours": int((job.metadata_json or {}).get("window_hours") or 24),
+                        "limit": int((job.metadata_json or {}).get("limit") or 50),
+                    },
+                    triggered_by=f"cron:{job.name}",
+                    cron_job_id=job.id,
+                    service=self.jobs,
                 )
                 result_payload = {
-                    "mode": "dream_review",
-                    "scanned_memories": review.scanned_memories,
-                    "failed_tool_runs": review.failed_tool_runs,
-                    "proposals_created": review.proposals_created,
-                    "proposal_ids": review.proposal_ids,
+                    "mode": "enqueue",
+                    "task_name": "dream_review",
+                    "job_id": str(background.id),
+                }
+            elif self._is_heartbeat_job(job):
+                background = enqueue_background_job(
+                    db,
+                    task_name="heartbeat_check",
+                    payload={},
+                    triggered_by=f"cron:{job.name}",
+                    cron_job_id=job.id,
+                    service=self.jobs,
+                )
+                result_payload = {
+                    "mode": "enqueue",
+                    "task_name": "heartbeat_check",
+                    "job_id": str(background.id),
                 }
             else:
-                result = self.agent.run_turn(db, job.instruction, session_id=f"cron:{job.name}")
-                result_payload = {"turn_id": result.turn_id, "answer": result.answer, "context": result.context}
+                background = enqueue_background_job(
+                    db,
+                    task_name=str((job.metadata_json or {}).get("task_name") or "dream_review"),
+                    payload=(job.metadata_json or {}).get("payload") if isinstance((job.metadata_json or {}).get("payload"), dict) else {},
+                    triggered_by=f"cron:{job.name}",
+                    cron_job_id=job.id,
+                    service=self.jobs,
+                )
+                result_payload = {"mode": "enqueue", "task_name": background.task_name, "job_id": str(background.id)}
         except Exception as exc:  # noqa: BLE001
             job.last_status = "failed"
             job.failure_count = int(job.failure_count or 0) + 1
@@ -134,3 +161,8 @@ class CronScheduler:
     def _is_dream_review_job(job: CronJob) -> bool:
         metadata = job.metadata_json or {}
         return metadata.get("system_task") == "dream_review"
+
+    @staticmethod
+    def _is_heartbeat_job(job: CronJob) -> bool:
+        metadata = job.metadata_json or {}
+        return metadata.get("system_task") == "heartbeat"

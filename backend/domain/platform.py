@@ -40,6 +40,7 @@ class PlatformService:
                 "approval.created",
                 {"approval_id": str(approval.id), "subject_type": subject_type, "subject_id": subject_id},
             )
+            self.events.audit("approval.create", "approval", target_id=str(approval.id), payload=payload or {})
         return approval
 
     def list_approvals(self, db: Session, *, status: str | None = None, limit: int = 100) -> list[Approval]:
@@ -58,6 +59,7 @@ class PlatformService:
         approval.resolved_at = datetime.now(UTC)
         if self.events:
             self.events.emit("approval.resolved", {"approval_id": str(approval.id), "status": status})
+            self.events.audit("approval.resolve", "approval", target_id=str(approval.id), payload={"status": status})
         return approval
 
     def list_cron_jobs(self, db: Session, *, enabled: bool | None = None, limit: int = 100) -> list[CronJob]:
@@ -92,6 +94,7 @@ class PlatformService:
         db.flush()
         if self.events:
             self.events.emit("cron.upsert", {"name": name, "enabled": enabled})
+            self.events.audit("cron.upsert", "cron_job", target_id=name, payload={"enabled": enabled})
         return job
 
     def ensure_system_cron_job(
@@ -165,6 +168,7 @@ class PlatformService:
         db.flush()
         if self.events:
             self.events.emit("mcp.upsert", {"name": name, "transport": transport, "enabled": enabled})
+            self.events.audit("mcp.upsert", "mcp_server", target_id=name, payload={"transport": transport, "enabled": enabled})
         return server
 
     def list_gateways(self, db: Session, *, kind: str | None = None, limit: int = 100) -> list[GatewayConnection]:
@@ -201,4 +205,5 @@ class PlatformService:
         db.flush()
         if self.events:
             self.events.emit("gateway.upsert", {"name": name, "kind": kind, "enabled": enabled})
+            self.events.audit("gateway.upsert", "gateway", target_id=name, payload={"kind": kind, "enabled": enabled})
         return gateway

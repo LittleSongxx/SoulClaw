@@ -38,6 +38,7 @@ def run_migrations_online() -> None:
         section,
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
+        connect_args={"check_same_thread": False} if _database_url().startswith("sqlite") else {},
     )
 
     with connectable.connect() as connection:

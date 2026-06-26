@@ -23,7 +23,7 @@ def copy_missing_tree(src: Path, dst: Path) -> int:
     """Merge ``src`` into ``dst`` without overwriting existing files.
 
     Recurses into directories that already exist in the destination so that
-            newly-shipped seed content (for example ``skills/arxiv/``) lands in a
+    newly-shipped seed content (for example ``skills/arxiv/``) lands in a
     workspace that was created by an older image and already has
     ``skills/example-ping/``.
     """
@@ -52,13 +52,17 @@ def copy_missing_tree(src: Path, dst: Path) -> int:
 def main() -> int:
     os.environ.setdefault("ZLAGENT_HOST", "0.0.0.0")
     os.environ.setdefault("ZLAGENT_PORT", "8020")
+    os.environ.setdefault("ZLAGENT_WORKSPACE_DIR", str(DEFAULT_WORKSPACE))
+    os.environ.setdefault("ZLAGENT_WORKSPACE_SEED_DIR", str(SEED_WORKSPACE))
     os.environ.setdefault("PYTHONUNBUFFERED", "1")
     os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 
+    workspace = Path(os.environ["ZLAGENT_WORKSPACE_DIR"]).expanduser()
+    workspace_seed = Path(os.environ["ZLAGENT_WORKSPACE_SEED_DIR"]).expanduser()
     (APP_DIR / "data").mkdir(parents=True, exist_ok=True)
     (APP_DIR / "config").mkdir(parents=True, exist_ok=True)
-    DEFAULT_WORKSPACE.mkdir(parents=True, exist_ok=True)
-    copy_missing_tree(SEED_WORKSPACE, DEFAULT_WORKSPACE)
+    workspace.mkdir(parents=True, exist_ok=True)
+    copy_missing_tree(workspace_seed, workspace)
 
     command = sys.argv[1:] or [
         sys.executable,

@@ -79,10 +79,29 @@ def search_memory(
 ) -> dict:
     return {
         "items": [
-            {"score": item["score"], "source": item["source"], "memory": memory_to_dict(item["memory"])}
+            {
+                "score": item["score"],
+                "source": item["source"],
+                "id": str(item["memory"].id),
+                "kind": item["memory"].kind,
+                "summary": item["memory"].content[:500],
+                "memory": memory_to_dict(item["memory"]),
+            }
             for item in service.search(db, payload.query, limit=payload.limit)
         ]
     }
+
+
+@router.get("/get")
+def get_memory(
+    memory_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    service: MemoryService = Depends(get_memory_service),
+) -> dict:
+    memory = service.get(db, memory_id)
+    if memory is None:
+        raise HTTPException(status_code=404, detail="memory not found")
+    return memory_to_dict(memory)
 
 
 @router.post("/{memory_id}/supersede")
@@ -108,6 +127,19 @@ def verify_memory(
 ) -> dict:
     try:
         memory = service.mark_verified(db, memory_id, confidence_delta=confidence_delta)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return memory_to_dict(memory)
+
+
+@router.post("/{memory_id}/archive")
+def archive_memory(
+    memory_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    service: MemoryService = Depends(get_memory_service),
+) -> dict:
+    try:
+        memory = service.archive(db, memory_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return memory_to_dict(memory)
@@ -140,4 +172,3 @@ def create_probe(
     service: MemoryService = Depends(get_memory_service),
 ) -> dict:
     return probe_to_dict(service.create_probe(db, question=payload.question, expected=payload.expected))
-

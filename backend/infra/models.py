@@ -1,4 +1,4 @@
-"""SQLAlchemy models for the ZLAgent Postgres schema."""
+"""SQLAlchemy models for the ZLAgent local-first schema."""
 
 from __future__ import annotations
 
@@ -6,9 +6,9 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import Boolean, DateTime, Float, Integer, String, Text, func, text
-from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
+from sqlalchemy import JSON, Boolean, DateTime, Float, Integer, String, Text, func, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.types import Uuid
 
 
 class Base(DeclarativeBase):
@@ -25,11 +25,15 @@ class TimestampMixin:
 
 
 def _uuid_pk() -> Any:
-    return mapped_column(UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()"))
+    return mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
 
 
 def _json_default() -> Any:
-    return mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"), default=dict)
+    return mapped_column(JSON, nullable=False, default=dict)
+
+
+def _json_list_default() -> Any:
+    return mapped_column(JSON, nullable=False, default=list)
 
 
 class User(Base, TimestampMixin):
@@ -46,15 +50,46 @@ class Session(Base, TimestampMixin):
     __tablename__ = "sessions"
 
     id: Mapped[uuid.UUID] = _uuid_pk()
-    user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True, index=True)
+    user_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True, index=True)
     channel: Mapped[str] = mapped_column(String(64), nullable=False, server_default="local")
     external_user_id: Mapped[str] = mapped_column(String(256), nullable=False, server_default="")
     title: Mapped[str] = mapped_column(String(256), nullable=False, server_default="")
     metadata_json: Mapped[dict[str, Any]] = mapped_column(
         "metadata",
-        JSONB,
+        JSON,
         nullable=False,
-        server_default=text("'{}'::jsonb"),
+        default=dict,
+    )
+
+
+class SessionMessage(Base):
+    __tablename__ = "session_messages"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    session_id: Mapped[str] = mapped_column(String(256), nullable=False, index=True)
+    turn_id: Mapped[str] = mapped_column(String(256), nullable=False, server_default="", index=True)
+    role: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    content: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        "metadata",
+        JSON,
+        nullable=False,
+        default=dict,
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
+class SessionSummary(Base, TimestampMixin):
+    __tablename__ = "session_summaries"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    session_id: Mapped[str] = mapped_column(String(256), nullable=False, unique=True, index=True)
+    summary: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    summarized_message_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        "metadata",
+        JSON,
+        nullable=False,
         default=dict,
     )
 
@@ -63,7 +98,7 @@ class AuditEvent(Base):
     __tablename__ = "audit_events"
 
     id: Mapped[uuid.UUID] = _uuid_pk()
-    actor_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True, index=True)
+    actor_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True, index=True)
     action: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     target_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     target_id: Mapped[str] = mapped_column(String(256), nullable=False, server_default="")
@@ -93,9 +128,8 @@ class WikiSource(Base, TimestampMixin):
     checksum: Mapped[str] = mapped_column(String(128), nullable=False, server_default="")
     metadata_json: Mapped[dict[str, Any]] = mapped_column(
         "metadata",
-        JSONB,
+        JSON,
         nullable=False,
-        server_default=text("'{}'::jsonb"),
         default=dict,
     )
 
@@ -110,15 +144,14 @@ class WikiPage(Base, TimestampMixin):
     path: Mapped[str] = mapped_column(Text, nullable=False)
     summary: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
     body: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
-    aliases: Mapped[list[str]] = mapped_column(ARRAY(Text), nullable=False, server_default=text("ARRAY[]::text[]"), default=list)
-    tags: Mapped[list[str]] = mapped_column(ARRAY(Text), nullable=False, server_default=text("ARRAY[]::text[]"), default=list)
+    aliases: Mapped[list[str]] = _json_list_default()
+    tags: Mapped[list[str]] = _json_list_default()
     confidence: Mapped[float] = mapped_column(Float, nullable=False, server_default="0.5")
     checksum: Mapped[str] = mapped_column(String(128), nullable=False, server_default="")
     metadata_json: Mapped[dict[str, Any]] = mapped_column(
         "metadata",
-        JSONB,
+        JSON,
         nullable=False,
-        server_default=text("'{}'::jsonb"),
         default=dict,
     )
 
@@ -134,9 +167,8 @@ class WikiLink(Base):
     anchor_text: Mapped[str] = mapped_column(String(512), nullable=False, server_default="")
     metadata_json: Mapped[dict[str, Any]] = mapped_column(
         "metadata",
-        JSONB,
+        JSON,
         nullable=False,
-        server_default=text("'{}'::jsonb"),
         default=dict,
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -181,13 +213,12 @@ class Memory(Base, TimestampMixin):
     importance: Mapped[float] = mapped_column(Float, nullable=False, server_default="0.5")
     confidence: Mapped[float] = mapped_column(Float, nullable=False, server_default="0.5")
     stability: Mapped[float] = mapped_column(Float, nullable=False, server_default="0.5")
-    supersedes_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True, index=True)
+    supersedes_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True, index=True)
     source_turn_id: Mapped[str] = mapped_column(String(256), nullable=False, server_default="", index=True)
     metadata_json: Mapped[dict[str, Any]] = mapped_column(
         "metadata",
-        JSONB,
+        JSON,
         nullable=False,
-        server_default=text("'{}'::jsonb"),
         default=dict,
     )
     last_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -197,8 +228,8 @@ class MemoryConflict(Base):
     __tablename__ = "memory_conflicts"
 
     id: Mapped[uuid.UUID] = _uuid_pk()
-    left_memory_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, index=True)
-    right_memory_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, index=True)
+    left_memory_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), nullable=False, index=True)
+    right_memory_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), nullable=False, index=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, server_default="open", index=True)
     reason: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -229,9 +260,8 @@ class Skill(Base, TimestampMixin):
     pinned: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
     metadata_json: Mapped[dict[str, Any]] = mapped_column(
         "metadata",
-        JSONB,
+        JSON,
         nullable=False,
-        server_default=text("'{}'::jsonb"),
         default=dict,
     )
 
@@ -329,11 +359,27 @@ class CronJob(Base, TimestampMixin):
     failure_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     metadata_json: Mapped[dict[str, Any]] = mapped_column(
         "metadata",
-        JSONB,
+        JSON,
         nullable=False,
-        server_default=text("'{}'::jsonb"),
         default=dict,
     )
+
+
+class BackgroundJob(Base):
+    __tablename__ = "background_jobs"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    task_name: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    queue_id: Mapped[str] = mapped_column(String(256), nullable=False, server_default="", index=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, server_default="queued", index=True)
+    payload: Mapped[dict[str, Any]] = _json_default()
+    result: Mapped[dict[str, Any]] = _json_default()
+    error: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    triggered_by: Mapped[str] = mapped_column(String(128), nullable=False, server_default="")
+    cron_job_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class MCPServer(Base, TimestampMixin):
@@ -351,9 +397,8 @@ class MCPServer(Base, TimestampMixin):
     last_error: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
     tool_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     tools_cache: Mapped[list[dict[str, Any]]] = mapped_column(
-        JSONB,
+        JSON,
         nullable=False,
-        server_default=text("'[]'::jsonb"),
         default=list,
     )
 
@@ -370,6 +415,10 @@ class GatewayConnection(Base, TimestampMixin):
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"), index=True)
     last_inbound_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_outbound_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    instance_id: Mapped[str] = mapped_column(String(128), nullable=False, server_default="")
+    version: Mapped[str] = mapped_column(String(80), nullable=False, server_default="")
+    capabilities: Mapped[list[str]] = _json_list_default()
     last_error: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
     inbound_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     outbound_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")

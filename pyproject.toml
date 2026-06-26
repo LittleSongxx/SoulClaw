@@ -1,7 +1,7 @@
 [project]
 name = "zlagent"
 version = "2.0.0"
-description = "A platform-grade personal AI agent with Postgres, Qdrant, Markdown Wiki, memory, and skill evolution."
+description = "A local-first personal AI agent with SQLite, Markdown-authoritative memory, LLM-Wiki, and skill evolution."
 requires-python = ">=3.11,<3.14"
 dependencies = [
     "fastapi>=0.115.0",
@@ -15,7 +15,7 @@ dependencies = [
     "PyJWT>=2.10.1",
     "PyYAML>=6.0.2",
     "redis>=5.0.0",
-    "qdrant-client[fastembed]>=1.12.1",
+    "celery>=5.4.0",
     "httpx>=0.28.0",
     "loguru>=0.7.3",
     "croniter>=5.0.0",

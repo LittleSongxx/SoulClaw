@@ -66,6 +66,7 @@ class DummyMemory:
         self.content = content
         self.importance = 0.8
         self.confidence = 0.7
+        self.stability = 0.7
         self.source_turn_id = "turn-1"
 
 
@@ -86,8 +87,10 @@ def test_dream_review_creates_skill_proposal_from_error_evidence() -> None:
 
     result = runtime.run_review(db)
 
-    assert result.proposals_created == 2
+    assert result.proposals_created == 6
     assert skills.proposals[0].target_type == "skill"
+    assert skills.proposals[1].target_type == "memory"
+    assert skills.proposals[2].target_type == "wiki"
     assert skills.proposals[0].payload["required_checks"][-1] == "human_review_before_apply"
     assert "SKILL.md" in skills.proposals[0].payload["files"]
 

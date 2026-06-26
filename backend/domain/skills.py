@@ -17,7 +17,6 @@ from sqlalchemy.orm import Session
 from backend.infra.config import Settings, get_settings
 from backend.infra.events import RuntimeEventBus
 from backend.infra.models import EvolutionProposal, Skill, SkillFile, SkillHistory, SkillTest
-from backend.infra.qdrant_index import IndexDocument, QdrantHybridIndex
 
 SKILL_FRONTMATTER_RE = re.compile(r"\A---\s*\n(?P<yaml>.*?)\n---\s*\n(?P<body>.*)\Z", re.DOTALL)
 TITLE_RE = re.compile(r"^#\s+(.+)$", re.MULTILINE)
@@ -74,11 +73,9 @@ class SkillService:
     def __init__(
         self,
         settings: Settings | None = None,
-        qdrant: QdrantHybridIndex | None = None,
         events: RuntimeEventBus | None = None,
     ) -> None:
         self.settings = settings or get_settings()
-        self.qdrant = qdrant
         self.events = events
 
     @property
@@ -87,7 +84,6 @@ class SkillService:
 
     def scan(self, db: Session) -> dict[str, Any]:
         self.root.mkdir(parents=True, exist_ok=True)
-        skill_docs: list[IndexDocument] = []
         count = 0
         for skill_md in sorted(self.root.rglob("SKILL.md")):
             skill_dir = skill_md.parent
@@ -120,22 +116,12 @@ class SkillService:
                         content=content,
                     )
                 )
-            skill_docs.append(
-                IndexDocument(
-                    key=skill_key,
-                    text="\n\n".join(files.values()),
-                    payload={"skill_key": skill_key, "name": name, "path": str(skill_dir)},
-                )
-            )
             self._sync_declared_tests(db, skill_key, metadata)
             count += 1
 
-        indexed = False
-        if self.qdrant:
-            indexed = self.qdrant.upsert_documents(self.settings.qdrant_skill_collection, skill_docs)
         if self.events:
-            self.events.emit("skills.scan", {"skills": count, "qdrant_indexed": indexed})
-        return {"skills": count, "qdrant_indexed": indexed}
+            self.events.emit("skills.scan", {"skills": count, "index": "file_mirror"})
+        return {"skills": count, "index": "file_mirror"}
 
     def list(self, db: Session, *, status: str | None = None, limit: int = 200) -> list[Skill]:
         stmt = select(Skill).order_by(Skill.skill_key).limit(max(1, min(limit, 1000)))
@@ -243,6 +229,12 @@ class SkillService:
                 "skill.proposal.created",
                 {"proposal_id": str(proposal.id), "target_type": target_type, "action": action},
             )
+            self.events.audit(
+                "evolution.proposal.create",
+                "evolution_proposal",
+                target_id=str(proposal.id),
+                payload={"target_type": target_type, "action": action},
+            )
         return proposal
 
     def list_proposals(self, db: Session, *, status: str | None = None, limit: int = 100) -> list[EvolutionProposal]:
@@ -296,6 +288,12 @@ class SkillService:
         self.scan(db)
         if self.events:
             self.events.emit("skill.proposal.applied", {"proposal_id": str(proposal.id), "skill_key": skill_key})
+            self.events.audit(
+                "skill.proposal.apply",
+                "evolution_proposal",
+                target_id=str(proposal.id),
+                payload={"skill_key": skill_key, "actor": actor},
+            )
         return proposal
 
     def rollback(self, db: Session, skill_key: str, *, actor: str = "admin") -> dict[str, Any]:
@@ -327,6 +325,7 @@ class SkillService:
         self.scan(db)
         if self.events:
             self.events.emit("skill.rollback", {"skill_key": key})
+            self.events.audit("skill.rollback", "skill", target_id=key, payload={"actor": actor})
         return {"ok": True, "skill_key": key, "restored_files": sorted(before)}
 
     def _sync_declared_tests(self, db: Session, skill_key: str, metadata: dict[str, Any]) -> None:
@@ -377,4 +376,3 @@ class SkillService:
         if base_resolved not in candidate.parents and candidate != base_resolved:
             raise ValueError(f"unsafe file path: {relative_path}")
         return candidate
-

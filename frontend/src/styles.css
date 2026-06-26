@@ -264,6 +264,29 @@ nav button.active {
   align-items: center;
 }
 
+.form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 10px;
+  align-items: start;
+}
+
+.form-grid textarea {
+  min-height: 74px;
+}
+
+.inline {
+  min-height: 38px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: #4d5a56;
+}
+
+.inline input {
+  width: auto;
+}
+
 .searchbox {
   display: flex;
   align-items: center;

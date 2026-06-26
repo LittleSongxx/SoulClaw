@@ -18,18 +18,9 @@ Thumbs.db
 # Runtime data (persisted via docker volumes)
 data/
 config/local.yaml
-workspace/credentials/
-workspace/files/
-workspace/knowledge/*
-!workspace/knowledge/wiki/
-!workspace/knowledge/wiki/**
-workspace/knowledge_modes/
-workspace/logs/
-workspace/memory/
-workspace/runtime/
-workspace/tmp/
-workspace/skills/.usage.json
-workspace/.zlagent/
+workspace/*
+!workspace/.gitkeep
+workspace_seed/**/history.jsonl
 
 # Build / packaging
 build/

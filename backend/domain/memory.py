@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import UTC, datetime
 from typing import Any
@@ -9,10 +10,10 @@ from typing import Any
 from sqlalchemy import desc, or_, select
 from sqlalchemy.orm import Session
 
+from backend.domain.workspace import WorkspaceService
 from backend.infra.config import Settings, get_settings
 from backend.infra.events import RuntimeEventBus
-from backend.infra.models import Memory, MemoryConflict, MemoryProbe
-from backend.infra.qdrant_index import IndexDocument, QdrantHybridIndex
+from backend.infra.models import EvolutionProposal, Memory, MemoryConflict, MemoryProbe
 
 L1_KINDS = {"control_axiom", "pinned_fact"}
 L2_KINDS = {"episodic", "user_fact", "agent_note", "error_signal"}
@@ -23,12 +24,12 @@ class MemoryService:
     def __init__(
         self,
         settings: Settings | None = None,
-        qdrant: QdrantHybridIndex | None = None,
         events: RuntimeEventBus | None = None,
+        workspace: WorkspaceService | None = None,
     ) -> None:
         self.settings = settings or get_settings()
-        self.qdrant = qdrant
         self.events = events
+        self.workspace = workspace or WorkspaceService(settings=self.settings, events=events)
 
     def create(
         self,
@@ -63,9 +64,11 @@ class MemoryService:
             if previous is not None:
                 previous.archived = True
         db.flush()
-        self._index([memory])
+        self._detect_conflicts(db, memory)
+        self._append_to_memory_file(memory)
         if self.events:
             self.events.emit("memory.create", {"memory_id": str(memory.id), "kind": kind, "source": source})
+            self.events.audit("memory.create", "memory", target_id=str(memory.id), payload={"kind": kind, "source": source})
         return memory
 
     def list(self, db: Session, *, kind: str | None = None, include_archived: bool = False, limit: int = 100) -> list[Memory]:
@@ -96,26 +99,14 @@ class MemoryService:
                 .limit(limit)
             )
         for memory in db.scalars(stmt).all():
-            records[str(memory.id)] = {"score": 1.0, "source": "postgres", "memory": memory}
-
-        if self.qdrant is not None and query.strip():
-            hits = self.qdrant.search(self.settings.qdrant_memory_collection, query, limit=limit)
-            ids = [
-                item.get("payload", {}).get("memory_id")
-                for item in hits
-                if item.get("payload", {}).get("memory_id")
-            ]
-            parsed_ids: list[uuid.UUID] = []
-            for raw in ids:
-                try:
-                    parsed_ids.append(uuid.UUID(str(raw)))
-                except ValueError:
-                    continue
-            if parsed_ids:
-                for memory in db.scalars(select(Memory).where(Memory.id.in_(parsed_ids), Memory.archived.is_(False))).all():
-                    hit = next((item for item in hits if item.get("payload", {}).get("memory_id") == str(memory.id)), {})
-                    records.setdefault(str(memory.id), {"score": hit.get("score"), "source": "qdrant", "memory": memory})
+            records[str(memory.id)] = {"score": 1.0, "source": "memory_index", "memory": memory}
         return list(records.values())[:limit]
+
+    def get(self, db: Session, memory_id: uuid.UUID) -> Memory | None:
+        return db.get(Memory, memory_id)
+
+    def file_context(self, *, limit_chars: int = 6000) -> str:
+        return self.workspace.read("memory").content[: max(1, limit_chars)]
 
     def resident_context(self, db: Session, query: str, *, dynamic_limit: int = 8) -> dict[str, list[Memory]]:
         resident_stmt = (
@@ -176,30 +167,180 @@ class MemoryService:
         memory.last_verified_at = datetime.now(UTC)
         memory.confidence = self._clamp(memory.confidence + confidence_delta)
         memory.stability = self._clamp(memory.stability + confidence_delta / 2)
+        if self.events:
+            self.events.audit("memory.verify", "memory", target_id=str(memory_id), payload={"confidence_delta": confidence_delta})
         return memory
 
-    def _index(self, memories: list[Memory]) -> None:
-        if self.qdrant is None:
-            return
-        docs = [
-            IndexDocument(
-                key=str(memory.id),
-                text=memory.content,
-                payload={
-                    "memory_id": str(memory.id),
-                    "kind": memory.kind,
-                    "source": memory.source,
-                    "importance": memory.importance,
-                    "confidence": memory.confidence,
-                    "stability": memory.stability,
-                    "pinned": memory.pinned,
-                },
+    def archive(self, db: Session, memory_id: uuid.UUID) -> Memory:
+        memory = db.get(Memory, memory_id)
+        if memory is None:
+            raise KeyError(f"memory not found: {memory_id}")
+        memory.archived = True
+        if self.events:
+            self.events.emit("memory.archive", {"memory_id": str(memory_id)})
+            self.events.audit("memory.archive", "memory", target_id=str(memory_id))
+        return memory
+
+    def apply_proposal(self, db: Session, proposal_id: uuid.UUID, *, actor: str = "admin") -> EvolutionProposal:
+        proposal = db.get(EvolutionProposal, proposal_id)
+        if proposal is None:
+            raise KeyError(f"proposal not found: {proposal_id}")
+        if proposal.status not in {"pending", "approved"}:
+            raise ValueError(f"proposal is not applyable: {proposal.status}")
+        if proposal.target_type != "memory":
+            raise ValueError("only memory proposals are applyable here")
+        action = proposal.action
+        payload = proposal.payload or {}
+        before: dict[str, Any] = {}
+        result: dict[str, Any]
+        if action == "create":
+            memory = self.create(
+                db,
+                kind=str(payload.get("kind") or "agent_note"),
+                content=str(payload["content"]),
+                source=str(payload.get("source") or "proposal"),
+                pinned=bool(payload.get("pinned", False)),
+                importance=float(payload.get("importance", 0.5)),
+                confidence=float(payload.get("confidence", 0.5)),
+                stability=float(payload.get("stability", 0.5)),
+                metadata=payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {},
             )
-            for memory in memories
-        ]
-        self.qdrant.upsert_documents(self.settings.qdrant_memory_collection, docs)
+            result = {"ok": True, "memory_id": str(memory.id), "action": action}
+        elif action == "supersede":
+            memory_id = uuid.UUID(str(payload["memory_id"]))
+            previous = db.get(Memory, memory_id)
+            if previous is None:
+                raise KeyError(f"memory not found: {memory_id}")
+            before = {"memory": self._snapshot(previous)}
+            replacement = {
+                "kind": payload.get("kind") or previous.kind,
+                "content": str(payload["content"]),
+                "source": payload.get("source", "proposal"),
+                "pinned": payload.get("pinned", previous.pinned),
+                "importance": payload.get("importance", previous.importance),
+                "confidence": payload.get("confidence", previous.confidence),
+                "stability": payload.get("stability", previous.stability),
+                "metadata": payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {},
+            }
+            memory = self.supersede(db, memory_id, replacement)
+            result = {"ok": True, "memory_id": str(memory.id), "supersedes_id": str(memory_id), "action": action}
+        elif action == "archive":
+            memory_id = uuid.UUID(str(payload["memory_id"]))
+            previous = db.get(Memory, memory_id)
+            if previous is None:
+                raise KeyError(f"memory not found: {memory_id}")
+            before = {"memory": self._snapshot(previous)}
+            self.archive(db, memory_id)
+            result = {"ok": True, "memory_id": str(memory_id), "action": action}
+        elif action == "verify":
+            memory_id = uuid.UUID(str(payload["memory_id"]))
+            previous = db.get(Memory, memory_id)
+            if previous is None:
+                raise KeyError(f"memory not found: {memory_id}")
+            before = {"memory": self._snapshot(previous)}
+            memory = self.mark_verified(db, memory_id, confidence_delta=float(payload.get("confidence_delta", 0.05)))
+            result = {"ok": True, "memory_id": str(memory.id), "action": action}
+        else:
+            raise ValueError("memory proposal action must be create, supersede, archive, or verify")
+        proposal.status = "applied"
+        proposal.before_snapshot = before
+        proposal.after_snapshot = result
+        proposal.result = result | {"actor": actor}
+        proposal.applied_at = datetime.now(UTC)
+        if self.events:
+            self.events.emit("memory.proposal.applied", {"proposal_id": str(proposal.id), "action": action})
+            self.events.audit(
+                "memory.proposal.apply",
+                "evolution_proposal",
+                target_id=str(proposal.id),
+                payload={"action": action, "actor": actor},
+            )
+        return proposal
 
     @staticmethod
     def _clamp(value: float) -> float:
         return max(0.0, min(1.0, float(value)))
 
+    def _append_to_memory_file(self, memory: Memory) -> None:
+        try:
+            item = self.workspace.read("memory")
+            marker = f"<!-- zlagent:memory id={memory.id} -->"
+            if marker in item.content:
+                return
+            line = (
+                f"\n\n{marker}\n"
+                f"- ({memory.kind}, source={memory.source}, confidence={memory.confidence:.2f}) "
+                f"{memory.content.strip()}\n"
+            )
+            self.workspace.write("memory", item.content.rstrip() + line, actor="memory-service")
+        except Exception as exc:  # noqa: BLE001
+            if self.events:
+                self.events.emit(
+                    "memory.file_append.failed",
+                    {"memory_id": str(memory.id), "error": str(exc)},
+                    severity="warning",
+                )
+
+    def _detect_conflicts(self, db: Session, memory: Memory) -> None:
+        tokens = self._tokens(memory.content)
+        if len(tokens) < 4:
+            return
+        candidates = list(
+            db.scalars(
+                select(Memory)
+                .where(Memory.id != memory.id, Memory.archived.is_(False), Memory.kind == memory.kind)
+                .order_by(desc(Memory.updated_at))
+                .limit(50)
+            ).all()
+        )
+        for candidate in candidates:
+            overlap = self._jaccard(tokens, self._tokens(candidate.content))
+            if overlap < 0.62 or candidate.content.strip() == memory.content.strip():
+                continue
+            existing = db.scalar(
+                select(MemoryConflict)
+                .where(
+                    or_(
+                        (MemoryConflict.left_memory_id == candidate.id)
+                        & (MemoryConflict.right_memory_id == memory.id),
+                        (MemoryConflict.left_memory_id == memory.id)
+                        & (MemoryConflict.right_memory_id == candidate.id),
+                    ),
+                    MemoryConflict.status == "open",
+                )
+                .limit(1)
+            )
+            if existing is None:
+                db.add(
+                    MemoryConflict(
+                        left_memory_id=candidate.id,
+                        right_memory_id=memory.id,
+                        status="open",
+                        reason=f"Similar {memory.kind} memories may conflict (token overlap {overlap:.2f}).",
+                    )
+                )
+
+    @staticmethod
+    def _tokens(text: str) -> set[str]:
+        return {item for item in re.findall(r"[a-zA-Z0-9_\u4e00-\u9fff]+", text.lower()) if len(item) > 1}
+
+    @staticmethod
+    def _jaccard(left: set[str], right: set[str]) -> float:
+        if not left or not right:
+            return 0.0
+        return len(left & right) / len(left | right)
+
+    @staticmethod
+    def _snapshot(memory: Memory) -> dict[str, Any]:
+        return {
+            "id": str(memory.id),
+            "kind": memory.kind,
+            "content": memory.content,
+            "source": memory.source,
+            "pinned": memory.pinned,
+            "archived": memory.archived,
+            "importance": memory.importance,
+            "confidence": memory.confidence,
+            "stability": memory.stability,
+            "metadata": memory.metadata_json or {},
+        }

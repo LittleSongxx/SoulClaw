@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import uuid
 from contextlib import contextmanager
 
@@ -90,3 +92,39 @@ def test_gateway_disabled_connection_is_rejected(monkeypatch: pytest.MonkeyPatch
 
     with pytest.raises(RuntimeError):
         manager.send(OutboundGatewayMessage(gateway_name="local", target_id="user-1", text="hi"))
+
+
+def test_gateway_inbound_validates_optional_hmac_signature(monkeypatch: pytest.MonkeyPatch) -> None:
+    gateway = DummyGateway(kind="webhook")
+    gateway.config = {"secret": "secret"}
+    monkeypatch.setattr("backend.runtime.gateway.session_scope", lambda: fake_session_scope(gateway))
+    manager = GatewayRuntimeManager(agent=DummyAgent(), events=DummyEvents())
+    signature = hmac.new(b"secret", b"hello", hashlib.sha256).hexdigest()
+
+    result = manager.handle_inbound(
+        InboundGatewayMessage(
+            gateway_name="local",
+            external_user_id="user-1",
+            text="hello",
+            metadata={"signature": f"sha256={signature}"},
+        )
+    )
+
+    assert result["answer"] == "reply: hello"
+
+
+def test_gateway_inbound_rejects_bad_hmac_signature(monkeypatch: pytest.MonkeyPatch) -> None:
+    gateway = DummyGateway(kind="webhook")
+    gateway.config = {"secret": "secret"}
+    monkeypatch.setattr("backend.runtime.gateway.session_scope", lambda: fake_session_scope(gateway))
+    manager = GatewayRuntimeManager(agent=DummyAgent(), events=DummyEvents())
+
+    with pytest.raises(RuntimeError):
+        manager.handle_inbound(
+            InboundGatewayMessage(
+                gateway_name="local",
+                external_user_id="user-1",
+                text="hello",
+                metadata={"signature": "bad"},
+            )
+        )

@@ -6,8 +6,10 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from backend.api.admin.deps import get_current_user, get_db, get_dream_runtime
-from backend.runtime.dream import DreamRuntime
+from backend.api.admin.deps import get_current_user, get_db, get_job_service
+from backend.api.admin.serializers import background_job_to_dict
+from backend.domain.jobs import BackgroundJobService, enqueue_background_job
+from backend.infra.models import User
 
 router = APIRouter(prefix="/api/dream", tags=["dream"], dependencies=[Depends(get_current_user)])
 
@@ -21,12 +23,14 @@ class DreamRunRequest(BaseModel):
 def run_dream(
     payload: DreamRunRequest,
     db: Session = Depends(get_db),
-    runtime: DreamRuntime = Depends(get_dream_runtime),
+    jobs: BackgroundJobService = Depends(get_job_service),
+    user: User = Depends(get_current_user),
 ) -> dict:
-    result = runtime.run_review(db, window_hours=payload.window_hours, limit=payload.limit)
-    return {
-        "scanned_memories": result.scanned_memories,
-        "failed_tool_runs": result.failed_tool_runs,
-        "proposals_created": result.proposals_created,
-        "proposal_ids": result.proposal_ids,
-    }
+    job = enqueue_background_job(
+        db,
+        task_name="dream_review",
+        payload=payload.model_dump(),
+        triggered_by=user.username,
+        service=jobs,
+    )
+    return {"job": background_job_to_dict(job)}

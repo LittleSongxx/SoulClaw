@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from backend.infra.config import Settings
 from backend.infra.security import hash_password, verify_password
 
@@ -37,3 +39,18 @@ def test_password_hash_roundtrip() -> None:
 
     assert verify_password("correct horse battery staple", encoded)
     assert not verify_password("wrong", encoded)
+
+
+def test_cors_origins_accepts_comma_separated_env(monkeypatch) -> None:
+    monkeypatch.setenv("ZLAGENT_CORS_ORIGINS", "https://a.example, https://b.example")
+
+    settings = Settings()
+
+    assert settings.cors_origins == ["https://a.example", "https://b.example"]
+
+
+def test_production_rejects_default_secrets() -> None:
+    settings = Settings(environment="production")
+
+    with pytest.raises(RuntimeError, match="ZLAGENT_JWT_SECRET"):
+        settings.validate_runtime_secrets()

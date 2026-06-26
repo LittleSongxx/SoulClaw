@@ -71,3 +71,20 @@ def test_mcp_tool_definition_is_gated_external_tool(monkeypatch: pytest.MonkeyPa
     assert definition.requires_approval is True
     assert definition.parameters["properties"]["text"]["type"] == "string"
     assert result["args"] == {"text": "hello"}
+
+
+def test_mcp_safe_permission_override_registers_read_tool(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = MCPRuntimeManager(events=DummyEvents())
+    descriptor = MCPToolDescriptor(
+        server_name="server",
+        tool_name="search",
+        description="Search",
+        input_schema={},
+        permission="safe",
+    )
+    monkeypatch.setattr(manager, "call_tool_sync", lambda server, tool, args: {"ok": True})
+
+    definition = manager._tool_definition(descriptor, available=True)
+
+    assert definition.scope == "external.read"
+    assert definition.requires_approval is False

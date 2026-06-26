@@ -120,8 +120,16 @@ class ToolRegistry:
     def _register_builtin_tools(self) -> None:
         self.register(
             ToolDefinition(
+                name="wiki_orient",
+                description="Read LLM-Wiki schema, index, recent log, and page map before retrieval.",
+                scope="wiki.read",
+                handler=self._wiki_orient,
+            )
+        )
+        self.register(
+            ToolDefinition(
                 name="wiki_search",
-                description="Search Markdown Wiki pages through Postgres and Qdrant mirrors.",
+                description="Search the Wiki page index. Use wiki_read before relying on a page as evidence.",
                 scope="wiki.read",
                 handler=self._wiki_search,
             )
@@ -136,8 +144,34 @@ class ToolRegistry:
         )
         self.register(
             ToolDefinition(
+                name="wiki_follow_links",
+                description="Traverse resolved Wiki links from or to a page_key.",
+                scope="wiki.read",
+                handler=self._wiki_follow_links,
+                parameters={
+                    "type": "object",
+                    "required": ["page_key"],
+                    "properties": {
+                        "page_key": {"type": "string"},
+                        "direction": {"type": "string", "enum": ["out", "in", "both"]},
+                        "limit": {"type": "integer"},
+                    },
+                },
+            )
+        )
+        self.register(
+            ToolDefinition(
+                name="wiki_lint",
+                description="Lint LLM-Wiki structure and write Error Book entries.",
+                scope="wiki.write",
+                requires_approval=False,
+                handler=self._wiki_lint,
+            )
+        )
+        self.register(
+            ToolDefinition(
                 name="wiki_compile",
-                description="Compile Markdown Wiki source into Postgres and Qdrant mirrors.",
+                description="Compile Markdown Wiki source into the local page/link/error-book index.",
                 scope="wiki.write",
                 requires_approval=False,
                 handler=self._wiki_compile,
@@ -146,9 +180,22 @@ class ToolRegistry:
         self.register(
             ToolDefinition(
                 name="memory_search",
-                description="Search layered long-term memory.",
+                description="Search long-term memory index and return readable memory references.",
                 scope="memory.read",
                 handler=self._memory_search,
+            )
+        )
+        self.register(
+            ToolDefinition(
+                name="memory_get",
+                description="Read one long-term memory item by id.",
+                scope="memory.read",
+                handler=self._memory_get,
+                parameters={
+                    "type": "object",
+                    "required": ["memory_id"],
+                    "properties": {"memory_id": {"type": "string"}},
+                },
             )
         )
         self.register(
@@ -198,15 +245,22 @@ class ToolRegistry:
             )
         )
 
+    def _wiki_orient(self, db: Session, arguments: dict[str, Any]) -> dict[str, Any]:
+        return self.wiki.orientation(db, recent_log_lines=int(arguments.get("recent_log_lines") or 40))
+
     def _wiki_search(self, db: Session, arguments: dict[str, Any]) -> dict[str, Any]:
         query = str(arguments.get("query") or "")
         limit = int(arguments.get("limit") or 10)
         return {
             "items": [
                 {
-                    "page_key": item["page"].page_key,
-                    "title": item["page"].title,
-                    "summary": item["page"].summary,
+                    "page_key": item["page_key"],
+                    "title": item["title"],
+                    "path": item["path"],
+                    "summary": item["summary"],
+                    "tags": item.get("tags", []),
+                    "page_type": item.get("page_type", ""),
+                    "confidence": item.get("confidence", 0.5),
                     "source": item["source"],
                     "score": item["score"],
                 }
@@ -219,10 +273,33 @@ class ToolRegistry:
         page = self.wiki.read(db, page_key)
         if page is None:
             raise KeyError(f"wiki page not found: {page_key}")
-        return {"page_key": page.page_key, "title": page.title, "summary": page.summary, "body": page.body}
+        graph = self.wiki.read_with_graph(db, page_key)
+        return {
+            "page_key": page.page_key,
+            "title": page.title,
+            "summary": page.summary,
+            "body": page.body,
+            "metadata": page.metadata_json or {},
+            "outlinks": graph["outlinks"] if graph else [],
+            "backlinks": graph["backlinks"] if graph else [],
+        }
+
+    def _wiki_follow_links(self, db: Session, arguments: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "items": self.wiki.follow_links(
+                db,
+                str(arguments["page_key"]),
+                direction=str(arguments.get("direction") or "out"),
+                limit=int(arguments.get("limit") or 50),
+            )
+        }
 
     def _wiki_compile(self, db: Session, arguments: dict[str, Any]) -> dict[str, Any]:
         return self.wiki.compile(db)
+
+    def _wiki_lint(self, db: Session, arguments: dict[str, Any]) -> dict[str, Any]:
+        del arguments
+        return self.wiki.lint(db)
 
     def _memory_search(self, db: Session, arguments: dict[str, Any]) -> dict[str, Any]:
         query = str(arguments.get("query") or "")
@@ -232,12 +309,29 @@ class ToolRegistry:
                 {
                     "id": str(item["memory"].id),
                     "kind": item["memory"].kind,
-                    "content": item["memory"].content,
                     "source": item["source"],
                     "score": item["score"],
+                    "summary": item["memory"].content[:500],
                 }
                 for item in self.memory.search(db, query, limit=limit)
             ]
+        }
+
+    def _memory_get(self, db: Session, arguments: dict[str, Any]) -> dict[str, Any]:
+        memory_id = uuid.UUID(str(arguments.get("memory_id") or ""))
+        memory = self.memory.get(db, memory_id)
+        if memory is None:
+            raise KeyError(f"memory not found: {memory_id}")
+        return {
+            "id": str(memory.id),
+            "kind": memory.kind,
+            "content": memory.content,
+            "source": memory.source,
+            "pinned": memory.pinned,
+            "importance": memory.importance,
+            "confidence": memory.confidence,
+            "stability": memory.stability,
+            "metadata": memory.metadata_json or {},
         }
 
     def _memory_create(self, db: Session, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -326,7 +420,25 @@ class ToolExecutor:
                     turn_id=turn_id,
                 )
             raise PermissionError(f"tool requires approval: {tool_name}")
-        self.safety.validate(definition, arguments, approved=approved)
+        if approved and self.events:
+            self.events.audit(
+                "tool.approved_execution",
+                "tool",
+                target_id=tool_name,
+                payload={"tool_name": tool_name, "arguments": arguments, "turn_id": turn_id},
+            )
+            self.events.emit("tool.approved_execution", {"tool_name": tool_name}, turn_id=turn_id)
+        try:
+            self.safety.validate(definition, arguments, approved=approved)
+        except PermissionError as exc:
+            if self.events:
+                self.events.emit(
+                    "tool.blocked",
+                    {"tool_name": tool_name, "error": str(exc)},
+                    severity="warning",
+                    turn_id=turn_id,
+                )
+            raise
 
         run = ToolRun(
             turn_id=turn_id,

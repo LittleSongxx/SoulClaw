@@ -13,21 +13,25 @@ from loguru import logger
 
 from . import __version__
 from .api.admin import auth, control, dream, memory, platform, skills, tools, wiki
+from .domain.conversation import ConversationService
+from .domain.evolution import EvolutionService
+from .domain.jobs import BackgroundJobService
 from .domain.memory import MemoryService
 from .domain.platform import PlatformService
 from .domain.skills import SkillService
 from .domain.tools import ToolExecutor, ToolRegistry
 from .domain.wiki import WikiService
+from .domain.workspace import WorkspaceService
 from .infra.config import get_settings
 from .infra.db import run_alembic_upgrade, session_scope
 from .infra.events import RuntimeEventBus
-from .infra.qdrant_index import QdrantHybridIndex
 from .infra.redis_cache import build_redis_client
 from .infra.security import ensure_admin_user
 from .runtime.agent import AgentRuntime
 from .runtime.cron import CronScheduler
 from .runtime.dream import DreamRuntime
 from .runtime.gateway import GatewayRuntimeManager
+from .runtime.heartbeat import HeartbeatRuntime
 from .runtime.llm import OpenAICompatibleClient
 from .runtime.mcp import MCPRuntimeManager
 
@@ -35,6 +39,7 @@ from .runtime.mcp import MCPRuntimeManager
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
+    settings.validate_runtime_secrets()
     settings.ensure_directories()
     logger.remove()
     logger.add(lambda msg: print(msg, end=""), level=settings.log_level.upper())
@@ -48,14 +53,23 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         admin = ensure_admin_user(db, settings)
         logger.info("admin user ready: {}", admin.username)
 
-    qdrant = QdrantHybridIndex(settings)
-    qdrant.ensure_collections()
     redis_client = build_redis_client(settings)
 
-    wiki_service = WikiService(settings=settings, qdrant=qdrant, events=events)
-    memory_service = MemoryService(settings=settings, qdrant=qdrant, events=events)
-    skill_service = SkillService(settings=settings, qdrant=qdrant, events=events)
+    workspace_service = WorkspaceService(settings=settings, events=events)
+    workspace_service.ensure_files()
+    wiki_service = WikiService(settings=settings, events=events)
+    memory_service = MemoryService(settings=settings, events=events, workspace=workspace_service)
+    skill_service = SkillService(settings=settings, events=events)
+    conversation_service = ConversationService(events=events)
     platform_service = PlatformService(events=events)
+    job_service = BackgroundJobService(events=events)
+    evolution_service = EvolutionService(
+        skills=skill_service,
+        memory=memory_service,
+        wiki=wiki_service,
+        workspace=workspace_service,
+        events=events,
+    )
     tool_registry = ToolRegistry(wiki=wiki_service, memory=memory_service, skills=skill_service, events=events)
     mcp_runtime = MCPRuntimeManager(
         events=events,
@@ -78,20 +92,26 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         tools=tool_executor,
         registry=tool_registry,
         llm=llm_client,
+        conversation=conversation_service,
+        workspace=workspace_service,
     )
     gateway_runtime = GatewayRuntimeManager(agent=agent_runtime, events=events)
     tool_registry.install_gateway(gateway_runtime)
     dream_runtime = DreamRuntime(skills=skill_service, events=events)
-    cron_scheduler = CronScheduler(agent=agent_runtime, dream=dream_runtime, events=events)
+    heartbeat_runtime = HeartbeatRuntime(workspace=workspace_service, skills=skill_service, events=events)
+    cron_scheduler = CronScheduler(agent=agent_runtime, dream=dream_runtime, jobs=job_service, events=events)
 
     app.state.settings = settings
     app.state.event_bus = events
-    app.state.qdrant_index = qdrant
     app.state.redis_client = redis_client
+    app.state.workspace_service = workspace_service
     app.state.wiki_service = wiki_service
     app.state.memory_service = memory_service
     app.state.skill_service = skill_service
+    app.state.conversation_service = conversation_service
+    app.state.job_service = job_service
     app.state.platform_service = platform_service
+    app.state.evolution_service = evolution_service
     app.state.tool_registry = tool_registry
     app.state.tool_executor = tool_executor
     app.state.mcp_runtime = mcp_runtime
@@ -99,6 +119,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.agent_runtime = agent_runtime
     app.state.gateway_runtime = gateway_runtime
     app.state.dream_runtime = dream_runtime
+    app.state.heartbeat_runtime = heartbeat_runtime
     app.state.cron_scheduler = cron_scheduler
 
     events.emit("runtime.started", {"version": __version__, "environment": settings.environment})
@@ -137,12 +158,28 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("[dream] startup cron ensure failed: {}", exc)
                 events.emit("dream.bootstrap.failed", {"error": str(exc)}, severity="warning")
+        if settings.heartbeat_enabled:
+            try:
+                platform_service.ensure_system_cron_job(
+                    db,
+                    name="system-heartbeat",
+                    cron_expr=settings.heartbeat_cron,
+                    timezone=settings.heartbeat_timezone,
+                    instruction="Review HEARTBEAT.md active tasks and create pending proposals.",
+                    metadata={"system_task": "heartbeat", "managed_by": "zlagent", "task_name": "heartbeat_check"},
+                    enabled=True,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[heartbeat] startup cron ensure failed: {}", exc)
+                events.emit("heartbeat.bootstrap.failed", {"error": str(exc)}, severity="warning")
     cron_scheduler.schedule_missing()
-    cron_scheduler.start()
+    if settings.api_scheduler_enabled:
+        cron_scheduler.start()
     try:
         yield
     finally:
-        await cron_scheduler.stop()
+        if settings.api_scheduler_enabled:
+            await cron_scheduler.stop()
         events.emit("runtime.stopped", {"version": __version__})
         if redis_client is not None:
             redis_client.close()
@@ -154,7 +191,7 @@ def create_app() -> FastAPI:
     app = FastAPI(title=settings.app_name, version=__version__, lifespan=lifespan)
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origins=settings.cors_origins,
         allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],

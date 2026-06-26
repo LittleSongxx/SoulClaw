@@ -9,8 +9,14 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from backend.api.admin.deps import get_current_user, get_db, get_skill_service
+from backend.api.admin.deps import (
+    get_current_user,
+    get_db,
+    get_evolution_service,
+    get_skill_service,
+)
 from backend.api.admin.serializers import proposal_to_dict, skill_file_to_dict, skill_to_dict
+from backend.domain.evolution import EvolutionService
 from backend.domain.skills import SkillService
 from backend.infra.models import User
 
@@ -23,6 +29,10 @@ class ProposalCreateRequest(BaseModel):
     risk_level: str = "medium"
     payload: dict[str, Any]
     evidence: dict[str, Any] = Field(default_factory=dict)
+
+
+class ProposalRejectRequest(BaseModel):
+    reason: str = ""
 
 
 @router.get("")
@@ -79,6 +89,23 @@ def apply_proposal(
 ) -> dict:
     try:
         proposal = service.apply_proposal(db, proposal_id, actor=user.username)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return proposal_to_dict(proposal)
+
+
+@router.post("/proposals/{proposal_id}/reject")
+def reject_proposal(
+    proposal_id: uuid.UUID,
+    payload: ProposalRejectRequest,
+    db: Session = Depends(get_db),
+    service: EvolutionService = Depends(get_evolution_service),
+    user: User = Depends(get_current_user),
+) -> dict:
+    try:
+        proposal = service.reject(db, proposal_id, actor=user.username, reason=payload.reason)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
