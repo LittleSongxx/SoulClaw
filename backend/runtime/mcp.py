@@ -1,4 +1,4 @@
-"""MCP discovery and transient tool execution for the ZLAgent runtime."""
+"""MCP discovery and transient tool execution for the SoulClaw runtime."""
 
 from __future__ import annotations
 

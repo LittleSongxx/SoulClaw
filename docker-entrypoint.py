@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Docker entrypoint for ZLAgent.
+"""Docker entrypoint for SoulClaw.
 
 Responsibilities:
   * Ensure persistent directories exist.
   * Seed workspace with defaults without overwriting user data.
-  * Start the uvicorn server bound to ZLAGENT_HOST:ZLAGENT_PORT.
+  * Start the uvicorn server bound to SOULCLAW_HOST:SOULCLAW_PORT.
 """
 from __future__ import annotations
 
@@ -50,15 +50,15 @@ def copy_missing_tree(src: Path, dst: Path) -> int:
 
 
 def main() -> int:
-    os.environ.setdefault("ZLAGENT_HOST", "0.0.0.0")
-    os.environ.setdefault("ZLAGENT_PORT", "8020")
-    os.environ.setdefault("ZLAGENT_WORKSPACE_DIR", str(DEFAULT_WORKSPACE))
-    os.environ.setdefault("ZLAGENT_WORKSPACE_SEED_DIR", str(SEED_WORKSPACE))
+    os.environ.setdefault("SOULCLAW_HOST", "0.0.0.0")
+    os.environ.setdefault("SOULCLAW_PORT", "8020")
+    os.environ.setdefault("SOULCLAW_WORKSPACE_DIR", str(DEFAULT_WORKSPACE))
+    os.environ.setdefault("SOULCLAW_WORKSPACE_SEED_DIR", str(SEED_WORKSPACE))
     os.environ.setdefault("PYTHONUNBUFFERED", "1")
     os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 
-    workspace = Path(os.environ["ZLAGENT_WORKSPACE_DIR"]).expanduser()
-    workspace_seed = Path(os.environ["ZLAGENT_WORKSPACE_SEED_DIR"]).expanduser()
+    workspace = Path(os.environ["SOULCLAW_WORKSPACE_DIR"]).expanduser()
+    workspace_seed = Path(os.environ["SOULCLAW_WORKSPACE_SEED_DIR"]).expanduser()
     (APP_DIR / "data").mkdir(parents=True, exist_ok=True)
     (APP_DIR / "config").mkdir(parents=True, exist_ok=True)
     workspace.mkdir(parents=True, exist_ok=True)
@@ -70,9 +70,9 @@ def main() -> int:
         "uvicorn",
         "backend.app:app",
         "--host",
-        os.environ["ZLAGENT_HOST"],
+        os.environ["SOULCLAW_HOST"],
         "--port",
-        os.environ["ZLAGENT_PORT"],
+        os.environ["SOULCLAW_PORT"],
     ]
     return subprocess.call(command, cwd=str(APP_DIR))
 

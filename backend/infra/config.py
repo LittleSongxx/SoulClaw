@@ -1,4 +1,4 @@
-"""Platform settings for the current ZLAgent runtime."""
+"""Platform settings for the current SoulClaw runtime."""
 
 from __future__ import annotations
 
@@ -14,19 +14,19 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 class Settings(BaseSettings):
     """Runtime configuration loaded from environment and `.env`.
 
-    The canonical variables use the `ZLAGENT_` prefix. `DATABASE_URL`
+    The canonical variables use the `SOULCLAW_` prefix. `DATABASE_URL`
     remains accepted as a backup alias, but docs and compose use
-    `ZLAGENT_DATABASE_URL`.
+    `SOULCLAW_DATABASE_URL`.
     """
 
     model_config = SettingsConfigDict(
         env_file=".env",
-        env_prefix="ZLAGENT_",
+        env_prefix="SOULCLAW_",
         case_sensitive=False,
         extra="ignore",
     )
 
-    app_name: str = "ZLAgent"
+    app_name: str = "SoulClaw"
     environment: str = "development"
     host: str = "127.0.0.1"
     port: int = 8020
@@ -45,8 +45,8 @@ class Settings(BaseSettings):
     packages_dir: Path = Path(".packages")
 
     database_url: str = Field(
-        default="sqlite:///data/zlagent.sqlite3",
-        validation_alias=AliasChoices("ZLAGENT_DATABASE_URL", "DATABASE_URL"),
+        default="sqlite:///data/soulclaw.sqlite3",
+        validation_alias=AliasChoices("SOULCLAW_DATABASE_URL", "DATABASE_URL"),
     )
     redis_url: str = "redis://localhost:6379/0"
     celery_broker_url: str | None = None
@@ -58,7 +58,7 @@ class Settings(BaseSettings):
     skills_root: Path | None = None
 
     admin_username: str = "admin"
-    admin_password: str = "zlagent-admin"
+    admin_password: str = "soulclaw-admin"
     jwt_secret: str = "change-me-for-production"
     jwt_algorithm: str = "HS256"
     jwt_access_token_minutes: int = 60 * 12
@@ -83,6 +83,13 @@ class Settings(BaseSettings):
     heartbeat_cron: str = "*/30 * * * *"
     heartbeat_timezone: str = "Asia/Shanghai"
     gateway_heartbeat_timeout_seconds: int = 120
+    public_base_url: str = ""
+    a2a_http_timeout_seconds: float = 60.0
+    a2a_bootstrap_weaver_enabled: bool = True
+    a2a_weaver_base_url: str = "http://127.0.0.1:8001"
+    a2a_weaver_internal_api_key: str = ""
+    a2a_weaver_auth_user_header: str = "X-Weaver-User"
+    a2a_weaver_user_id: str = "soulclaw"
 
     @property
     def resolved_celery_broker_url(self) -> str:
@@ -136,11 +143,11 @@ class Settings(BaseSettings):
         if self.environment.lower() not in {"production", "prod"} or not self.require_production_secrets:
             return
         if self.jwt_secret == "change-me-for-production":
-            raise RuntimeError("ZLAGENT_JWT_SECRET must be changed in production")
-        if self.admin_password == "zlagent-admin":
-            raise RuntimeError("ZLAGENT_ADMIN_PASSWORD must be changed in production")
+            raise RuntimeError("SOULCLAW_JWT_SECRET must be changed in production")
+        if self.admin_password == "soulclaw-admin":
+            raise RuntimeError("SOULCLAW_ADMIN_PASSWORD must be changed in production")
         if not self.cors_origins or "*" in self.cors_origins:
-            raise RuntimeError("ZLAGENT_CORS_ORIGINS must be explicit in production")
+            raise RuntimeError("SOULCLAW_CORS_ORIGINS must be explicit in production")
 
 
 @lru_cache(maxsize=1)

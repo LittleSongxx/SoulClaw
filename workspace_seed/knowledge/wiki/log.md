@@ -3,7 +3,7 @@ title: Wiki Log
 page_key: log
 type: log
 tags:
-  - zlagent
+  - soulclaw
   - llm-wiki
 confidence: 0.9
 summary: Append-only operation log for Wiki maintenance.
@@ -11,4 +11,4 @@ summary: Append-only operation log for Wiki maintenance.
 
 # Wiki Log
 
-- Initialized default ZLAgent LLM-Wiki seed.
+- Initialized default SoulClaw LLM-Wiki seed.

@@ -155,7 +155,7 @@ class ConversationService:
         prompt = [
             {
                 "role": "system",
-                "content": "Summarize this ZLAgent session for future short-term context. Keep durable facts, goals, decisions, and unresolved threads. Be concise.",
+                "content": "Summarize this SoulClaw session for future short-term context. Keep durable facts, goals, decisions, and unresolved threads. Be concise.",
             },
             {"role": "user", "content": transcript},
         ]

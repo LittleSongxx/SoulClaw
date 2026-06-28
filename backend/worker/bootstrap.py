@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from backend.domain.a2a import A2AService
 from backend.domain.jobs import BackgroundJobService
 from backend.domain.memory import MemoryService
 from backend.domain.platform import PlatformService
@@ -12,6 +13,7 @@ from backend.domain.wiki import WikiService
 from backend.domain.workspace import WorkspaceService
 from backend.infra.config import get_settings
 from backend.infra.events import RuntimeEventBus
+from backend.runtime.a2a import A2ARuntimeManager
 from backend.runtime.dream import DreamRuntime
 from backend.runtime.heartbeat import HeartbeatRuntime
 from backend.runtime.mcp import MCPRuntimeManager
@@ -28,6 +30,7 @@ class WorkerServices:
     jobs: BackgroundJobService
     platform: PlatformService
     mcp: MCPRuntimeManager
+    a2a: A2ARuntimeManager
 
 
 def build_worker_services() -> WorkerServices:
@@ -38,6 +41,7 @@ def build_worker_services() -> WorkerServices:
     wiki = WikiService(settings=settings, events=events)
     memory = MemoryService(settings=settings, events=events, workspace=workspace)
     skills = SkillService(settings=settings, events=events)
+    a2a_service = A2AService(events=events)
     return WorkerServices(
         events=events,
         wiki=wiki,
@@ -51,5 +55,11 @@ def build_worker_services() -> WorkerServices:
             events=events,
             discovery_timeout_seconds=settings.mcp_discovery_timeout_seconds,
             call_timeout_seconds=settings.mcp_call_timeout_seconds,
+        ),
+        a2a=A2ARuntimeManager(
+            service=a2a_service,
+            events=events,
+            settings=settings,
+            http_timeout_seconds=settings.a2a_http_timeout_seconds,
         ),
     )

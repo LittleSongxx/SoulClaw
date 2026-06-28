@@ -10,7 +10,7 @@ tags:
   - digest
   - scheduled
 metadata:
-  zlagent:
+  soulclaw:
     category: research
     triggers:
       - 最新论文

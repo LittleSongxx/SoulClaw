@@ -9,7 +9,7 @@ tags:
   - utility
   - weather
 metadata:
-  zlagent:
+  soulclaw:
     category: research
     triggers:
       - 天气

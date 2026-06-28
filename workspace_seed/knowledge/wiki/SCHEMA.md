@@ -3,10 +3,10 @@ title: Wiki Schema
 page_key: schema
 type: schema
 tags:
-  - zlagent
+  - soulclaw
   - llm-wiki
 confidence: 0.9
-summary: Default writing and structure rules for the ZLAgent LLM-Wiki.
+summary: Default writing and structure rules for the SoulClaw LLM-Wiki.
 ---
 
 # Wiki Schema

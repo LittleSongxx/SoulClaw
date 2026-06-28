@@ -1,1 +1,1 @@
-"""Infrastructure adapters for the ZLAgent platform runtime."""
+"""Infrastructure adapters for the SoulClaw platform runtime."""

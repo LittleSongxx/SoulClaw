@@ -1,4 +1,4 @@
-"""Tool registry, safety floor, and auditable execution for ZLAgent."""
+"""Tool registry, safety floor, and auditable execution for SoulClaw."""
 
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ from backend.infra.events import RuntimeEventBus
 from backend.infra.models import ToolRun
 
 if TYPE_CHECKING:
+    from backend.runtime.a2a import A2ARuntimeManager
     from backend.runtime.gateway import GatewayRuntimeManager
 
 ToolHandler = Callable[[Session, dict[str, Any]], dict[str, Any]]
@@ -80,16 +81,20 @@ class ToolRegistry:
         skills: SkillService,
         events: RuntimeEventBus | None = None,
         gateway: GatewayRuntimeManager | None = None,
+        a2a: A2ARuntimeManager | None = None,
     ) -> None:
         self.wiki = wiki
         self.memory = memory
         self.skills = skills
         self.events = events
         self.gateway = gateway
+        self.a2a = a2a
         self._tools: dict[str, ToolDefinition] = {}
         self._register_builtin_tools()
         if self.gateway is not None:
             self.install_gateway(self.gateway)
+        if self.a2a is not None:
+            self.install_a2a(self.a2a)
 
     def list(self) -> list[ToolDefinition]:
         return sorted(self._tools.values(), key=lambda item: item.name)
@@ -245,6 +250,33 @@ class ToolRegistry:
             )
         )
 
+    def install_a2a(self, a2a: A2ARuntimeManager) -> None:
+        self.a2a = a2a
+        self.register(
+            ToolDefinition(
+                name="a2a_delegate",
+                description=(
+                    "Delegate a coarse-grained task to an enabled A2A specialist agent. "
+                    "Use for DeepResearch, document projects, scheduling, or coding agents."
+                ),
+                scope="external.write",
+                requires_approval=False,
+                parameters={
+                    "type": "object",
+                    "required": ["capability", "query"],
+                    "properties": {
+                        "capability": {"type": "string"},
+                        "query": {"type": "string"},
+                        "connection_name": {"type": "string"},
+                        "context": {"type": "object"},
+                        "files": {"type": "array", "items": {"type": "object"}},
+                        "options": {"type": "object"},
+                    },
+                },
+                handler=self._a2a_delegate,
+            )
+        )
+
     def _wiki_orient(self, db: Session, arguments: dict[str, Any]) -> dict[str, Any]:
         return self.wiki.orientation(db, recent_log_lines=int(arguments.get("recent_log_lines") or 40))
 
@@ -370,6 +402,27 @@ class ToolRegistry:
             )
         )
 
+    def _a2a_delegate(self, db: Session, arguments: dict[str, Any]) -> dict[str, Any]:
+        if self.a2a is None:
+            raise RuntimeError("A2A runtime is not configured")
+        from backend.runtime.a2a import A2ADelegateRequest
+
+        capability = str(arguments.get("capability") or "")
+        options = arguments.get("options") if isinstance(arguments.get("options"), dict) else {}
+        if self.a2a.requires_approval(capability, options) and not bool(arguments.get("_approved")):
+            raise PermissionError("A2A delegation requires approval for high-risk capability")
+        return self.a2a.delegate(
+            db,
+            A2ADelegateRequest(
+                capability=capability,
+                query=str(arguments.get("query") or ""),
+                context=arguments.get("context") if isinstance(arguments.get("context"), dict) else {},
+                files=arguments.get("files") if isinstance(arguments.get("files"), list) else [],
+                options=options,
+                connection_name=str(arguments.get("connection_name") or ""),
+            ),
+        )
+
 
 class ToolExecutor:
     def __init__(
@@ -451,8 +504,36 @@ class ToolExecutor:
         db.flush()
         if self.events:
             self.events.emit("tool.started", {"tool_run_id": str(run.id), "tool_name": tool_name}, turn_id=turn_id)
+        handler_arguments = dict(arguments)
+        if approved:
+            handler_arguments["_approved"] = True
         try:
-            result = definition.handler(db, arguments)
+            result = definition.handler(db, handler_arguments)
+        except PermissionError as exc:
+            approval = None
+            if self.platform is not None:
+                approval = self.platform.create_approval(
+                    db,
+                    subject_type="tool_run",
+                    subject_id=tool_name,
+                    payload={"tool_name": tool_name, "arguments": arguments, "turn_id": turn_id, "dynamic_approval": True},
+                )
+            run.status = "approval_required"
+            run.result = {"error": str(exc), "approval_id": str(approval.id) if approval is not None else None}
+            run.finished_at = datetime.now(UTC)
+            if self.events:
+                self.events.emit(
+                    "tool.approval_required",
+                    {
+                        "tool_run_id": str(run.id),
+                        "tool_name": tool_name,
+                        "approval_id": str(approval.id) if approval is not None else None,
+                        "error": str(exc),
+                    },
+                    severity="warning",
+                    turn_id=turn_id,
+                )
+            raise
         except Exception as exc:
             run.status = "failed"
             run.result = {"error": str(exc)}

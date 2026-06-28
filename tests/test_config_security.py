@@ -7,7 +7,7 @@ from backend.infra.security import hash_password, verify_password
 
 
 def test_database_url_accepts_new_env_alias(monkeypatch) -> None:
-    monkeypatch.setenv("ZLAGENT_DATABASE_URL", "postgresql+psycopg://u:p@localhost:5432/newdb")
+    monkeypatch.setenv("SOULCLAW_DATABASE_URL", "postgresql+psycopg://u:p@localhost:5432/newdb")
     monkeypatch.delenv("DATABASE_URL", raising=False)
 
     settings = Settings()
@@ -16,7 +16,7 @@ def test_database_url_accepts_new_env_alias(monkeypatch) -> None:
 
 
 def test_database_url_keeps_backup_alias(monkeypatch) -> None:
-    monkeypatch.delenv("ZLAGENT_DATABASE_URL", raising=False)
+    monkeypatch.delenv("SOULCLAW_DATABASE_URL", raising=False)
     monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg://u:p@localhost:5432/backupdb")
 
     settings = Settings()
@@ -42,7 +42,7 @@ def test_password_hash_roundtrip() -> None:
 
 
 def test_cors_origins_accepts_comma_separated_env(monkeypatch) -> None:
-    monkeypatch.setenv("ZLAGENT_CORS_ORIGINS", "https://a.example, https://b.example")
+    monkeypatch.setenv("SOULCLAW_CORS_ORIGINS", "https://a.example, https://b.example")
 
     settings = Settings()
 
@@ -52,5 +52,5 @@ def test_cors_origins_accepts_comma_separated_env(monkeypatch) -> None:
 def test_production_rejects_default_secrets() -> None:
     settings = Settings(environment="production")
 
-    with pytest.raises(RuntimeError, match="ZLAGENT_JWT_SECRET"):
+    with pytest.raises(RuntimeError, match="SOULCLAW_JWT_SECRET"):
         settings.validate_runtime_secrets()

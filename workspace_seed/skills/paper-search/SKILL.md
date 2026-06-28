@@ -13,7 +13,7 @@ tags:
   - papers
   - on-demand
 metadata:
-  zlagent:
+  soulclaw:
     category: research
     triggers:
       - 顶刊

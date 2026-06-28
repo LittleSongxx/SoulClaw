@@ -10,7 +10,7 @@ The active backend implementation lives in:
 
 The public FastAPI entry remains `backend.app:app`. New behavior should be added through these layers so Wiki, Memory, Skills, Tools, MCP, Gateway, Cron, Dream, Approval, and Proposal all share the same durable event and audit surface.
 
-ZLAgent is currently local-first:
+SoulClaw is currently local-first:
 
 - `workspace_seed/` is the tracked default template for SOUL, USER, MEMORY, HEARTBEAT, Wiki, and Skills.
 - `workspace/` is private runtime state and is ignored by Git.

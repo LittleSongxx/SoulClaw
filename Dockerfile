@@ -9,13 +9,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONIOENCODING=utf-8 \
     PIP_DEFAULT_TIMEOUT=120 \
     PIP_RETRIES=5 \
-    ZLAGENT_HOST=0.0.0.0 \
-    ZLAGENT_PORT=8020 \
-    ZLAGENT_DATA_DIR=/app/data \
-    ZLAGENT_CONFIG_DIR=/app/config \
-    ZLAGENT_WORKSPACE_DIR=/app/workspace \
-    ZLAGENT_WORKSPACE_SEED_DIR=/app/workspace_seed \
-    ZLAGENT_PACKAGES_DIR=/app/.packages \
+    SOULCLAW_HOST=0.0.0.0 \
+    SOULCLAW_PORT=8020 \
+    SOULCLAW_DATA_DIR=/app/data \
+    SOULCLAW_CONFIG_DIR=/app/config \
+    SOULCLAW_WORKSPACE_DIR=/app/workspace \
+    SOULCLAW_WORKSPACE_SEED_DIR=/app/workspace_seed \
+    SOULCLAW_PACKAGES_DIR=/app/.packages \
     NPM_CONFIG_PREFIX=/app/.packages/npm \
     NPM_CONFIG_IGNORE_SCRIPTS=true \
     NPM_CONFIG_CACHE=/app/.packages/npm-cache \
@@ -97,14 +97,14 @@ RUN if [ -n "${NPM_CONFIG_REGISTRY:-}" ]; then \
         && rm -rf node_modules; \
     fi
 
-RUN groupadd --gid 10001 zlagent \
+RUN groupadd --gid 10001 soulclaw \
     && useradd --uid 10001 --gid 10001 --home /app \
-        --no-create-home --shell /usr/sbin/nologin zlagent \
+        --no-create-home --shell /usr/sbin/nologin soulclaw \
     && mkdir -p /app/data /app/config /app/workspace /app/Downloads \
         /app/.packages/npm /app/.packages/npm-cache \
         /app/.packages/pip /app/.packages/pip/bin /app/.packages/pip-cache \
         /app/.packages/uv-cache /app/.packages/uv/tools /app/.packages/uv/python \
-    && chown -R zlagent:zlagent /app/data /app/config /app/workspace /app/Downloads /app/.packages
+    && chown -R soulclaw:soulclaw /app/data /app/config /app/workspace /app/Downloads /app/.packages
 
 # Keep build layers lean. MCP servers can be installed at runtime into
 # the persisted /app/.packages volume, avoiding a large build layer.
@@ -115,18 +115,18 @@ COPY alembic.ini ./alembic.ini
 COPY alembic ./alembic
 COPY workspace_seed ./workspace_seed
 COPY docker-entrypoint.py ./docker-entrypoint.py
-RUN chown -R zlagent:zlagent /app/backend /app/alembic /app/alembic.ini /app/frontend /app/workspace_seed /app/docker-entrypoint.py \
+RUN chown -R soulclaw:soulclaw /app/backend /app/alembic /app/alembic.ini /app/frontend /app/workspace_seed /app/docker-entrypoint.py \
     && chmod -R u=rwX,go=rX /app/backend /app/alembic /app/frontend /app/workspace_seed \
     && chmod 0444 /app/alembic.ini \
     && chmod 0555 /app/docker-entrypoint.py
 
-USER zlagent
+USER soulclaw
 
 EXPOSE 8020
 
 VOLUME ["/app/data", "/app/config", "/app/workspace", "/app/.packages"]
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD python -c "import os, urllib.request; urllib.request.urlopen(f'http://127.0.0.1:{os.environ.get(\"ZLAGENT_PORT\",\"8020\")}/api/health', timeout=5).read()" || exit 1
+    CMD python -c "import os, urllib.request; urllib.request.urlopen(f'http://127.0.0.1:{os.environ.get(\"SOULCLAW_PORT\",\"8020\")}/api/health', timeout=5).read()" || exit 1
 
 ENTRYPOINT ["python", "/app/docker-entrypoint.py"]

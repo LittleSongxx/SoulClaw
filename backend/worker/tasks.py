@@ -32,20 +32,24 @@ def _run_job(job_id: str, fn):
     services = build_worker_services()
     parsed_id = uuid.UUID(str(job_id))
     with session_scope() as db:
-        services.jobs.mark_started(db, parsed_id)
+        with services.events.bind_session(db):
+            services.jobs.mark_started(db, parsed_id)
     try:
         with session_scope() as db:
-            result = fn(services, db)
+            with services.events.bind_session(db):
+                result = fn(services, db)
     except Exception as exc:  # noqa: BLE001
         with session_scope() as db:
-            services.jobs.mark_failed(db, parsed_id, str(exc))
+            with services.events.bind_session(db):
+                services.jobs.mark_failed(db, parsed_id, str(exc))
         raise
     with session_scope() as db:
-        services.jobs.mark_succeeded(db, parsed_id, result)
+        with services.events.bind_session(db):
+            services.jobs.mark_succeeded(db, parsed_id, result)
     return result
 
 
-@celery_app.task(name="zlagent.dream_review")
+@celery_app.task(name="soulclaw.dream_review")
 def dream_review_task(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     def run(services, db):
         result = services.dream.run_review(
@@ -63,25 +67,25 @@ def dream_review_task(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     return _run_job(job_id, run)
 
 
-@celery_app.task(name="zlagent.wiki_compile")
+@celery_app.task(name="soulclaw.wiki_compile")
 def wiki_compile_task(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     del payload
     return _run_job(job_id, lambda services, db: services.wiki.compile(db))
 
 
-@celery_app.task(name="zlagent.wiki_lint")
+@celery_app.task(name="soulclaw.wiki_lint")
 def wiki_lint_task(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     del payload
     return _run_job(job_id, lambda services, db: services.wiki.lint(db))
 
 
-@celery_app.task(name="zlagent.skill_scan")
+@celery_app.task(name="soulclaw.skill_scan")
 def skill_scan_task(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     del payload
     return _run_job(job_id, lambda services, db: services.skills.scan(db))
 
 
-@celery_app.task(name="zlagent.mcp_refresh")
+@celery_app.task(name="soulclaw.mcp_refresh")
 def mcp_refresh_task(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     async def refresh(services):
         server_name = str(payload.get("server_name") or "")
@@ -92,7 +96,7 @@ def mcp_refresh_task(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     return _run_job(job_id, lambda services, db: asyncio.run(refresh(services)))
 
 
-@celery_app.task(name="zlagent.heartbeat_check")
+@celery_app.task(name="soulclaw.heartbeat_check")
 def heartbeat_check_task(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     del payload
 

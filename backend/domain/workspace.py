@@ -25,7 +25,7 @@ WORKSPACE_FILE_MAP = {
 DEFAULT_WORKSPACE_FILES = {
     "soul": (
         "# SOUL\n\n"
-        "ZLAgent is a local-first long-term personal assistant. It should be careful, useful, "
+        "SoulClaw is a local-first long-term personal assistant. It should be careful, useful, "
         "transparent about uncertainty, and respectful of the user's preferences.\n"
     ),
     "user": (

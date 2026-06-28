@@ -264,7 +264,7 @@ class MemoryService:
     def _append_to_memory_file(self, memory: Memory) -> None:
         try:
             item = self.workspace.read("memory")
-            marker = f"<!-- zlagent:memory id={memory.id} -->"
+            marker = f"<!-- soulclaw:memory id={memory.id} -->"
             if marker in item.content:
                 return
             line = (

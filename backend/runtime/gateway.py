@@ -146,7 +146,7 @@ class GatewayRuntimeManager:
         secret = str(config.get("secret") or "")
         if not secret:
             return
-        signature = str(message.metadata.get("signature") or message.metadata.get("x_zlagent_signature") or "")
+        signature = str(message.metadata.get("signature") or message.metadata.get("x_soulclaw_signature") or "")
         expected = hmac.new(secret.encode("utf-8"), message.text.encode("utf-8"), hashlib.sha256).hexdigest()
         if signature.startswith("sha256="):
             signature = signature.removeprefix("sha256=")

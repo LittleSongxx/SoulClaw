@@ -1,5 +1,5 @@
 [project]
-name = "zlagent"
+name = "soulclaw"
 version = "2.0.0"
 description = "A local-first personal AI agent with SQLite, Markdown-authoritative memory, LLM-Wiki, and skill evolution."
 requires-python = ">=3.11,<3.14"
@@ -20,6 +20,7 @@ dependencies = [
     "loguru>=0.7.3",
     "croniter>=5.0.0",
     "mcp>=1.0.0",
+    "a2a-sdk[fastapi]>=1.1.0",
 ]
 
 [project.optional-dependencies]

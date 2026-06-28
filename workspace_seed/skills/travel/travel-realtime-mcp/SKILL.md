@@ -15,7 +15,7 @@ tags:
 metadata:
   hermes:
     created_by: user
-  zlagent:
+  soulclaw:
     category: mcp
     triggers:
       - 实时票价
@@ -185,7 +185,7 @@ Use only when the user wants a larger travel-agent stack with flights, hotels, e
 
 - Source: `skarlekar/mcp_travelassistant`
 - Capabilities: `search_flights`, `search_hotels`, `search_events`, `get_weather_forecast`, `geocode_location`, `calculate_distance`, `convert_currency`.
-- Requires multiple local server directories plus keys such as SerpAPI. This is powerful but heavier than ZLAgent's quick-reply goal.
+- Requires multiple local server directories plus keys such as SerpAPI. This is powerful but heavier than SoulClaw's quick-reply goal.
 
 ## Steps
 

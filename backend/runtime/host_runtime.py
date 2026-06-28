@@ -29,7 +29,7 @@ _ALLOWED_SCRIPT_SUFFIXES = (".py", ".sh")
 
 
 class HostTaskRuntime(TaskRuntime):
-    """Runs scripts / inline snippets in the same OS as ZLAgent.
+    """Runs scripts / inline snippets in the same OS as SoulClaw.
 
     Constructor pins the workspace root once; every execution
     re-validates the path against it so swapping ``workspace_dir``
@@ -87,7 +87,7 @@ class HostTaskRuntime(TaskRuntime):
                 # policy ceiling on writable paths still applies.
                 fd, tmp_str = tempfile.mkstemp(
                     suffix=".py",
-                    prefix="_zlagent_snippet_",
+                    prefix="_soulclaw_snippet_",
                     dir=str(self._workspace_dir),
                     text=True,
                 )

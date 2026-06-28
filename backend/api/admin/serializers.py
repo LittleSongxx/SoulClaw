@@ -283,6 +283,75 @@ def gateway_to_dict(gateway) -> dict[str, Any]:
     }
 
 
+def a2a_connection_to_dict(connection) -> dict[str, Any]:
+    return {
+        "id": str(connection.id),
+        "name": connection.name,
+        "kind": connection.kind,
+        "endpoint": connection.endpoint,
+        "rpc_url": connection.rpc_url,
+        "agent_card": connection.agent_card or {},
+        "config": connection.config or {},
+        "enabled": connection.enabled,
+        "status": connection.status,
+        "capabilities": connection.capabilities or [],
+        "skills": connection.skills or [],
+        "last_discovered_at": dt(connection.last_discovered_at),
+        "last_error": connection.last_error,
+        "created_at": dt(connection.created_at),
+        "updated_at": dt(connection.updated_at),
+    }
+
+
+def a2a_task_to_dict(task, *, artifacts: list | None = None, events: list | None = None) -> dict[str, Any]:
+    return {
+        "id": str(task.id),
+        "task_id": task.task_id,
+        "connection_name": task.connection_name,
+        "capability": task.capability,
+        "context_id": task.context_id,
+        "remote_task_id": task.remote_task_id,
+        "remote_context_id": task.remote_context_id,
+        "status": task.status,
+        "input_text": task.input_text,
+        "result": task.result or {},
+        "error": task.error,
+        "metadata": task.metadata_json or {},
+        "started_at": dt(task.started_at),
+        "finished_at": dt(task.finished_at),
+        "created_at": dt(task.created_at),
+        "updated_at": dt(task.updated_at),
+        "artifacts": [a2a_artifact_to_dict(item) for item in artifacts] if artifacts is not None else None,
+        "events": [a2a_event_to_dict(item) for item in events] if events is not None else None,
+    }
+
+
+def a2a_artifact_to_dict(artifact) -> dict[str, Any]:
+    return {
+        "id": str(artifact.id),
+        "task_id": artifact.task_id,
+        "artifact_id": artifact.artifact_id,
+        "name": artifact.name,
+        "mime_type": artifact.mime_type,
+        "uri": artifact.uri,
+        "content": artifact.content,
+        "parts": artifact.parts or [],
+        "metadata": artifact.metadata_json or {},
+        "created_at": dt(artifact.created_at),
+    }
+
+
+def a2a_event_to_dict(event) -> dict[str, Any]:
+    return {
+        "id": str(event.id),
+        "task_id": event.task_id,
+        "event_type": event.event_type,
+        "sequence": event.sequence,
+        "payload": event.payload or {},
+        "created_at": dt(event.created_at),
+    }
+
+
 def tool_definition_to_dict(tool) -> dict[str, Any]:
     return {
         "name": tool.name,

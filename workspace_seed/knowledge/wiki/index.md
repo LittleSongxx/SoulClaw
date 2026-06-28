@@ -1,15 +1,15 @@
 ---
-title: ZLAgent Platform Wiki
+title: SoulClaw Platform Wiki
 page_key: index
 type: architecture
 tags:
-  - zlagent
+  - soulclaw
   - platform
 confidence: 0.8
-summary: ZLAgent uses Markdown as the authoritative LLM Wiki source and rebuilds local SQLite page/link indexes from it.
+summary: SoulClaw uses Markdown as the authoritative LLM Wiki source and rebuilds local SQLite page/link indexes from it.
 ---
 
-# ZLAgent Platform Wiki
+# SoulClaw Platform Wiki
 
 Markdown files in this directory are the authoritative source for LLM Wiki knowledge.
 The compiler mirrors page metadata, links, compile status, and error-book records into the local database for page-index search and graph traversal.

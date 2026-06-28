@@ -354,13 +354,13 @@ def gateway_heartbeat(
 @router.post("/api/gateways/inbound")
 def gateway_inbound(
     payload: GatewayInboundRequest,
-    x_zlagent_signature: str | None = Header(default=None),
+    x_soulclaw_signature: str | None = Header(default=None),
     runtime: GatewayRuntimeManager = Depends(get_gateway_runtime),
 ) -> dict:
     try:
         data = payload.model_dump()
-        if x_zlagent_signature:
-            data["metadata"] = {**data.get("metadata", {}), "signature": x_zlagent_signature}
+        if x_soulclaw_signature:
+            data["metadata"] = {**data.get("metadata", {}), "signature": x_soulclaw_signature}
         return runtime.handle_inbound(InboundGatewayMessage(**data))
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

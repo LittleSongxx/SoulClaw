@@ -1,8 +1,9 @@
-"""DB-backed Cron scheduler for the ZLAgent runtime."""
+"""DB-backed Cron scheduler for the SoulClaw runtime."""
 
 from __future__ import annotations
 
 import asyncio
+from contextlib import nullcontext
 from datetime import UTC, datetime
 
 from loguru import logger
@@ -38,7 +39,7 @@ class CronScheduler:
     def start(self) -> None:
         if self._task is None or self._task.done():
             self._stop = asyncio.Event()
-            self._task = asyncio.create_task(self._run(), name="zlagent-cron-scheduler")
+            self._task = asyncio.create_task(self._run(), name="soulclaw-cron-scheduler")
             self.events.emit("cron.scheduler.started", {"poll_interval_seconds": self.poll_interval_seconds})
 
     async def stop(self) -> None:
@@ -68,19 +69,21 @@ class CronScheduler:
         if now.tzinfo is None:
             now = now.replace(tzinfo=UTC)
         with session_scope() as db:
-            jobs = list(
-                db.scalars(
-                    select(CronJob)
-                    .where(CronJob.enabled.is_(True))
-                    .where((CronJob.next_run_at.is_(None)) | (CronJob.next_run_at <= now))
-                    .order_by(CronJob.next_run_at.asc().nullsfirst(), CronJob.name)
-                    .limit(limit)
-                    .with_for_update(skip_locked=True)
-                ).all()
-            )
-            for job in jobs:
-                self._run_job(db, job, now=now)
-            return len(jobs)
+            bind_session = getattr(self.events, "bind_session", None)
+            with bind_session(db) if bind_session is not None else nullcontext():
+                jobs = list(
+                    db.scalars(
+                        select(CronJob)
+                        .where(CronJob.enabled.is_(True))
+                        .where((CronJob.next_run_at.is_(None)) | (CronJob.next_run_at <= now))
+                        .order_by(CronJob.next_run_at.asc().nullsfirst(), CronJob.name)
+                        .limit(limit)
+                        .with_for_update(skip_locked=True)
+                    ).all()
+                )
+                for job in jobs:
+                    self._run_job(db, job, now=now)
+                return len(jobs)
 
     def schedule_missing(self, *, now: datetime | None = None) -> int:
         now = now or datetime.now(UTC)

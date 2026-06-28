@@ -58,10 +58,10 @@ const navItems: Array<{ key: ViewKey; label: string; icon: unknown }> = [
   { key: "settings", label: "Settings", icon: Settings }
 ];
 
-const token = ref(localStorage.getItem("zlagent_token") || "");
+const token = ref(localStorage.getItem("soulclaw_token") || "");
 const active = ref<ViewKey>("dashboard");
 const username = ref("admin");
-const password = ref("zlagent-admin");
+const password = ref("soulclaw-admin");
 const loading = ref(false);
 const error = ref("");
 const searchQuery = ref("");
@@ -160,7 +160,7 @@ async function login() {
       body: JSON.stringify({ username: username.value, password: password.value })
     });
     token.value = payload.access_token;
-    localStorage.setItem("zlagent_token", token.value);
+    localStorage.setItem("soulclaw_token", token.value);
     await refreshAll();
   } catch (err) {
     error.value = err instanceof Error ? err.message : String(err);
@@ -171,7 +171,7 @@ async function login() {
 
 function logout() {
   token.value = "";
-  localStorage.removeItem("zlagent_token");
+  localStorage.removeItem("soulclaw_token");
   me.value = null;
 }
 
@@ -491,7 +491,7 @@ onMounted(refreshAll);
       <div class="brand-row">
         <Database :size="28" />
         <div>
-          <h1>ZLAgent</h1>
+          <h1>SoulClaw</h1>
           <p>Platform Console</p>
         </div>
       </div>
@@ -518,7 +518,7 @@ onMounted(refreshAll);
       <div class="brand-row compact">
         <Database :size="24" />
         <div>
-          <h1>ZLAgent</h1>
+          <h1>SoulClaw</h1>
           <p>{{ me?.username || "admin" }}</p>
         </div>
       </div>

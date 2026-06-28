@@ -9,7 +9,7 @@ tags:
   - productivity
   - planning
 metadata:
-  zlagent:
+  soulclaw:
     category: productivity
     triggers:
       - 列个计划

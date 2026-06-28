@@ -1,7 +1,7 @@
 ---
 name: skill-authoring
 description: |
-  Author a new ZLAgent skill in the canonical Trigger / Inputs / Steps /
+  Author a new SoulClaw skill in the canonical Trigger / Inputs / Steps /
   Verification / Failure Signals format. Class-level only. Used when the
   user says "把这个流程记成 skill" or in background skill review.
 version: 0.1.0
@@ -9,7 +9,7 @@ tags:
   - meta
   - skills
 metadata:
-  zlagent:
+  soulclaw:
     category: meta
     triggers:
       - 记成 skill
@@ -59,7 +59,7 @@ SKILL.md，让未来同类任务可以一次命中、一次执行、一次校验
    version: 0.1.0
    tags: [<category>, ...]
    metadata:
-     zlagent:
+     soulclaw:
        category: <category>
        triggers: [...]
        capabilities: []

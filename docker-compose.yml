@@ -1,7 +1,7 @@
-name: zlagent
+name: soulclaw
 
 services:
-  zlagent:
+  soulclaw:
     build:
       context: .
       dockerfile: Dockerfile
@@ -9,8 +9,8 @@ services:
         PIP_INDEX_URL: ${PIP_INDEX_URL:-}
         APT_MIRROR_URL: ${APT_MIRROR_URL:-}
         NPM_CONFIG_REGISTRY: ${NPM_CONFIG_REGISTRY:-}
-    image: zlagent:local
-    container_name: zlagent
+    image: soulclaw:local
+    container_name: soulclaw
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
@@ -26,49 +26,49 @@ services:
       redis:
         condition: service_healthy
     environment:
-      ZLAGENT_HOST: 0.0.0.0
-      ZLAGENT_PORT: 8020
-      ZLAGENT_LOG_LEVEL: ${ZLAGENT_LOG_LEVEL:-INFO}
+      SOULCLAW_HOST: 0.0.0.0
+      SOULCLAW_PORT: 8020
+      SOULCLAW_LOG_LEVEL: ${SOULCLAW_LOG_LEVEL:-INFO}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
       OPENAI_MODEL: ${OPENAI_MODEL:-}
       NPM_CONFIG_REGISTRY: ${NPM_CONFIG_REGISTRY:-}
-      ZLAGENT_REDIS_URL: redis://redis:6379/0
-      ZLAGENT_DATABASE_URL: sqlite:////app/data/zlagent.sqlite3
-      ZLAGENT_WORKSPACE_SEED_DIR: /app/workspace_seed
-      ZLAGENT_BOOTSTRAP_WIKI_ON_STARTUP: ${ZLAGENT_BOOTSTRAP_WIKI_ON_STARTUP:-true}
-      ZLAGENT_BOOTSTRAP_SKILLS_ON_STARTUP: ${ZLAGENT_BOOTSTRAP_SKILLS_ON_STARTUP:-true}
-      ZLAGENT_DREAM_REVIEW_ENABLED: ${ZLAGENT_DREAM_REVIEW_ENABLED:-true}
-      ZLAGENT_API_SCHEDULER_ENABLED: ${ZLAGENT_API_SCHEDULER_ENABLED:-false}
-      ZLAGENT_DREAM_REVIEW_CRON: "${ZLAGENT_DREAM_REVIEW_CRON:-30 3 * * *}"
-      ZLAGENT_DREAM_REVIEW_TIMEZONE: ${ZLAGENT_DREAM_REVIEW_TIMEZONE:-Asia/Shanghai}
-      ZLAGENT_ADMIN_USERNAME: ${ZLAGENT_ADMIN_USERNAME:-admin}
-      ZLAGENT_ADMIN_PASSWORD: ${ZLAGENT_ADMIN_PASSWORD:-zlagent-admin}
-      ZLAGENT_JWT_SECRET: ${ZLAGENT_JWT_SECRET:-change-me-for-production}
-      ZLAGENT_SEARXNG_URL: ${ZLAGENT_SEARXNG_URL:-}
+      SOULCLAW_REDIS_URL: redis://redis:6379/0
+      SOULCLAW_DATABASE_URL: sqlite:////app/data/soulclaw.sqlite3
+      SOULCLAW_WORKSPACE_SEED_DIR: /app/workspace_seed
+      SOULCLAW_BOOTSTRAP_WIKI_ON_STARTUP: ${SOULCLAW_BOOTSTRAP_WIKI_ON_STARTUP:-true}
+      SOULCLAW_BOOTSTRAP_SKILLS_ON_STARTUP: ${SOULCLAW_BOOTSTRAP_SKILLS_ON_STARTUP:-true}
+      SOULCLAW_DREAM_REVIEW_ENABLED: ${SOULCLAW_DREAM_REVIEW_ENABLED:-true}
+      SOULCLAW_API_SCHEDULER_ENABLED: ${SOULCLAW_API_SCHEDULER_ENABLED:-false}
+      SOULCLAW_DREAM_REVIEW_CRON: "${SOULCLAW_DREAM_REVIEW_CRON:-30 3 * * *}"
+      SOULCLAW_DREAM_REVIEW_TIMEZONE: ${SOULCLAW_DREAM_REVIEW_TIMEZONE:-Asia/Shanghai}
+      SOULCLAW_ADMIN_USERNAME: ${SOULCLAW_ADMIN_USERNAME:-admin}
+      SOULCLAW_ADMIN_PASSWORD: ${SOULCLAW_ADMIN_PASSWORD:-soulclaw-admin}
+      SOULCLAW_JWT_SECRET: ${SOULCLAW_JWT_SECRET:-change-me-for-production}
+      SOULCLAW_SEARXNG_URL: ${SOULCLAW_SEARXNG_URL:-}
     env_file:
       - path: .env
         required: false
     ports:
-      - "${ZLAGENT_HOST_PORT:-8020}:8020"
+      - "${SOULCLAW_HOST_PORT:-8020}:8020"
     volumes:
-      - zlagent_data:/app/data
-      - zlagent_config:/app/config
-      - zlagent_workspace:/app/workspace
-      - zlagent_packages:/app/.packages
+      - soulclaw_data:/app/data
+      - soulclaw_config:/app/config
+      - soulclaw_workspace:/app/workspace
+      - soulclaw_packages:/app/.packages
 
-  zlagent-worker:
-    image: zlagent:local
-    container_name: zlagent-worker
+  soulclaw-worker:
+    image: soulclaw:local
+    container_name: soulclaw-worker
     restart: unless-stopped
     depends_on:
       redis:
         condition: service_healthy
     command: ["celery", "-A", "backend.worker.celery_app.celery_app", "worker", "--loglevel=INFO", "--concurrency=1"]
     environment:
-      ZLAGENT_REDIS_URL: redis://redis:6379/0
-      ZLAGENT_DATABASE_URL: sqlite:////app/data/zlagent.sqlite3
-      ZLAGENT_WORKSPACE_SEED_DIR: /app/workspace_seed
+      SOULCLAW_REDIS_URL: redis://redis:6379/0
+      SOULCLAW_DATABASE_URL: sqlite:////app/data/soulclaw.sqlite3
+      SOULCLAW_WORKSPACE_SEED_DIR: /app/workspace_seed
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
       OPENAI_MODEL: ${OPENAI_MODEL:-}
@@ -76,34 +76,34 @@ services:
       - path: .env
         required: false
     volumes:
-      - zlagent_data:/app/data
-      - zlagent_config:/app/config
-      - zlagent_workspace:/app/workspace
-      - zlagent_packages:/app/.packages
+      - soulclaw_data:/app/data
+      - soulclaw_config:/app/config
+      - soulclaw_workspace:/app/workspace
+      - soulclaw_packages:/app/.packages
 
-  zlagent-scheduler:
-    image: zlagent:local
-    container_name: zlagent-scheduler
+  soulclaw-scheduler:
+    image: soulclaw:local
+    container_name: soulclaw-scheduler
     restart: unless-stopped
     depends_on:
       redis:
         condition: service_healthy
     command: ["python", "-m", "backend.worker.scheduler"]
     environment:
-      ZLAGENT_REDIS_URL: redis://redis:6379/0
-      ZLAGENT_DATABASE_URL: sqlite:////app/data/zlagent.sqlite3
-      ZLAGENT_WORKSPACE_SEED_DIR: /app/workspace_seed
+      SOULCLAW_REDIS_URL: redis://redis:6379/0
+      SOULCLAW_DATABASE_URL: sqlite:////app/data/soulclaw.sqlite3
+      SOULCLAW_WORKSPACE_SEED_DIR: /app/workspace_seed
     env_file:
       - path: .env
         required: false
     volumes:
-      - zlagent_data:/app/data
-      - zlagent_config:/app/config
-      - zlagent_workspace:/app/workspace
+      - soulclaw_data:/app/data
+      - soulclaw_config:/app/config
+      - soulclaw_workspace:/app/workspace
 
   redis:
     image: redis:7-alpine
-    container_name: zlagent-redis
+    container_name: soulclaw-redis
     restart: unless-stopped
     command:
       - redis-server
@@ -120,32 +120,32 @@ services:
       retries: 5
       start_period: 5s
     volumes:
-      - zlagent_redis:/data
+      - soulclaw_redis:/data
 
   postgres:
     image: pgvector/pgvector:pg16
-    container_name: zlagent-postgres
+    container_name: soulclaw-postgres
     profiles: ["postgres"]
     restart: unless-stopped
     environment:
-      POSTGRES_DB: zlagent
-      POSTGRES_USER: zlagent
-      POSTGRES_PASSWORD: zlagent
+      POSTGRES_DB: soulclaw
+      POSTGRES_USER: soulclaw
+      POSTGRES_PASSWORD: soulclaw
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U zlagent -d zlagent"]
+      test: ["CMD-SHELL", "pg_isready -U soulclaw -d soulclaw"]
       interval: 5s
       timeout: 3s
       retries: 10
       start_period: 10s
     ports:
-      - "${ZLAGENT_POSTGRES_PORT:-5432}:5432"
+      - "${SOULCLAW_POSTGRES_PORT:-5432}:5432"
     volumes:
-      - zlagent_postgres:/var/lib/postgresql/data
+      - soulclaw_postgres:/var/lib/postgresql/data
 
 volumes:
-  zlagent_data:
-  zlagent_config:
-  zlagent_workspace:
-  zlagent_redis:
-  zlagent_packages:
-  zlagent_postgres:
+  soulclaw_data:
+  soulclaw_config:
+  soulclaw_workspace:
+  soulclaw_redis:
+  soulclaw_packages:
+  soulclaw_postgres:

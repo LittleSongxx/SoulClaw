@@ -13,7 +13,7 @@ tags:
 metadata:
   hermes:
     created_by: user
-  zlagent:
+  soulclaw:
     category: meta
     triggers:
       - 写个文档

@@ -8,7 +8,7 @@ tags:
   - writing
   - editing
 metadata:
-  zlagent:
+  soulclaw:
     category: writing
     triggers:
       - 去 AI 味

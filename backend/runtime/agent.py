@@ -11,6 +11,7 @@ from backend.domain.tools import ToolExecutor, ToolRegistry
 from backend.domain.wiki import WikiService
 from backend.domain.workspace import WorkspaceService
 from backend.infra.events import RuntimeEventBus
+from backend.runtime.a2a import A2ADelegateRequest, A2ARuntimeManager
 from backend.runtime.llm import OpenAICompatibleClient
 
 
@@ -39,6 +40,7 @@ class AgentRuntime:
         llm: OpenAICompatibleClient | None = None,
         conversation: ConversationService | None = None,
         workspace: WorkspaceService | None = None,
+        a2a: A2ARuntimeManager | None = None,
     ) -> None:
         self.wiki = wiki
         self.memory = memory
@@ -48,6 +50,7 @@ class AgentRuntime:
         self.llm = llm
         self.conversation = conversation
         self.workspace = workspace
+        self.a2a = a2a
 
     def run_turn(
         self,
@@ -66,6 +69,26 @@ class AgentRuntime:
         )
         if self.conversation is not None:
             self.conversation.record_user_message(db, session_id=session_id, turn_id=turn_id, content=message)
+        delegated_result: dict[str, Any] | None = None
+        if tool_calls is None and self.a2a is not None and self._should_delegate_to_deep_research(message):
+            try:
+                delegated_result = self.a2a.delegate(
+                    db,
+                    A2ADelegateRequest(
+                        capability="deep-research",
+                        query=message,
+                        context={"session_id": session_id, "turn_id": turn_id},
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.events.emit(
+                    "a2a.delegate.failed",
+                    {"error": str(exc), "message_preview": message[:200]},
+                    severity="warning",
+                    session_id=session_id,
+                    turn_id=turn_id,
+                )
+                delegated_result = {"status": "failed", "error": str(exc)}
         wiki_orientation = self.wiki.orientation(db) if hasattr(self.wiki, "orientation") else {"pages": [], "index": "", "schema": "", "recent_log": ""}
         wiki_hits = self.wiki.search(db, message, limit=5) if self.llm is None or not self.llm.configured else []
         memory_context = self.memory.resident_context(db, message, dynamic_limit=5)
@@ -75,7 +98,10 @@ class AgentRuntime:
         llm_answer = ""
         llm_status = "not_configured"
         llm_messages: list[dict[str, Any]] = []
-        if tool_calls is None:
+        if delegated_result is not None:
+            llm_answer = self._delegated_answer(delegated_result)
+            llm_status = "delegated_a2a"
+        elif tool_calls is None:
             llm_answer, inferred_tool_calls, llm_status, llm_messages, tool_results = self._run_llm(
                 db,
                 turn_id,
@@ -156,6 +182,7 @@ class AgentRuntime:
             },
             "workspace": {kind: {"path": item.path, "updated_at": item.updated_at} for kind, item in workspace_context.items()},
             "tools": tool_results,
+            "a2a": delegated_result or {},
             "llm": {"status": llm_status, "tool_calls": inferred_tool_calls, "wiki_read_used": wiki_read_used},
         }
         self.events.emit("turn.completed", {"context": context}, session_id=session_id, turn_id=turn_id)
@@ -179,7 +206,7 @@ class AgentRuntime:
             {
                 "role": "system",
                 "content": (
-                    "You are ZLAgent. Use Memory context and LLM-Wiki tools. "
+                    "You are SoulClaw. Use Memory context and LLM-Wiki tools. "
                     "For Wiki-backed facts, first orient/search, then call wiki_read before answering. "
                     "For durable memory facts, use memory_search and memory_get before relying on them. "
                     "Cite Wiki pages as [[page_key]] when using Wiki evidence."
@@ -377,12 +404,46 @@ class AgentRuntime:
         )
 
     @staticmethod
+    def _should_delegate_to_deep_research(message: str) -> bool:
+        text = str(message or "").lower()
+        triggers = (
+            "deepresearch",
+            "deep research",
+            "deep-research",
+            "深度研究",
+            "深入调研",
+            "全面调研",
+            "广泛调研",
+            "research report",
+        )
+        return any(trigger in text for trigger in triggers)
+
+    @staticmethod
+    def _delegated_answer(result: dict[str, Any]) -> str:
+        if result.get("status") == "failed":
+            return f"A2A delegation failed: {result.get('error') or 'unknown error'}"
+        task_id = result.get("task_id") or ""
+        status = result.get("status") or ""
+        answer = result.get("answer") or ""
+        artifacts = result.get("artifacts") if isinstance(result.get("artifacts"), list) else []
+        parts = ["A2A delegation completed" if status == "completed" else "A2A delegation started"]
+        if task_id:
+            parts.append(f"task_id={task_id}")
+        if status:
+            parts.append(f"status={status}")
+        if artifacts:
+            parts.append(f"artifacts={len(artifacts)}")
+        if answer:
+            parts.append("\n\n" + str(answer))
+        return " ".join(parts)
+
+    @staticmethod
     def _fallback_answer(
         wiki_hits: list[dict[str, Any]],
         memory_context: dict[str, Any],
         tool_results: list[dict[str, Any]],
     ) -> str:
-        parts = ["ZLAgent runtime is online."]
+        parts = ["SoulClaw runtime is online."]
         if wiki_hits:
             parts.append(f"Retrieved {len(wiki_hits)} Wiki item(s).")
         dynamic_memory = memory_context.get("dynamic", [])

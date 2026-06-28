@@ -41,7 +41,7 @@ if Celery is None:
     celery_app = _FallbackCelery()
 else:
     celery_app = Celery(
-        "zlagent",
+        "soulclaw",
         broker=settings.resolved_celery_broker_url,
         backend=settings.resolved_celery_result_backend,
         include=["backend.worker.tasks"],

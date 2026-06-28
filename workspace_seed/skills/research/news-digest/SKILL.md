@@ -10,7 +10,7 @@ tags:
   - news
   - scheduled
 metadata:
-  zlagent:
+  soulclaw:
     category: research
     triggers:
       - 今天新闻

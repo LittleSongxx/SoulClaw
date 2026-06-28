@@ -1,1 +1,1 @@
-"""Celery worker package for ZLAgent background jobs."""
+"""Celery worker package for SoulClaw background jobs."""

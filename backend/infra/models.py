@@ -1,4 +1,4 @@
-"""SQLAlchemy models for the ZLAgent local-first schema."""
+"""SQLAlchemy models for the SoulClaw local-first schema."""
 
 from __future__ import annotations
 
@@ -423,3 +423,76 @@ class GatewayConnection(Base, TimestampMixin):
     inbound_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     outbound_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     failure_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+
+
+class A2AAgentConnection(Base, TimestampMixin):
+    __tablename__ = "a2a_agent_connections"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    name: Mapped[str] = mapped_column(String(128), nullable=False, unique=True, index=True)
+    kind: Mapped[str] = mapped_column(String(64), nullable=False, server_default="a2a", index=True)
+    endpoint: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    rpc_url: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    agent_card: Mapped[dict[str, Any]] = _json_default()
+    config: Mapped[dict[str, Any]] = _json_default()
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"), index=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, server_default="pending", index=True)
+    capabilities: Mapped[list[str]] = _json_list_default()
+    skills: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
+    last_discovered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+
+
+class A2ATask(Base, TimestampMixin):
+    __tablename__ = "a2a_tasks"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    task_id: Mapped[str] = mapped_column(String(128), nullable=False, unique=True, index=True)
+    connection_name: Mapped[str] = mapped_column(String(128), nullable=False, server_default="", index=True)
+    capability: Mapped[str] = mapped_column(String(128), nullable=False, server_default="", index=True)
+    context_id: Mapped[str] = mapped_column(String(128), nullable=False, server_default="", index=True)
+    remote_task_id: Mapped[str] = mapped_column(String(256), nullable=False, server_default="", index=True)
+    remote_context_id: Mapped[str] = mapped_column(String(256), nullable=False, server_default="", index=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, server_default="submitted", index=True)
+    input_text: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    result: Mapped[dict[str, Any]] = _json_default()
+    error: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        "metadata",
+        JSON,
+        nullable=False,
+        default=dict,
+    )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class A2AArtifact(Base):
+    __tablename__ = "a2a_artifacts"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    task_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    artifact_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(256), nullable=False, server_default="")
+    mime_type: Mapped[str] = mapped_column(String(128), nullable=False, server_default="text/plain")
+    uri: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    content: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    parts: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        "metadata",
+        JSON,
+        nullable=False,
+        default=dict,
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
+class A2AEvent(Base):
+    __tablename__ = "a2a_events"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    task_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    event_type: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    payload: Mapped[dict[str, Any]] = _json_default()
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)

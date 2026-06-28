@@ -8,7 +8,7 @@ tags:
   - research
   - summary
 metadata:
-  zlagent:
+  soulclaw:
     category: research
     triggers:
       - 总结一下

@@ -3,13 +3,13 @@ name: systematic-debugging
 description: |
   Root-cause-first debugging loop for code or runtime errors: understand
   the failure before proposing a fix. Adapted from Hermes' systematic-
-  debugging — same iron law, smaller surface, ZLAgent-tool-aware.
+  debugging — same iron law, smaller surface, SoulClaw-tool-aware.
 version: 0.1.0
 tags:
   - coding
   - debugging
 metadata:
-  zlagent:
+  soulclaw:
     category: coding
     triggers:
       - 报错

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Generator
+from collections.abc import AsyncGenerator
 
 import jwt
 from fastapi import Depends, HTTPException, Request, status
@@ -18,15 +18,21 @@ from backend.infra.security import decode_access_token, parse_user_id
 bearer = HTTPBearer(auto_error=False)
 
 
-def get_db() -> Generator[Session, None, None]:
+async def get_db(request: Request) -> AsyncGenerator[Session, None]:
     db = new_session()
+    event_bus = getattr(request.app.state, "event_bus", None)
+    session_binding = event_bus.bind_session(db) if event_bus is not None and hasattr(event_bus, "bind_session") else None
     try:
+        if session_binding is not None:
+            session_binding.__enter__()
         yield db
         db.commit()
     except Exception:
         db.rollback()
         raise
     finally:
+        if session_binding is not None:
+            session_binding.__exit__(None, None, None)
         db.close()
 
 
@@ -92,6 +98,14 @@ def get_event_bus(request: Request):
 
 def get_agent_runtime(request: Request):
     return request.app.state.agent_runtime
+
+
+def get_a2a_service(request: Request):
+    return request.app.state.a2a_service
+
+
+def get_a2a_runtime(request: Request):
+    return request.app.state.a2a_runtime
 
 
 def get_mcp_runtime(request: Request):

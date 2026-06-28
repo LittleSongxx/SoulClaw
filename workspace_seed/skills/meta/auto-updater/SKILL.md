@@ -1,7 +1,7 @@
 ---
 name: auto-updater
 description: |
-  定期检查 ZLAgent 的 skill、MCP 工具、记忆摘要的变化，
+  定期检查 SoulClaw 的 skill、MCP 工具、记忆摘要的变化，
   生成一份变更摘要并通过 IM 发送给用户。
 version: 0.1.0
 tags:
@@ -9,7 +9,7 @@ tags:
   - automation
   - cron
 metadata:
-  zlagent:
+  soulclaw:
     category: meta
     triggers:
       - 每天发摘要
@@ -38,7 +38,7 @@ metadata:
 
 不属于本 skill 的范围：
 - 检查外部新闻/repo 更新 → 走 news-digest / arxiv
-- 检查 ZLAgent 源代码更新 → 需要 git MCP，不在本 skill 范围
+- 检查 SoulClaw 源代码更新 → 需要 git MCP，不在本 skill 范围
 
 ## 二、触发 / Trigger（输入信号）
 
@@ -83,7 +83,7 @@ metadata:
 摘要格式（IM 友好，控制在 300 字以内）：
 
 ```
-📊 ZLAgent 周报 · <日期>
+📊 SoulClaw 周报 · <日期>
 
 🧠 技能变化
   + 新增：humanizer, skill-vetter（共 +2）
@@ -100,7 +100,7 @@ metadata:
 
 如果什么都没变化，发：
 ```
-📊 ZLAgent 日报 · <日期>
+📊 SoulClaw 日报 · <日期>
 本日无变化。一切正常运行。
 ```
 

@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import json
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any
 
 from loguru import logger
 from sqlalchemy import desc, select
+from sqlalchemy.orm import Session
 
 from .db import session_scope
 from .models import AuditEvent, RuntimeEvent
@@ -20,6 +25,25 @@ class RuntimeEventBus:
     later add a Redis fanout without changing the domain surface.
     """
 
+    def __init__(self) -> None:
+        self._bound_session: ContextVar[Session | None] = ContextVar(
+            f"soulclaw_event_session_{id(self)}",
+            default=None,
+        )
+
+    @contextmanager
+    def bind_session(self, db: Session) -> Iterator[None]:
+        """Persist events through the caller's active transaction."""
+
+        token = self._bound_session.set(db)
+        try:
+            yield
+        finally:
+            try:
+                self._bound_session.reset(token)
+            except ValueError:
+                self._bound_session.set(None)
+
     def emit(
         self,
         event_type: str,
@@ -30,16 +54,19 @@ class RuntimeEventBus:
         turn_id: str = "",
     ) -> None:
         try:
-            with session_scope() as db:
-                db.add(
-                    RuntimeEvent(
-                        event_type=event_type,
-                        severity=severity,
-                        session_id=session_id,
-                        turn_id=turn_id,
-                        payload=payload or {},
-                    )
-                )
+            event = RuntimeEvent(
+                event_type=event_type,
+                severity=severity,
+                session_id=session_id,
+                turn_id=turn_id,
+                payload=_jsonable(payload),
+            )
+            bound = self._bound_session.get()
+            if bound is not None:
+                bound.add(event)
+            else:
+                with session_scope() as db:
+                    db.add(event)
         except Exception as exc:  # noqa: BLE001
             logger.warning("[events] failed to persist runtime event {}: {}", event_type, exc)
 
@@ -53,16 +80,19 @@ class RuntimeEventBus:
         payload: dict[str, Any] | None = None,
     ) -> None:
         try:
-            with session_scope() as db:
-                db.add(
-                    AuditEvent(
-                        actor_id=actor_id,
-                        action=action,
-                        target_type=target_type,
-                        target_id=target_id,
-                        payload=payload or {},
-                    )
-                )
+            event = AuditEvent(
+                actor_id=actor_id,
+                action=action,
+                target_type=target_type,
+                target_id=target_id,
+                payload=_jsonable(payload),
+            )
+            bound = self._bound_session.get()
+            if bound is not None:
+                bound.add(event)
+            else:
+                with session_scope() as db:
+                    db.add(event)
         except Exception as exc:  # noqa: BLE001
             logger.warning("[events] failed to persist audit event {}: {}", action, exc)
 
@@ -80,3 +110,12 @@ class RuntimeEventBus:
             stmt = select(AuditEvent).order_by(desc(AuditEvent.created_at)).limit(limit)
             return list(db.scalars(stmt).all())
 
+
+def _jsonable(payload: dict[str, Any] | None) -> dict[str, Any]:
+    if not payload:
+        return {}
+    try:
+        encoded = json.loads(json.dumps(payload, ensure_ascii=False, default=str))
+    except Exception:  # noqa: BLE001
+        return {"repr": repr(payload)}
+    return encoded if isinstance(encoded, dict) else {"value": encoded}

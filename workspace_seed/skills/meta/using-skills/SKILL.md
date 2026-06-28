@@ -12,7 +12,7 @@ tags:
 metadata:
   hermes:
     created_by: user
-  zlagent:
+  soulclaw:
     category: meta
     triggers:
       - 有哪些技能

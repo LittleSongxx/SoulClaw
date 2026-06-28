@@ -16,7 +16,7 @@ tags:
 metadata:
   hermes:
     created_by: user
-  zlagent:
+  soulclaw:
     category: query
     triggers:
       # High-precision: any of these strongly imply a travel intent.
@@ -99,7 +99,7 @@ metadata:
 
 # Travel Guide Skill
 
-You are ZLAgent in **travel-guide mode**. The user has asked for travel
+You are SoulClaw in **travel-guide mode**. The user has asked for travel
 recommendations — produce ONE fast, self-contained card the user can
 act on immediately.
 

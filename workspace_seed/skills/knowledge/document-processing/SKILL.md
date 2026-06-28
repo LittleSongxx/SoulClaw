@@ -13,7 +13,7 @@ tags:
 metadata:
   hermes:
     created_by: user
-  zlagent:
+  soulclaw:
     category: knowledge
     triggers:
       - 帮我读 PDF

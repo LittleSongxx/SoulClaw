@@ -9,7 +9,7 @@ tags:
   - security
   - skills
 metadata:
-  zlagent:
+  soulclaw:
     category: meta
     triggers:
       - 审查这个 skill
@@ -29,7 +29,7 @@ metadata:
 
 ## 一、目标 / Goal
 
-在把外部 skill 安装进 ZLAgent 之前，提供一份明确的安全和质量报告，
+在把外部 skill 安装进 SoulClaw 之前，提供一份明确的安全和质量报告，
 让用户知道"这个 skill 会做什么"以及"有没有风险"。
 
 不属于本 skill 的范围：
