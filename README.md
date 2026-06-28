@@ -11,9 +11,9 @@
 
 SoulClaw 是一个本地优先的长期个人 AI Agent，也是一个 A2A 多智能体编排节点。它把会话连续性、Markdown 权威记忆、Agent-native LLM-Wiki、Skills、工具/MCP/Gateway、审批、Dream/Reflection、Heartbeat、后台任务队列和 A2A 委托放在同一个可观测控制台里。
 
-当前架构不再把 Qdrant/chunk 候选召回作为默认路径。长期内容以 Markdown 文件为权威来源，SQLite 保存本地状态、索引镜像、审计、后台任务和 A2A 任务状态。搜索只用于定位页面或记忆；使用事实前应通过 `wiki_read` 或 `memory_get` 读取原文。仓库模板位于 `workspace_seed/`，真实运行时内容位于本机私有 `workspace/`，启动时只补缺失文件，不覆盖已有个人数据。
+长期内容以 Markdown 文件为权威来源，SQLite 保存本地状态、索引镜像、审计、后台任务和 A2A 任务状态。搜索用于定位页面或记忆；使用事实前应通过 `wiki_read` 或 `memory_get` 读取原文。仓库模板位于 `workspace_seed/`，真实运行时内容位于本机私有 `workspace/`，启动时只补缺失文件，不覆盖已有个人数据。
 
-A2A 与 MCP 的分工是：MCP 用于工具和数据源接入；A2A 用于 DeepResearch、文档项目、日程项目、代码编写这类粗粒度、可跟踪、可返回 artifacts 的外部 Agent 协作。当前第一版已经内置 A2A runtime、Agent Card、JSON-RPC endpoint、任务/事件/artifact 持久化，以及 Weaver DeepResearch 兼容适配。
+A2A 与 MCP 的分工是：MCP 用于工具和数据源接入；A2A 用于 DeepResearch、文档项目、日程项目、代码编写这类粗粒度、可跟踪、可返回 artifacts 的外部 Agent 协作。SoulClaw 内置 A2A runtime、Agent Card、JSON-RPC endpoint、任务/事件/artifact 持久化，以及 Weaver DeepResearch 兼容适配。
 
 ```mermaid
 flowchart LR
@@ -36,16 +36,16 @@ flowchart LR
     Heartbeat[Heartbeat] --> Queue
     Scheduler[Scheduler] --> Queue
     Queue --> Worker[Worker]
-    Worker --> Proposal[Evolution Proposal]
+    Worker --> Proposal[Pending Proposal]
     Proposal --> Human[人工 Apply / Reject]
     Human --> Files
     Human --> Wiki
     Human --> Skills
 ```
 
-## 当前能力
+## 功能概览
 
-| 能力 | 当前真实状态 |
+| 能力 | 说明 |
 |---|---|
 | 会话连续性 | `session_messages` 保存 user/assistant/tool 消息，`session_summaries` 保存滚动摘要 |
 | Markdown 权威文件 | 自动初始化 `SOUL.md`、`USER.md`、`memory/MEMORY.md`、`memory/history.jsonl`、`HEARTBEAT.md` |
@@ -63,7 +63,7 @@ flowchart LR
 
 ## A2A 多智能体
 
-SoulClaw 会作为 orchestrator，把复杂任务委托给独立 Agent，而不是把外部 Agent 当作进程内函数。它当前提供两类接口：
+SoulClaw 会作为 orchestrator，把复杂任务委托给独立 Agent，而不是把外部 Agent 当作进程内函数。它提供两类接口：
 
 ```text
 GET  /.well-known/agent-card.json
@@ -72,7 +72,7 @@ GET  /api/a2a/card
 POST /api/a2a
 ```
 
-`POST /api/a2a` 是公开 JSON-RPC endpoint，当前处理：
+`POST /api/a2a` 是公开 JSON-RPC endpoint，支持：
 
 ```text
 message/send
@@ -107,7 +107,7 @@ SOULCLAW_A2A_WEAVER_AUTH_USER_HEADER=X-Weaver-User
 SOULCLAW_A2A_WEAVER_USER_ID=soulclaw
 ```
 
-低风险读取/研究类任务可以自动委托；代码写入、日程修改、外部发送、文档写入等高风险 capability 会通过现有 Approval 机制拦截。严格标准化的下一步是让 Weaver 自身或 sidecar 发布原生 `/.well-known/agent-card.json`，SoulClaw 再从私有 API 适配切换到标准 A2A 发现和调用。
+低风险读取/研究类任务可以自动委托；代码写入、日程修改、外部发送、文档写入等高风险 capability 会通过现有 Approval 机制拦截。
 
 ## LLM-Wiki 检索方式
 
@@ -136,7 +136,7 @@ workspace_seed/knowledge/wiki/
 
 ## 长期文件
 
-SoulClaw 对齐 OpenClaw、Hermes、nanobot 的长期文件风格。仓库模板是：
+仓库包含一组长期文件模板：
 
 ```text
 workspace_seed/
@@ -170,7 +170,7 @@ workspace/
 
 ### Conda 本地开发
 
-项目当前默认使用本地 conda 环境 `soulclaw`：
+本地开发环境使用 conda 环境 `soulclaw`：
 
 ```bash
 conda activate soulclaw
@@ -214,7 +214,7 @@ docker compose up -d --build
 | `soulclaw-redis` | Celery broker/result backend |
 | `soulclaw-postgres` | 可选 Postgres/pgvector profile，不是默认必需 |
 
-SQLite 数据默认在 `data/soulclaw.sqlite3`。Postgres 可作为可选生产后端，通过 `SOULCLAW_DATABASE_URL` 切换。项目目录当前是：
+SQLite 数据默认在 `data/soulclaw.sqlite3`。Postgres 可作为可选生产后端，通过 `SOULCLAW_DATABASE_URL` 切换。项目目录是：
 
 ```text
 /home/song/code/Agent/assistant/SoulClaw
@@ -287,7 +287,7 @@ conda run -n soulclaw env PYTHONPATH=. ruff check backend tests
 npm run build --prefix frontend
 ```
 
-当前基线验证结果：
+验证结果：
 
 ```text
 68 passed

@@ -11,9 +11,9 @@
 
 SoulClaw is a local-first long-term personal AI agent and an A2A multi-agent orchestration node. It brings session continuity, Markdown-authoritative memory, Agent-native LLM-Wiki, skills, tools/MCP/gateways, approvals, Dream/Reflection, Heartbeat, background job queues, and A2A delegation into one observable console.
 
-The current architecture no longer uses Qdrant/chunk candidate retrieval as the default path. Long-lived content is authoritative in Markdown files, while SQLite stores local state, rebuildable indexes, audit trails, background jobs, and A2A task state. Search only locates pages or memories; evidence should be read through `wiki_read` or `memory_get`. Tracked templates live in `workspace_seed/`; real runtime context lives in the private local `workspace/` directory. Startup merges missing seed files without overwriting user data.
+Long-lived content is authoritative in Markdown files, while SQLite stores local state, rebuildable indexes, audit trails, background jobs, and A2A task state. Search locates pages or memories; evidence should be read through `wiki_read` or `memory_get`. Tracked templates live in `workspace_seed/`; real runtime context lives in the private local `workspace/` directory. Startup merges missing seed files without overwriting user data.
 
-A2A and MCP have separate jobs here: MCP connects tools and data sources; A2A coordinates coarse-grained specialist agents such as DeepResearch, document-project, scheduling, and coding agents that need trackable task lifecycles and artifacts. The first implementation already includes an A2A runtime, Agent Card, JSON-RPC endpoint, persistent tasks/events/artifacts, and a Weaver DeepResearch compatibility adapter.
+A2A and MCP have separate jobs here: MCP connects tools and data sources; A2A coordinates coarse-grained specialist agents such as DeepResearch, document-project, scheduling, and coding agents that need trackable task lifecycles and artifacts. SoulClaw includes an A2A runtime, Agent Card, JSON-RPC endpoint, persistent tasks/events/artifacts, and a Weaver DeepResearch compatibility adapter.
 
 ```mermaid
 flowchart LR
@@ -36,16 +36,16 @@ flowchart LR
     Heartbeat[Heartbeat] --> Queue
     Scheduler[Scheduler] --> Queue
     Queue --> Worker[Worker]
-    Worker --> Proposal[Evolution Proposal]
+    Worker --> Proposal[Pending Proposal]
     Proposal --> Human[Human Apply / Reject]
     Human --> Files
     Human --> Wiki
     Human --> Skills
 ```
 
-## Current Capabilities
+## Capabilities
 
-| Area | Current state |
+| Area | Description |
 |---|---|
 | Session continuity | `session_messages` stores user/assistant/tool messages; `session_summaries` stores rolling summaries |
 | Authoritative Markdown files | Auto-initializes `SOUL.md`, `USER.md`, `memory/MEMORY.md`, `memory/history.jsonl`, and `HEARTBEAT.md` |
@@ -56,14 +56,14 @@ flowchart LR
 | Tools/MCP/Gateway | Unified tool registry and audit; risky tools require approval; gateways support inbound/send/HMAC/heartbeat status |
 | A2A multi-agent | Publishes a local Agent Card; supports JSON-RPC `message/send`, `tasks/get`, `tasks/cancel`, `tasks/resubscribe`; persists connections, tasks, events, and artifacts |
 | Weaver DeepResearch | Default connection name is `weaver-deep-research`; adapts Weaver `/api/research/sse` into DeepResearch progress, cancellation, final reports, and evidence artifacts |
-| Dream/Reflection | Runs in Celery workers and creates pending proposals instead of editing files directly |
+| Dream/Reflection | Runs in Celery workers and creates pending proposals; file edits require approval |
 | Heartbeat | Periodically reads `HEARTBEAT.md` Active Tasks and creates review proposals or skipped history |
 | Background jobs | `dream_review`, `heartbeat_check`, `wiki_compile`, `wiki_lint`, `skill_scan`, and `mcp_refresh` run through Celery/Redis |
 | Safety | Proposal decisions, tool approvals, workspace file edits, cron/mcp/gateway/a2a writes are audited |
 
 ## A2A Multi-Agent
 
-SoulClaw acts as an orchestrator and delegates complex work to independent agents instead of treating external agents as in-process functions. It currently exposes:
+SoulClaw acts as an orchestrator and delegates complex work to independent agents with trackable task lifecycles and artifacts. It exposes:
 
 ```text
 GET  /.well-known/agent-card.json
@@ -107,7 +107,7 @@ SOULCLAW_A2A_WEAVER_AUTH_USER_HEADER=X-Weaver-User
 SOULCLAW_A2A_WEAVER_USER_ID=soulclaw
 ```
 
-Low-risk reading and research delegation can run automatically. High-risk capabilities such as code writing, calendar changes, external sending, and document writes are routed through the existing Approval system. The stricter next step is to expose a native A2A server or sidecar for Weaver itself so SoulClaw can discover `/.well-known/agent-card.json` and stop relying on Weaver's private API adapter.
+Low-risk reading and research delegation can run automatically. High-risk capabilities such as code writing, calendar changes, external sending, and document writes are routed through the Approval system.
 
 ## LLM-Wiki Retrieval
 
@@ -136,7 +136,7 @@ workspace_seed/knowledge/wiki/
 
 ## Long-Term Files
 
-SoulClaw follows the long-lived file style found in projects such as OpenClaw, Hermes, and nanobot. The tracked seed is:
+The repository includes a tracked seed for long-lived files:
 
 ```text
 workspace_seed/
@@ -170,7 +170,7 @@ These Markdown files are authoritative for identity, user profile, durable memor
 
 ### Conda Local Development
 
-The current local development environment is the conda environment named `soulclaw`:
+The local development environment uses the conda environment named `soulclaw`:
 
 ```bash
 conda activate soulclaw
@@ -214,7 +214,7 @@ Default services:
 | `soulclaw-redis` | Celery broker/result backend |
 | `soulclaw-postgres` | Optional Postgres/pgvector profile, not required by default |
 
-SQLite data defaults to `data/soulclaw.sqlite3`. Postgres remains available as an optional production/server backend via `SOULCLAW_DATABASE_URL`. The current project directory is:
+SQLite data defaults to `data/soulclaw.sqlite3`. Postgres is available as an optional production/server backend via `SOULCLAW_DATABASE_URL`. The project directory is:
 
 ```text
 /home/song/code/Agent/assistant/SoulClaw
@@ -287,7 +287,7 @@ conda run -n soulclaw env PYTHONPATH=. ruff check backend tests
 npm run build --prefix frontend
 ```
 
-Current baseline:
+Verification results:
 
 ```text
 68 passed
