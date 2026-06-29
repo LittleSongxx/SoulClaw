@@ -308,6 +308,11 @@ async function searchMemory() {
   memories.value = (payload.items || []).map((item: Record<string, unknown>) => item.memory).filter(Boolean) as Array<Record<string, unknown>>;
 }
 
+async function syncMemoryFile() {
+  jobResult.value = await api("/api/memory/sync", { method: "POST" });
+  await loadActive();
+}
+
 async function verifyMemory(id: unknown) {
   await api(`/api/memory/${id}/verify`, { method: "POST" });
   await loadActive();
@@ -640,6 +645,7 @@ onMounted(refreshAll);
             <input v-model="memoryQuery" @keyup.enter="searchMemory" placeholder="Search memory" />
           </div>
           <button class="secondary" @click="searchMemory">Search</button>
+          <button class="secondary" @click="syncMemoryFile">Sync File</button>
           <button class="secondary" @click="loadMemoryDiagnostics">Diagnostics</button>
         </div>
         <section class="tool-surface">
@@ -738,8 +744,9 @@ onMounted(refreshAll);
         <section class="list">
           <article v-for="item in mcpServers" :key="String(item.id)">
             <strong>{{ item.name }}</strong>
-            <span>{{ item.transport }} · {{ item.enabled ? "enabled" : "disabled" }} · {{ item.status }} · {{ item.tool_count || 0 }} tools</span>
+            <span>{{ item.transport }} · {{ item.enabled ? "enabled" : "disabled" }} · {{ item.status }} · {{ item.health_status || "unknown" }} · {{ item.session_mode || "transient" }} · {{ item.tool_count || 0 }} tools</span>
             <p>{{ item.command || item.url }}</p>
+            <small>{{ item.config_source || "manual" }}</small>
             <small v-if="item.last_error">{{ item.last_error }}</small>
             <button class="secondary fit" @click="refreshMcp(item.name)">Refresh</button>
           </article>

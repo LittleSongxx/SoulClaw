@@ -17,6 +17,7 @@ from pathlib import Path
 APP_DIR = Path("/app")
 DEFAULT_WORKSPACE = APP_DIR / "workspace"
 SEED_WORKSPACE = APP_DIR / "workspace_seed"
+SEED_CONFIG = APP_DIR / "config_seed"
 
 
 def copy_missing_tree(src: Path, dst: Path) -> int:
@@ -63,6 +64,7 @@ def main() -> int:
     (APP_DIR / "config").mkdir(parents=True, exist_ok=True)
     workspace.mkdir(parents=True, exist_ok=True)
     copy_missing_tree(workspace_seed, workspace)
+    copy_missing_tree(SEED_CONFIG, APP_DIR / "config")
 
     command = sys.argv[1:] or [
         sys.executable,

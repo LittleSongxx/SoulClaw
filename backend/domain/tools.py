@@ -50,6 +50,15 @@ class ToolDefinition:
         }
 
 
+class ToolApprovalRequired(PermissionError):
+    """Raised when a tool call is paused behind an approval record."""
+
+    def __init__(self, message: str, *, tool_name: str = "", approval_id: str = "") -> None:
+        super().__init__(message)
+        self.tool_name = tool_name
+        self.approval_id = approval_id
+
+
 class ToolSafetyFloor:
     """Hard safety floor inspired by hermes-agent/mateclaw approval patterns."""
 
@@ -82,6 +91,7 @@ class ToolRegistry:
         events: RuntimeEventBus | None = None,
         gateway: GatewayRuntimeManager | None = None,
         a2a: A2ARuntimeManager | None = None,
+        max_direct_tool_schemas: int = 32,
     ) -> None:
         self.wiki = wiki
         self.memory = memory
@@ -89,6 +99,7 @@ class ToolRegistry:
         self.events = events
         self.gateway = gateway
         self.a2a = a2a
+        self.max_direct_tool_schemas = max_direct_tool_schemas
         self._tools: dict[str, ToolDefinition] = {}
         self._register_builtin_tools()
         if self.gateway is not None:
@@ -100,7 +111,22 @@ class ToolRegistry:
         return sorted(self._tools.values(), key=lambda item: item.name)
 
     def openai_tools(self) -> list[dict[str, Any]]:
-        return [tool.openai_schema() for tool in self.list() if tool.available]
+        available = [tool for tool in self.list() if tool.available]
+        if len(available) <= self.max_direct_tool_schemas:
+            return [tool.openai_schema() for tool in available]
+        direct_names = {
+            "tool_search",
+            "tool_describe",
+            "tool_call",
+            "wiki_orient",
+            "wiki_search",
+            "wiki_read",
+            "memory_search",
+            "skill_search",
+            "skill_read",
+            "wiki_sufficiency_check",
+        }
+        return [tool.openai_schema() for tool in available if tool.name in direct_names]
 
     def get(self, name: str) -> ToolDefinition | None:
         return self._tools.get(name)
@@ -166,6 +192,21 @@ class ToolRegistry:
         )
         self.register(
             ToolDefinition(
+                name="wiki_sufficiency_check",
+                description="Check whether Wiki-backed claims have page-level evidence from wiki_read.",
+                scope="wiki.read",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "claim": {"type": "string"},
+                        "read_pages": {"type": "array", "items": {"type": "string"}},
+                    },
+                },
+                handler=self._wiki_sufficiency_check,
+            )
+        )
+        self.register(
+            ToolDefinition(
                 name="wiki_lint",
                 description="Lint LLM-Wiki structure and write Error Book entries.",
                 scope="wiki.write",
@@ -214,6 +255,52 @@ class ToolRegistry:
         )
         self.register(
             ToolDefinition(
+                name="skill_search",
+                description="Search the skill index for procedural guidance. Use before reading a full skill.",
+                scope="skill.read",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "limit": {"type": "integer"},
+                    },
+                },
+                handler=self._skill_search,
+            )
+        )
+        self.register(
+            ToolDefinition(
+                name="skill_read",
+                description="Read one skill's indexed files by skill_key after skill_search indicates it is relevant.",
+                scope="skill.read",
+                parameters={
+                    "type": "object",
+                    "required": ["skill_key"],
+                    "properties": {"skill_key": {"type": "string"}},
+                },
+                handler=self._skill_read,
+            )
+        )
+        self.register(
+            ToolDefinition(
+                name="skill_use_trace",
+                description="Record that a skill was used and whether it helped, as a skill_trace memory.",
+                scope="memory.write",
+                requires_approval=False,
+                parameters={
+                    "type": "object",
+                    "required": ["skill_key", "outcome"],
+                    "properties": {
+                        "skill_key": {"type": "string"},
+                        "outcome": {"type": "string"},
+                        "notes": {"type": "string"},
+                    },
+                },
+                handler=self._skill_use_trace,
+            )
+        )
+        self.register(
+            ToolDefinition(
                 name="skills_scan",
                 description="Scan workspace skills and rebuild skill indexes.",
                 scope="skill.read",
@@ -226,6 +313,51 @@ class ToolRegistry:
                 description="Run manifest lint/static safety tests for a skill.",
                 scope="skill.read",
                 handler=self._skill_test,
+            )
+        )
+        self.register(
+            ToolDefinition(
+                name="tool_search",
+                description="Search available SoulClaw tools by name, description, and scope.",
+                scope="system.read",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "limit": {"type": "integer"},
+                    },
+                },
+                handler=self._tool_search,
+            )
+        )
+        self.register(
+            ToolDefinition(
+                name="tool_describe",
+                description="Describe one available tool and return its parameter schema.",
+                scope="system.read",
+                parameters={
+                    "type": "object",
+                    "required": ["tool_name"],
+                    "properties": {"tool_name": {"type": "string"}},
+                },
+                handler=self._tool_describe,
+            )
+        )
+        self.register(
+            ToolDefinition(
+                name="tool_call",
+                description="Call a named available tool after discovering it with tool_search/tool_describe.",
+                scope="system.write",
+                requires_approval=False,
+                parameters={
+                    "type": "object",
+                    "required": ["tool_name"],
+                    "properties": {
+                        "tool_name": {"type": "string"},
+                        "arguments": {"type": "object"},
+                    },
+                },
+                handler=self._tool_call,
             )
         )
     def install_gateway(self, gateway: GatewayRuntimeManager) -> None:
@@ -326,6 +458,18 @@ class ToolRegistry:
             )
         }
 
+    def _wiki_sufficiency_check(self, db: Session, arguments: dict[str, Any]) -> dict[str, Any]:
+        del db
+        read_pages = [str(item).strip() for item in arguments.get("read_pages", []) if str(item).strip()] if isinstance(arguments.get("read_pages"), list) else []
+        sufficient = bool(read_pages)
+        return {
+            "sufficient": sufficient,
+            "read_pages": read_pages,
+            "claim": str(arguments.get("claim") or ""),
+            "requirement": "Use wiki_read page bodies before answering Wiki-backed facts.",
+            "next_action": "" if sufficient else "Call wiki_read for at least one relevant page or state that evidence is insufficient.",
+        }
+
     def _wiki_compile(self, db: Session, arguments: dict[str, Any]) -> dict[str, Any]:
         return self.wiki.compile(db)
 
@@ -380,11 +524,122 @@ class ToolRegistry:
         )
         return {"id": str(memory.id), "kind": memory.kind, "content": memory.content}
 
+    def _skill_search(self, db: Session, arguments: dict[str, Any]) -> dict[str, Any]:
+        query = str(arguments.get("query") or "")
+        limit = int(arguments.get("limit") or 10)
+        return {
+            "items": [
+                {
+                    "skill_key": item["skill"].skill_key,
+                    "name": item["skill"].name,
+                    "description": item["skill"].description,
+                    "status": item["skill"].status,
+                    "pinned": item["skill"].pinned,
+                    "metadata": item["skill"].metadata_json or {},
+                    "source": item["source"],
+                    "score": item["score"],
+                }
+                for item in self.skills.search(db, query, limit=limit)
+            ]
+        }
+
+    def _skill_read(self, db: Session, arguments: dict[str, Any]) -> dict[str, Any]:
+        skill_key = str(arguments.get("skill_key") or "")
+        skill = self.skills.get(db, skill_key)
+        if skill is None:
+            raise KeyError(f"skill not found: {skill_key}")
+        files = self.skills.files(db, skill_key)
+        return {
+            "skill_key": skill.skill_key,
+            "name": skill.name,
+            "description": skill.description,
+            "metadata": skill.metadata_json or {},
+            "files": [
+                {
+                    "file_path": item.file_path,
+                    "checksum": item.checksum,
+                    "content": item.content,
+                }
+                for item in files
+            ],
+        }
+
+    def _skill_use_trace(self, db: Session, arguments: dict[str, Any]) -> dict[str, Any]:
+        skill_key = str(arguments.get("skill_key") or "")
+        outcome = str(arguments.get("outcome") or "")
+        notes = str(arguments.get("notes") or "")
+        content = f"Skill `{skill_key}` outcome: {outcome}"
+        if notes.strip():
+            content += f" Notes: {notes.strip()}"
+        memory = self.memory.create(
+            db,
+            kind="skill_trace",
+            content=content,
+            source="skill_use_trace",
+            importance=float(arguments.get("importance", 0.45)),
+            confidence=float(arguments.get("confidence", 0.65)),
+            stability=float(arguments.get("stability", 0.4)),
+            metadata={"skill_key": skill_key, "outcome": outcome, "notes": notes},
+        )
+        return {"memory_id": str(memory.id), "skill_key": skill_key, "outcome": outcome}
+
     def _skills_scan(self, db: Session, arguments: dict[str, Any]) -> dict[str, Any]:
         return self.skills.scan(db)
 
     def _skill_test(self, db: Session, arguments: dict[str, Any]) -> dict[str, Any]:
         return self.skills.test(db, str(arguments["skill_key"]))
+
+    def _tool_search(self, db: Session, arguments: dict[str, Any]) -> dict[str, Any]:
+        del db
+        query = str(arguments.get("query") or "").strip().lower()
+        limit = max(1, min(int(arguments.get("limit") or 20), 100))
+        items = []
+        for tool in self.list():
+            haystack = f"{tool.name} {tool.description} {tool.scope}".lower()
+            if query and query not in haystack:
+                continue
+            items.append(
+                {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "scope": tool.scope,
+                    "requires_approval": tool.requires_approval,
+                    "available": tool.available,
+                    "score": 1.0 if query and query in tool.name.lower() else 0.7,
+                }
+            )
+        return {"items": items[:limit], "total": len(items)}
+
+    def _tool_describe(self, db: Session, arguments: dict[str, Any]) -> dict[str, Any]:
+        del db
+        tool_name = str(arguments.get("tool_name") or "")
+        tool = self.get(tool_name)
+        if tool is None:
+            raise KeyError(f"tool not found: {tool_name}")
+        return {
+            "name": tool.name,
+            "description": tool.description,
+            "scope": tool.scope,
+            "requires_approval": tool.requires_approval,
+            "available": tool.available,
+            "parameters": tool.parameters,
+        }
+
+    def _tool_call(self, db: Session, arguments: dict[str, Any]) -> dict[str, Any]:
+        tool_name = str(arguments.get("tool_name") or "")
+        if tool_name in {"tool_call", ""}:
+            raise ValueError("tool_call requires a non-recursive target tool_name")
+        tool = self.get(tool_name)
+        if tool is None or tool.handler is None:
+            raise KeyError(f"tool not found: {tool_name}")
+        if not tool.available:
+            raise RuntimeError(f"tool unavailable: {tool_name}")
+        call_arguments = arguments.get("arguments") if isinstance(arguments.get("arguments"), dict) else {}
+        if (tool.requires_approval or tool.scope in ToolSafetyFloor.mutating_scopes) and not bool(arguments.get("_approved")):
+            raise PermissionError(f"tool requires approval: {tool_name}")
+        if bool(arguments.get("_approved")):
+            call_arguments = {**call_arguments, "_approved": True}
+        return {"tool_name": tool_name, "result": tool.handler(db, call_arguments)}
 
     def _gateway_send(self, db: Session, arguments: dict[str, Any]) -> dict[str, Any]:
         del db
@@ -456,12 +711,7 @@ class ToolExecutor:
         if definition.requires_approval and not approved:
             approval = None
             if self.platform is not None:
-                approval = self.platform.create_approval(
-                    db,
-                    subject_type="tool_run",
-                    subject_id=tool_name,
-                    payload={"tool_name": tool_name, "arguments": arguments, "turn_id": turn_id},
-                )
+                approval = self._create_tool_approval(db, tool_name=tool_name, arguments=arguments, turn_id=turn_id)
             if self.events:
                 self.events.emit(
                     "tool.approval_required",
@@ -472,7 +722,11 @@ class ToolExecutor:
                     severity="warning",
                     turn_id=turn_id,
                 )
-            raise PermissionError(f"tool requires approval: {tool_name}")
+            raise ToolApprovalRequired(
+                f"tool requires approval: {tool_name}",
+                tool_name=tool_name,
+                approval_id=str(approval.id) if approval is not None else "",
+            )
         if approved and self.events:
             self.events.audit(
                 "tool.approved_execution",
@@ -512,11 +766,12 @@ class ToolExecutor:
         except PermissionError as exc:
             approval = None
             if self.platform is not None:
-                approval = self.platform.create_approval(
+                approval = self._create_tool_approval(
                     db,
-                    subject_type="tool_run",
-                    subject_id=tool_name,
-                    payload={"tool_name": tool_name, "arguments": arguments, "turn_id": turn_id, "dynamic_approval": True},
+                    tool_name=tool_name,
+                    arguments=arguments,
+                    turn_id=turn_id,
+                    dynamic_approval=True,
                 )
             run.status = "approval_required"
             run.result = {"error": str(exc), "approval_id": str(approval.id) if approval is not None else None}
@@ -533,7 +788,11 @@ class ToolExecutor:
                     severity="warning",
                     turn_id=turn_id,
                 )
-            raise
+            raise ToolApprovalRequired(
+                str(exc),
+                tool_name=tool_name,
+                approval_id=str(approval.id) if approval is not None else "",
+            ) from exc
         except Exception as exc:
             run.status = "failed"
             run.result = {"error": str(exc)}
@@ -552,3 +811,36 @@ class ToolExecutor:
         if self.events:
             self.events.emit("tool.succeeded", {"tool_run_id": str(run.id), "tool_name": tool_name}, turn_id=turn_id)
         return {"tool_run_id": str(run.id), "tool_name": tool_name, "status": run.status, "result": result}
+
+    def _create_tool_approval(
+        self,
+        db: Session,
+        *,
+        tool_name: str,
+        arguments: dict[str, Any],
+        turn_id: str,
+        dynamic_approval: bool = False,
+    ):
+        if self.platform is None:
+            return None
+        payload = {"tool_name": tool_name, "arguments": arguments, "turn_id": turn_id}
+        if dynamic_approval:
+            payload["dynamic_approval"] = True
+        try:
+            return self.platform.create_approval(
+                db,
+                subject_type="tool_run",
+                subject_id=tool_name,
+                payload=payload,
+                original_tool_call={"tool_name": tool_name, "arguments": arguments},
+                turn_checkpoint={"turn_id": turn_id, "tool_name": tool_name},
+                allowed_decisions=["approve", "edit", "reject", "respond"],
+                resume_state={"mode": "rerun_tool"},
+            )
+        except TypeError:
+            return self.platform.create_approval(
+                db,
+                subject_type="tool_run",
+                subject_id=tool_name,
+                payload=payload,
+            )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+from pathlib import Path
 
 import pytest
 
@@ -63,6 +64,38 @@ class DummyMemory:
 
 
 class DummySkills:
+    def __init__(self) -> None:
+        self.skill = type(
+            "Skill",
+            (),
+            {
+                "skill_key": "coding/debug",
+                "name": "Debug",
+                "description": "Debug systematically",
+                "status": "active",
+                "pinned": False,
+                "metadata_json": {},
+            },
+        )()
+
+    def search(self, db, query: str, limit: int = 10):
+        del db, query, limit
+        return [{"skill": self.skill, "source": "skill_index", "score": 1.0}]
+
+    def get(self, db, skill_key: str):
+        del db
+        return self.skill if skill_key == "coding/debug" else None
+
+    def files(self, db, skill_key: str):
+        del db, skill_key
+        return [
+            type(
+                "SkillFile",
+                (),
+                {"file_path": "SKILL.md", "checksum": "abc", "content": "# Debug\n\nUse a checklist."},
+            )()
+        ]
+
     def scan(self, db):
         return {"skills": 0}
 
@@ -147,6 +180,45 @@ def test_wiki_follow_links_tool_returns_neighbors() -> None:
     assert result["items"][0]["dst_page_key"] == "other"
 
 
+def test_skill_search_and_read_tools_are_progressive() -> None:
+    registry = ToolRegistry(wiki=DummyWiki(), memory=DummyMemory(), skills=DummySkills())
+
+    search = registry.get("skill_search").handler(None, {"query": "debug"})
+    read = registry.get("skill_read").handler(None, {"skill_key": "coding/debug"})
+
+    assert search["items"][0]["skill_key"] == "coding/debug"
+    assert read["files"][0]["file_path"] == "SKILL.md"
+
+
+def test_tool_search_bridge_finds_tools_without_full_schema() -> None:
+    registry = ToolRegistry(wiki=DummyWiki(), memory=DummyMemory(), skills=DummySkills(), max_direct_tool_schemas=1)
+
+    tools = registry.openai_tools()
+    result = registry.get("tool_search").handler(None, {"query": "wiki"})
+
+    assert {item["function"]["name"] for item in tools} <= {
+        "tool_search",
+        "tool_describe",
+        "tool_call",
+        "wiki_orient",
+        "wiki_search",
+        "wiki_read",
+        "memory_search",
+        "skill_search",
+        "skill_read",
+        "wiki_sufficiency_check",
+    }
+    assert any(item["name"] == "wiki_search" for item in result["items"])
+
+
+def test_wiki_sufficiency_requires_read_pages() -> None:
+    registry = ToolRegistry(wiki=DummyWiki(), memory=DummyMemory(), skills=DummySkills())
+
+    result = registry.get("wiki_sufficiency_check").handler(None, {"claim": "x", "read_pages": []})
+
+    assert result["sufficient"] is False
+
+
 def test_platform_service_validates_cron_expr() -> None:
     service = PlatformService()
 
@@ -159,6 +231,33 @@ def test_platform_service_validates_mcp_transport_requirements() -> None:
 
     with pytest.raises(ValueError):
         service.upsert_mcp_server(FakeDB(), name="remote", transport="sse")
+
+
+def test_platform_imports_mcp_seed_from_yaml(tmp_path: Path) -> None:
+    seed = tmp_path / "mcp_servers.yaml"
+    seed.write_text(
+        """
+servers:
+  search:
+    command: "npx"
+    args: ["-y", "open-websearch@latest"]
+    tools:
+      override_permission:
+        search: safe
+""",
+        encoding="utf-8",
+    )
+    settings = type("Settings", (), {"mcp_config_file": seed})()
+    db = FakeDB()
+    service = PlatformService()
+
+    result = service.import_mcp_seed(db, settings)
+
+    server = next(item for item in db.objects if item.__class__.__name__ == "MCPServer")
+    assert result["imported"] == 1
+    assert server.name == "search"
+    assert server.config_source.startswith("yaml:")
+    assert server.permission_policy["override_permission"]["search"] == "safe"
 
 
 def test_platform_service_validates_gateway_kind() -> None:

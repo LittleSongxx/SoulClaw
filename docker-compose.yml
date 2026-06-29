@@ -22,9 +22,6 @@ services:
         reservations:
           memory: 512M
           cpus: '0.5'
-    depends_on:
-      redis:
-        condition: service_healthy
     environment:
       SOULCLAW_HOST: 0.0.0.0
       SOULCLAW_PORT: 8020
@@ -32,12 +29,17 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
       OPENAI_MODEL: ${OPENAI_MODEL:-}
+      SOULCLAW_LLM_PROVIDER: ${SOULCLAW_LLM_PROVIDER:-openai-compatible}
+      SOULCLAW_LLM_CONTEXT_WINDOW_TOKENS: ${SOULCLAW_LLM_CONTEXT_WINDOW_TOKENS:-128000}
       NPM_CONFIG_REGISTRY: ${NPM_CONFIG_REGISTRY:-}
       SOULCLAW_REDIS_URL: redis://redis:6379/0
+      SOULCLAW_REDIS_REQUIRED: ${SOULCLAW_REDIS_REQUIRED:-false}
       SOULCLAW_DATABASE_URL: sqlite:////app/data/soulclaw.sqlite3
       SOULCLAW_WORKSPACE_SEED_DIR: /app/workspace_seed
       SOULCLAW_BOOTSTRAP_WIKI_ON_STARTUP: ${SOULCLAW_BOOTSTRAP_WIKI_ON_STARTUP:-true}
       SOULCLAW_BOOTSTRAP_SKILLS_ON_STARTUP: ${SOULCLAW_BOOTSTRAP_SKILLS_ON_STARTUP:-true}
+      SOULCLAW_MCP_SEED_ON_STARTUP: ${SOULCLAW_MCP_SEED_ON_STARTUP:-true}
+      SOULCLAW_MCP_CONFIG_FILE: ${SOULCLAW_MCP_CONFIG_FILE:-config/mcp_servers.yaml}
       SOULCLAW_DREAM_REVIEW_ENABLED: ${SOULCLAW_DREAM_REVIEW_ENABLED:-true}
       SOULCLAW_API_SCHEDULER_ENABLED: ${SOULCLAW_API_SCHEDULER_ENABLED:-false}
       SOULCLAW_DREAM_REVIEW_CRON: "${SOULCLAW_DREAM_REVIEW_CRON:-30 3 * * *}"
@@ -45,6 +47,9 @@ services:
       SOULCLAW_ADMIN_USERNAME: ${SOULCLAW_ADMIN_USERNAME:-admin}
       SOULCLAW_ADMIN_PASSWORD: ${SOULCLAW_ADMIN_PASSWORD:-soulclaw-admin}
       SOULCLAW_JWT_SECRET: ${SOULCLAW_JWT_SECRET:-change-me-for-production}
+      SOULCLAW_A2A_BOOTSTRAP_WEAVER_ENABLED: ${SOULCLAW_A2A_BOOTSTRAP_WEAVER_ENABLED:-false}
+      SOULCLAW_A2A_REQUIRE_PUBLIC_AUTH: ${SOULCLAW_A2A_REQUIRE_PUBLIC_AUTH:-true}
+      SOULCLAW_A2A_PUBLIC_API_KEY: ${SOULCLAW_A2A_PUBLIC_API_KEY:-}
       SOULCLAW_SEARXNG_URL: ${SOULCLAW_SEARXNG_URL:-}
     env_file:
       - path: .env
@@ -60,6 +65,7 @@ services:
   soulclaw-worker:
     image: soulclaw:local
     container_name: soulclaw-worker
+    profiles: ["background"]
     restart: unless-stopped
     depends_on:
       redis:
@@ -67,11 +73,14 @@ services:
     command: ["celery", "-A", "backend.worker.celery_app.celery_app", "worker", "--loglevel=INFO", "--concurrency=1"]
     environment:
       SOULCLAW_REDIS_URL: redis://redis:6379/0
+      SOULCLAW_REDIS_REQUIRED: "true"
       SOULCLAW_DATABASE_URL: sqlite:////app/data/soulclaw.sqlite3
       SOULCLAW_WORKSPACE_SEED_DIR: /app/workspace_seed
+      SOULCLAW_MCP_CONFIG_FILE: /app/config/mcp_servers.yaml
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
       OPENAI_MODEL: ${OPENAI_MODEL:-}
+      SOULCLAW_LLM_PROVIDER: ${SOULCLAW_LLM_PROVIDER:-openai-compatible}
     env_file:
       - path: .env
         required: false
@@ -84,6 +93,7 @@ services:
   soulclaw-scheduler:
     image: soulclaw:local
     container_name: soulclaw-scheduler
+    profiles: ["background"]
     restart: unless-stopped
     depends_on:
       redis:
@@ -91,6 +101,7 @@ services:
     command: ["python", "-m", "backend.worker.scheduler"]
     environment:
       SOULCLAW_REDIS_URL: redis://redis:6379/0
+      SOULCLAW_REDIS_REQUIRED: "true"
       SOULCLAW_DATABASE_URL: sqlite:////app/data/soulclaw.sqlite3
       SOULCLAW_WORKSPACE_SEED_DIR: /app/workspace_seed
     env_file:
@@ -104,6 +115,7 @@ services:
   redis:
     image: redis:7-alpine
     container_name: soulclaw-redis
+    profiles: ["background"]
     restart: unless-stopped
     command:
       - redis-server

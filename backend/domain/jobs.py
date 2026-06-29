@@ -142,15 +142,11 @@ def enqueue_background_job(
         cron_job_id=cron_job_id,
     )
     service.mark_enqueued(db, job.id, queue_id=queue_id)
-    if hasattr(db, "commit"):
-        db.commit()
     from backend.worker.tasks import dispatch_task
 
     try:
         dispatch_task(task_name, str(job.id), payload or {}, queue_id=queue_id)
     except Exception as exc:
         service.mark_failed(db, job.id, str(exc))
-        if hasattr(db, "commit"):
-            db.commit()
         raise
     return job

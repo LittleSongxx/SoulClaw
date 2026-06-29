@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from backend.api.admin.deps import get_a2a_runtime, get_a2a_service, get_current_user, get_db
 from backend.api.admin.serializers import a2a_connection_to_dict, a2a_task_to_dict
 from backend.domain.a2a import A2AService
+from backend.infra.config import Settings, get_settings
 from backend.infra.models import User
 from backend.runtime.a2a import A2ADelegateRequest, A2ARuntimeManager
 
@@ -54,11 +55,16 @@ def public_agent_card_legacy(runtime: A2ARuntimeManager = Depends(get_a2a_runtim
 @router.post("/api/a2a")
 def a2a_jsonrpc(
     payload: dict[str, Any],
+    authorization: str | None = Header(default=None),
+    x_soulclaw_a2a_key: str | None = Header(default=None),
     db: Session = Depends(get_db),
     runtime: A2ARuntimeManager = Depends(get_a2a_runtime),
+    settings: Settings = Depends(get_settings),
 ) -> dict:
     if payload.get("jsonrpc") != "2.0":
         return {"jsonrpc": "2.0", "id": payload.get("id"), "error": {"code": -32600, "message": "invalid JSON-RPC request"}}
+    if not _a2a_public_authorized(settings, authorization=authorization, api_key=x_soulclaw_a2a_key):
+        return {"jsonrpc": "2.0", "id": payload.get("id"), "error": {"code": -32003, "message": "A2A public API authentication required"}}
     return runtime.handle_jsonrpc(db, payload)
 
 
@@ -189,3 +195,17 @@ def stream_a2a_task_events(
             yield f"id: {item.sequence}\nevent: {item.event_type}\ndata: {json.dumps(payload, ensure_ascii=False, default=str)}\n\n"
 
     return StreamingResponse(generate(), media_type="text/event-stream")
+
+
+def _a2a_public_authorized(settings: Settings, *, authorization: str | None, api_key: str | None) -> bool:
+    if not settings.a2a_require_public_auth:
+        return True
+    if not settings.public_base_url:
+        return True
+    expected = settings.a2a_public_api_key
+    if not expected:
+        return False
+    token = api_key or ""
+    if authorization and authorization.lower().startswith("bearer "):
+        token = authorization.split(" ", 1)[1].strip()
+    return token == expected

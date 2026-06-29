@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import uuid
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
+import yaml
 from croniter import croniter
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
 from backend.domain.cron_schedule import compute_next_run
+from backend.infra.config import Settings, get_settings
 from backend.infra.events import RuntimeEventBus
 from backend.infra.models import Approval, CronJob, GatewayConnection, MCPServer
 
@@ -26,12 +31,20 @@ class PlatformService:
         subject_type: str,
         subject_id: str = "",
         payload: dict[str, Any] | None = None,
+        turn_checkpoint: dict[str, Any] | None = None,
+        original_tool_call: dict[str, Any] | None = None,
+        allowed_decisions: list[str] | None = None,
+        resume_state: dict[str, Any] | None = None,
     ) -> Approval:
         approval = Approval(
             subject_type=subject_type,
             subject_id=subject_id,
             status="pending",
             payload=payload or {},
+            turn_checkpoint=turn_checkpoint or {},
+            original_tool_call=original_tool_call or {},
+            allowed_decisions=allowed_decisions or ["approve", "edit", "reject", "respond"],
+            resume_state=resume_state or {},
         )
         db.add(approval)
         db.flush()
@@ -144,9 +157,16 @@ class PlatformService:
         url: str = "",
         config: dict[str, Any] | None = None,
         enabled: bool = True,
+        config_source: str = "manual",
+        permission_policy: dict[str, Any] | None = None,
+        session_mode: str = "transient",
+        health_status: str = "unknown",
+        last_imported_checksum: str = "",
     ) -> MCPServer:
         if transport not in {"stdio", "sse", "streamable_http", "http"}:
             raise ValueError("unsupported MCP transport")
+        if session_mode not in {"transient", "managed"}:
+            raise ValueError("unsupported MCP session_mode")
         if transport == "stdio" and not command:
             raise ValueError("stdio MCP servers require a command")
         if transport != "stdio" and not url:
@@ -159,6 +179,11 @@ class PlatformService:
         server.command = command
         server.url = url
         server.config = config or {}
+        server.config_source = config_source or "manual"
+        server.permission_policy = permission_policy or {}
+        server.session_mode = session_mode
+        server.health_status = health_status
+        server.last_imported_checksum = last_imported_checksum
         server.enabled = enabled
         server.status = "pending" if enabled else "disabled"
         if not enabled:
@@ -170,6 +195,60 @@ class PlatformService:
             self.events.emit("mcp.upsert", {"name": name, "transport": transport, "enabled": enabled})
             self.events.audit("mcp.upsert", "mcp_server", target_id=name, payload={"transport": transport, "enabled": enabled})
         return server
+
+    def import_mcp_seed(self, db: Session, settings: Settings | None = None) -> dict[str, Any]:
+        settings = settings or get_settings()
+        path = settings.mcp_config_file.expanduser()
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        if not path.exists():
+            return {"path": str(path), "imported": 0, "skipped": 0, "missing": True}
+        loaded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        servers = loaded.get("servers") if isinstance(loaded, dict) else {}
+        if not isinstance(servers, dict):
+            raise ValueError("MCP seed file must contain a mapping at `servers`")
+        imported = 0
+        skipped = 0
+        for name, raw_config in servers.items():
+            if not isinstance(raw_config, dict):
+                skipped += 1
+                continue
+            server_name = str(name)
+            existing = db.scalar(select(MCPServer).where(MCPServer.name == server_name))
+            checksum = hashlib.sha256(
+                json.dumps(raw_config, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
+            ).hexdigest()
+            if existing is not None and not str(getattr(existing, "config_source", "")).startswith("yaml:"):
+                skipped += 1
+                continue
+            if existing is not None and existing.last_imported_checksum == checksum:
+                skipped += 1
+                continue
+            transport = str(raw_config.get("transport") or "stdio")
+            command = str(raw_config.get("command") or "")
+            url = str(raw_config.get("url") or "")
+            config = {key: value for key, value in raw_config.items() if key not in {"transport", "command", "url", "enabled"}}
+            tools = config.get("tools") if isinstance(config.get("tools"), dict) else {}
+            permission_policy = tools if isinstance(tools, dict) else {}
+            session_mode = str(raw_config.get("session_mode") or config.get("session_mode") or "transient")
+            self.upsert_mcp_server(
+                db,
+                name=server_name,
+                transport=transport,
+                command=command,
+                url=url,
+                config=config,
+                enabled=bool(raw_config.get("enabled", True)),
+                config_source=f"yaml:{path}",
+                permission_policy=permission_policy,
+                session_mode=session_mode,
+                health_status="unknown",
+                last_imported_checksum=checksum,
+            )
+            imported += 1
+        if self.events:
+            self.events.emit("mcp.seed.imported", {"path": str(path), "imported": imported, "skipped": skipped})
+        return {"path": str(path), "imported": imported, "skipped": skipped, "missing": False}
 
     def list_gateways(self, db: Session, *, kind: str | None = None, limit: int = 100) -> list[GatewayConnection]:
         stmt = select(GatewayConnection).order_by(GatewayConnection.name).limit(max(1, min(limit, 500)))

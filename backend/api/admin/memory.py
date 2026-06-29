@@ -92,6 +92,14 @@ def search_memory(
     }
 
 
+@router.post("/sync")
+def sync_memory_file(
+    db: Session = Depends(get_db),
+    service: MemoryService = Depends(get_memory_service),
+) -> dict:
+    return service.sync_from_memory_file(db)
+
+
 @router.get("/get")
 def get_memory(
     memory_id: uuid.UUID,

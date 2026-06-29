@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from sqlalchemy import delete, desc, select
+from sqlalchemy import delete, desc, or_, select
 from sqlalchemy.orm import Session
 
 from backend.infra.config import Settings, get_settings
@@ -128,6 +128,40 @@ class SkillService:
         if status:
             stmt = stmt.where(Skill.status == status)
         return list(db.scalars(stmt).all())
+
+    def search(self, db: Session, query: str, *, limit: int = 10) -> list[dict[str, Any]]:
+        limit = max(1, min(limit, 50))
+        query = query.strip()
+        if query:
+            pattern = f"%{query}%"
+            stmt = (
+                select(Skill)
+                .where(
+                    Skill.status == "active",
+                    or_(
+                        Skill.skill_key.ilike(pattern),
+                        Skill.name.ilike(pattern),
+                        Skill.description.ilike(pattern),
+                    ),
+                )
+                .order_by(desc(Skill.pinned), Skill.skill_key)
+                .limit(limit)
+            )
+        else:
+            stmt = (
+                select(Skill)
+                .where(Skill.status == "active")
+                .order_by(desc(Skill.pinned), Skill.skill_key)
+                .limit(limit)
+            )
+        return [
+            {
+                "score": 1.0 if query and query.lower() in f"{skill.skill_key} {skill.name}".lower() else 0.7,
+                "source": "skill_index",
+                "skill": skill,
+            }
+            for skill in db.scalars(stmt).all()
+        ]
 
     def get(self, db: Session, skill_key: str) -> Skill | None:
         return db.scalar(select(Skill).where(Skill.skill_key == normalize_skill_key(skill_key)))

@@ -9,6 +9,7 @@ from backend.infra.models import BackgroundJob
 class FakeDB:
     def __init__(self) -> None:
         self.objects = []
+        self.commits = 0
 
     def add(self, item) -> None:
         self.objects.append(item)
@@ -24,6 +25,9 @@ class FakeDB:
                 return item
         return None
 
+    def commit(self) -> None:
+        self.commits += 1
+
 
 def test_enqueue_background_job_persists_queue_id(monkeypatch) -> None:
     db = FakeDB()
@@ -38,6 +42,7 @@ def test_enqueue_background_job_persists_queue_id(monkeypatch) -> None:
     assert job.status == "queued"
     assert job.queue_id
     assert job.payload == {"limit": 1}
+    assert db.commits == 0
 
 
 def test_background_job_status_transitions() -> None:

@@ -17,6 +17,9 @@ target_metadata = Base.metadata
 
 
 def _database_url() -> str:
+    configured = config.get_main_option("sqlalchemy.url")
+    if configured and configured != "sqlite:///data/soulclaw.sqlite3":
+        return configured
     return get_settings().database_url
 
 

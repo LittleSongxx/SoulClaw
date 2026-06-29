@@ -336,8 +336,8 @@ before deciding whether to attach.
 - Trying to install before showing the user the candidate.
 - Inventing a server name that the registry does not return.
 - Filling in API keys / tokens the user did not provide.
-- Calling `mcp_manage(action='add')` when an existing tool already
-  covered the gap.
+- Adding a new MCP server through the control plane when an existing
+  `mcp__...` tool already covered the gap.
 - Persisting a half-broken install (use `remove` to roll back).
 - Treating mcporter's stdout as authoritative without sanity-checking
   the install command against the server's real README.
@@ -347,5 +347,7 @@ before deciding whether to attach.
 - mcporter CLI docs: https://www.npmjs.com/package/mcporter
 - MCP server registry: https://mcpfinder.dev, https://mcp.so
 - Official MCP servers: https://github.com/modelcontextprotocol/servers
-- SoulClaw's `mcp_manage` tool — see `backend/tools/builtins/mcp_manage.py`
-- SoulClaw's lifecycle service — see `backend/mcp/lifecycle.py`
+- SoulClaw MCP control plane: `GET/POST /api/mcp`,
+  `POST /api/mcp/refresh`, and `POST /api/mcp/{server_name}/refresh`
+- SoulClaw tool bridge: use `tool_search`, `tool_describe`, and
+  `tool_call` after MCP discovery exposes `mcp__...` tools.

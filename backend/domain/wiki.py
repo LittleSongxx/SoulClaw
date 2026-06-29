@@ -166,6 +166,18 @@ class WikiService:
         log = self._read_optional_file("log.md")
         pages = self.list_pages(db, limit=500)
         recent_log = "\n".join(log.splitlines()[-max(1, min(recent_log_lines, 200)) :])
+        open_constraints = [
+            {
+                "error_type": item.error_type,
+                "page_key": item.page_key,
+                "root_cause": item.root_cause,
+                "constraint": item.constraint,
+                "constraint_rule": getattr(item, "constraint_rule", "") or "",
+                "verification_method": getattr(item, "verification_method", "") or "",
+                "source_refs": getattr(item, "source_refs", []) or [],
+            }
+            for item in self.error_book(db, status="open", limit=50)
+        ]
         return {
             "root": str(self.root),
             "schema": schema,
@@ -174,6 +186,7 @@ class WikiService:
             "page_count": len(pages),
             "directories": sorted({Path(page.path).parts[0] for page in pages if Path(page.path).parts}),
             "page_types": sorted({page.page_type for page in pages}),
+            "open_constraints": open_constraints,
             "pages": [
                 {
                     "page_key": page.page_key,
@@ -248,6 +261,7 @@ class WikiService:
             )
         ):
             old_error.status = "fixed"
+            old_error.lifecycle_status = "fixed"
             old_error.fixed_at = now
 
         for error in new_errors:
@@ -378,7 +392,9 @@ class WikiService:
             score = 1.0
             if lowered:
                 title_or_summary = lowered in page.title.lower() or lowered in page.summary.lower()
-                score = 1.0 if title_or_summary else 0.6
+                alias_or_tag = any(lowered in str(item).lower() for item in [*(page.aliases or []), *(page.tags or [])])
+                key_hit = lowered in page.page_key.lower()
+                score = 1.0 if key_hit or title_or_summary or alias_or_tag else 0.6
             records.append(
                 {
                     "score": score,
@@ -394,6 +410,7 @@ class WikiService:
                 }
             )
 
+        records.sort(key=lambda item: item["score"], reverse=True)
         return records[:limit]
 
     def follow_links(
@@ -460,6 +477,7 @@ class WikiService:
         now = datetime.now(UTC)
         for old_error in db.scalars(select(WikiErrorBook).where(WikiErrorBook.error_type.in_(sorted(stale_types)), WikiErrorBook.status == "open")):
             old_error.status = "fixed"
+            old_error.lifecycle_status = "fixed"
             old_error.fixed_at = now
         for filename in canonical_missing:
             errors.append(self._error("missing_canonical_file", filename, f"Missing {filename}.", "Create the canonical LLM-Wiki control file.", {"path": filename}))
@@ -675,6 +693,10 @@ class WikiService:
             page_key=page_key,
             root_cause=root_cause,
             constraint=constraint,
+            constraint_rule=payload.get("constraint_rule") or constraint,
+            verification_method=payload.get("verification_method") or "Run wiki lint/compile and answer the associated retrieval probe.",
+            source_refs=payload.get("source_refs") if isinstance(payload.get("source_refs"), list) else [],
+            lifecycle_status="open",
             status="open",
             payload=payload,
         )

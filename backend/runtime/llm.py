@@ -25,6 +25,36 @@ class LLMResponse:
     raw: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class LLMProvider:
+    name: str
+    model: str
+    base_url: str
+    context_window_tokens: int
+    supports_tools: bool = True
+    supports_streaming: bool = False
+
+
+class LLMProviderRegistry:
+    def __init__(self, settings: Settings | None = None) -> None:
+        self.settings = settings or get_settings()
+
+    def list(self) -> list[LLMProvider]:
+        return [
+            LLMProvider(
+                name=self.settings.llm_provider,
+                model=self.settings.openai_model or "",
+                base_url=self.settings.openai_base_url,
+                context_window_tokens=self.settings.llm_context_window_tokens,
+                supports_tools=True,
+                supports_streaming=False,
+            )
+        ]
+
+    def active(self) -> LLMProvider:
+        return self.list()[0]
+
+
 class OpenAICompatibleClient:
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
@@ -32,6 +62,10 @@ class OpenAICompatibleClient:
     @property
     def configured(self) -> bool:
         return bool(self.settings.openai_api_key and self.settings.openai_model)
+
+    @property
+    def provider(self) -> LLMProvider:
+        return LLMProviderRegistry(self.settings).active()
 
     def complete(
         self,

@@ -18,6 +18,8 @@ from backend.infra.models import EvolutionProposal, Memory, MemoryConflict, Memo
 L1_KINDS = {"control_axiom", "pinned_fact"}
 L2_KINDS = {"episodic", "user_fact", "agent_note", "error_signal"}
 L3_KINDS = {"semantic", "skill_trace", "project_knowledge"}
+MEMORY_MARKER_RE = re.compile(r"<!--\s*soulclaw:memory\s+id=([0-9a-fA-F-]+)\s*-->")
+MEMORY_LINE_RE = re.compile(r"^-\s+\((?P<meta>[^)]*)\)\s+(?P<content>.*)$", re.DOTALL)
 
 
 class MemoryService:
@@ -50,12 +52,17 @@ class MemoryService:
             kind=kind,
             content=content,
             source=source,
+            status="active",
             pinned=pinned,
             importance=self._clamp(importance),
             confidence=self._clamp(confidence),
             stability=self._clamp(stability),
             supersedes_id=supersedes_id,
             source_turn_id=source_turn_id,
+            provenance={
+                "source": source,
+                **(metadata.get("provenance", {}) if isinstance(metadata, dict) and isinstance(metadata.get("provenance"), dict) else {}),
+            },
             metadata_json=metadata or {},
         )
         db.add(memory)
@@ -63,7 +70,9 @@ class MemoryService:
             previous = db.get(Memory, supersedes_id)
             if previous is not None:
                 previous.archived = True
+                previous.status = "superseded"
         db.flush()
+        memory.source_file_marker = self._marker(memory)
         self._detect_conflicts(db, memory)
         self._append_to_memory_file(memory)
         if self.events:
@@ -129,7 +138,8 @@ class MemoryService:
         if previous is None:
             raise KeyError(f"memory not found: {memory_id}")
         previous.archived = True
-        return self.create(
+        previous.status = "superseded"
+        memory = self.create(
             db,
             kind=replacement.get("kind") or previous.kind,
             content=replacement["content"],
@@ -141,6 +151,10 @@ class MemoryService:
             supersedes_id=memory_id,
             metadata=replacement.get("metadata") or {"supersedes": str(memory_id)},
         )
+        previous.superseded_by = memory.id
+        self._rewrite_memory_file_entry(previous)
+        self._rewrite_memory_file_entry(memory)
+        return memory
 
     def list_conflicts(self, db: Session, *, status: str | None = "open", limit: int = 100) -> list[MemoryConflict]:
         stmt = select(MemoryConflict).order_by(desc(MemoryConflict.created_at)).limit(max(1, min(limit, 500)))
@@ -167,6 +181,7 @@ class MemoryService:
         memory.last_verified_at = datetime.now(UTC)
         memory.confidence = self._clamp(memory.confidence + confidence_delta)
         memory.stability = self._clamp(memory.stability + confidence_delta / 2)
+        self._rewrite_memory_file_entry(memory)
         if self.events:
             self.events.audit("memory.verify", "memory", target_id=str(memory_id), payload={"confidence_delta": confidence_delta})
         return memory
@@ -176,10 +191,63 @@ class MemoryService:
         if memory is None:
             raise KeyError(f"memory not found: {memory_id}")
         memory.archived = True
+        memory.status = "archived"
+        self._rewrite_memory_file_entry(memory)
         if self.events:
             self.events.emit("memory.archive", {"memory_id": str(memory_id)})
             self.events.audit("memory.archive", "memory", target_id=str(memory_id))
         return memory
+
+    def sync_from_memory_file(self, db: Session) -> dict[str, Any]:
+        item = self.workspace.read("memory")
+        lines = item.content.splitlines()
+        updated = 0
+        missing = 0
+        for index, line in enumerate(lines):
+            marker = MEMORY_MARKER_RE.match(line.strip())
+            if marker is None:
+                continue
+            try:
+                memory_id = uuid.UUID(marker.group(1))
+            except ValueError:
+                continue
+            memory = db.get(Memory, memory_id)
+            if memory is None:
+                missing += 1
+                continue
+            if index + 1 >= len(lines):
+                continue
+            parsed = self._parse_memory_line(lines[index + 1])
+            if parsed is None:
+                continue
+            metadata, content = parsed
+            memory.kind = metadata.get("kind") or memory.kind
+            memory.content = content or memory.content
+            memory.source = metadata.get("source") or memory.source
+            memory.status = metadata.get("status") or memory.status or "active"
+            memory.archived = memory.status in {"archived", "superseded"}
+            for key in ("importance", "confidence", "stability"):
+                if key in metadata:
+                    try:
+                        setattr(memory, key, self._clamp(float(metadata[key])))
+                    except ValueError:
+                        continue
+            memory.source_file_marker = self._marker(memory)
+            memory.provenance = {
+                **(memory.provenance or {}),
+                "synced_from": item.path,
+                "synced_at": datetime.now(UTC).isoformat(),
+            }
+            updated += 1
+        if self.events:
+            self.events.emit("memory.file_sync", {"updated": updated, "missing": missing, "path": item.path})
+            self.events.audit(
+                "memory.file_sync",
+                "workspace_file",
+                target_id="memory",
+                payload={"updated": updated, "missing": missing, "path": item.path},
+            )
+        return {"updated": updated, "missing": missing, "path": item.path}
 
     def apply_proposal(self, db: Session, proposal_id: uuid.UUID, *, actor: str = "admin") -> EvolutionProposal:
         proposal = db.get(EvolutionProposal, proposal_id)
@@ -264,14 +332,11 @@ class MemoryService:
     def _append_to_memory_file(self, memory: Memory) -> None:
         try:
             item = self.workspace.read("memory")
-            marker = f"<!-- soulclaw:memory id={memory.id} -->"
+            marker = self._marker(memory)
             if marker in item.content:
+                self._rewrite_memory_file_entry(memory)
                 return
-            line = (
-                f"\n\n{marker}\n"
-                f"- ({memory.kind}, source={memory.source}, confidence={memory.confidence:.2f}) "
-                f"{memory.content.strip()}\n"
-            )
+            line = f"\n\n{marker}\n{self._memory_file_line(memory)}\n"
             self.workspace.write("memory", item.content.rstrip() + line, actor="memory-service")
         except Exception as exc:  # noqa: BLE001
             if self.events:
@@ -280,6 +345,58 @@ class MemoryService:
                     {"memory_id": str(memory.id), "error": str(exc)},
                     severity="warning",
                 )
+
+    def _rewrite_memory_file_entry(self, memory: Memory) -> None:
+        try:
+            item = self.workspace.read("memory")
+            marker = self._marker(memory)
+            lines = item.content.splitlines()
+            for index, line in enumerate(lines):
+                if line.strip() != marker:
+                    continue
+                if index + 1 < len(lines):
+                    lines[index + 1] = self._memory_file_line(memory)
+                else:
+                    lines.append(self._memory_file_line(memory))
+                self.workspace.write("memory", "\n".join(lines).rstrip() + "\n", actor="memory-service")
+                return
+        except Exception as exc:  # noqa: BLE001
+            if self.events:
+                self.events.emit(
+                    "memory.file_rewrite.failed",
+                    {"memory_id": str(memory.id), "error": str(exc)},
+                    severity="warning",
+                )
+
+    @staticmethod
+    def _marker(memory: Memory) -> str:
+        return f"<!-- soulclaw:memory id={memory.id} -->"
+
+    @staticmethod
+    def _memory_file_line(memory: Memory) -> str:
+        status = getattr(memory, "status", "") or ("archived" if memory.archived else "active")
+        return (
+            f"- ({memory.kind}, source={memory.source}, status={status}, "
+            f"importance={memory.importance:.2f}, confidence={memory.confidence:.2f}, "
+            f"stability={memory.stability:.2f}) {memory.content.strip()}"
+        )
+
+    @staticmethod
+    def _parse_memory_line(line: str) -> tuple[dict[str, str], str] | None:
+        match = MEMORY_LINE_RE.match(line.strip())
+        if match is None:
+            return None
+        metadata: dict[str, str] = {}
+        for part in match.group("meta").split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "=" in part:
+                key, value = part.split("=", 1)
+                metadata[key.strip()] = value.strip()
+            elif "kind" not in metadata:
+                metadata["kind"] = part
+        return metadata, match.group("content").strip()
 
     def _detect_conflicts(self, db: Session, memory: Memory) -> None:
         tokens = self._tokens(memory.content)
@@ -337,10 +454,13 @@ class MemoryService:
             "kind": memory.kind,
             "content": memory.content,
             "source": memory.source,
+            "status": getattr(memory, "status", "active"),
             "pinned": memory.pinned,
             "archived": memory.archived,
             "importance": memory.importance,
             "confidence": memory.confidence,
             "stability": memory.stability,
+            "source_file_marker": getattr(memory, "source_file_marker", "") or "",
+            "provenance": getattr(memory, "provenance", {}) or {},
             "metadata": memory.metadata_json or {},
         }

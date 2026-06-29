@@ -58,7 +58,7 @@ flowchart LR
 | Weaver DeepResearch | Default connection name is `weaver-deep-research`; adapts Weaver `/api/research/sse` into DeepResearch progress, cancellation, final reports, and evidence artifacts |
 | Dream/Reflection | Runs in Celery workers and creates pending proposals; file edits require approval |
 | Heartbeat | Periodically reads `HEARTBEAT.md` Active Tasks and creates review proposals or skipped history |
-| Background jobs | `dream_review`, `heartbeat_check`, `wiki_compile`, `wiki_lint`, `skill_scan`, and `mcp_refresh` run through Celery/Redis |
+| Background jobs | Lightweight mode can trigger jobs from the API process; long-running deployments can enable Celery/Redis for `dream_review`, `heartbeat_check`, `wiki_compile`, `wiki_lint`, `skill_scan`, and `mcp_refresh` |
 | Safety | Proposal decisions, tool approvals, workspace file edits, cron/mcp/gateway/a2a writes are audited |
 
 ## A2A Multi-Agent
@@ -204,17 +204,31 @@ cp .env.example .env
 docker compose up -d --build
 ```
 
-Default services:
+Default lightweight services:
 
 | Service | Purpose |
 |---|---|
-| `soulclaw` | FastAPI + frontend console |
+| `soulclaw` | FastAPI + frontend console; uses SQLite by default and does not require Redis locally |
+
+Enable the local background profile only when you want the queue stack:
+
+```bash
+docker compose --profile background up -d --build
+```
+
+| Optional service | Purpose |
+|---|---|
 | `soulclaw-worker` | Celery worker |
 | `soulclaw-scheduler` | Scans `cron_jobs` and enqueues due tasks |
 | `soulclaw-redis` | Celery broker/result backend |
-| `soulclaw-postgres` | Optional Postgres/pgvector profile, not required by default |
 
-SQLite data defaults to `data/soulclaw.sqlite3`. Postgres is available as an optional production/server backend via `SOULCLAW_DATABASE_URL`. The project directory is:
+To rehearse Postgres locally, enable the postgres profile separately and point `SOULCLAW_DATABASE_URL` at it:
+
+```bash
+docker compose --profile postgres up -d postgres
+```
+
+SQLite data defaults to `data/soulclaw.sqlite3`. Redis is optional in lightweight mode as a hot cache/queue dependency, so readiness can pass without it. Postgres is available as an optional production/server backend via `SOULCLAW_DATABASE_URL`. The project directory is:
 
 ```text
 /home/song/code/Agent/assistant/SoulClaw
@@ -225,6 +239,18 @@ Open:
 - Console: <http://localhost:8020>
 - Health check: <http://localhost:8020/api/health>
 - Agent Card: <http://localhost:8020/.well-known/agent-card.json>
+
+### Personal Server Production Deployment
+
+Production deployment uses Postgres + Redis + app + worker + scheduler for a long-running personal server; the everyday default remains the lightweight single-app + SQLite shape. The production app port binds to `127.0.0.1:8020` by default, so put it behind an external Caddy, Nginx, or Cloudflare Tunnel layer for TLS, domains, and public access control.
+
+```bash
+cp .env.production.example .env.production
+# Edit .env.production and replace every password, JWT secret, CORS origin, public URL, and public A2A auth value.
+docker compose --env-file .env.production -f docker-compose.prod.yml up -d --build
+```
+
+The production compose file requires key variables such as `SOULCLAW_ADMIN_PASSWORD`, `SOULCLAW_JWT_SECRET`, `SOULCLAW_POSTGRES_PASSWORD`, `SOULCLAW_CORS_ORIGINS`, `SOULCLAW_PUBLIC_BASE_URL`, and `SOULCLAW_A2A_PUBLIC_API_KEY`, and explicitly requires Redis to be available. If production is configured with SQLite, the backend refuses to start.
 
 Default development account:
 
@@ -240,6 +266,8 @@ Production deployments must change `SOULCLAW_JWT_SECRET`, `SOULCLAW_ADMIN_PASSWO
 ```text
 POST    /api/auth/login
 GET     /api/health
+GET     /api/health/live
+GET     /api/health/ready
 
 GET/PUT /api/workspace/files/{soul|user|memory|heartbeat}
 
@@ -259,6 +287,7 @@ GET     /api/tools
 POST    /api/tools/{tool_name}/run
 GET     /api/approvals
 POST    /api/approvals/{approval_id}/approve-and-run
+POST    /api/approvals/{approval_id}/resume-turn
 
 GET     /api/a2a/connections
 POST    /api/a2a/delegate
@@ -284,16 +313,13 @@ POST    /api/evolution/proposals/{id}/apply
 ```bash
 conda run -n soulclaw env PYTHONPATH=. pytest -q
 conda run -n soulclaw env PYTHONPATH=. ruff check backend tests
+npm ci --prefix frontend
 npm run build --prefix frontend
+docker build -t soulclaw:local .
+docker compose --env-file .env.production.example -f docker-compose.prod.yml config
 ```
 
-Verification results:
-
-```text
-68 passed
-All checks passed
-frontend build passed
-```
+CI runs the same quality gates: Python 3.11 backend tests, ruff, Node 20 frontend build, Docker build, and SQLite/Postgres migration verification.
 
 ## References
 

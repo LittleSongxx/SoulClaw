@@ -11,6 +11,7 @@ from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
 from backend.api.admin.deps import (
+    get_agent_runtime,
     get_current_user,
     get_db,
     get_evolution_service,
@@ -37,6 +38,7 @@ from backend.domain.tools import ToolExecutor, ToolRegistry
 from backend.domain.workspace import WorkspaceService
 from backend.infra.config import Settings, get_settings
 from backend.infra.models import Approval, BackgroundJob, GatewayConnection, User
+from backend.runtime.agent import AgentRuntime
 from backend.runtime.gateway import (
     GatewayRuntimeManager,
     InboundGatewayMessage,
@@ -46,20 +48,33 @@ from backend.runtime.heartbeat import HeartbeatRuntime
 from backend.runtime.mcp import MCPRuntimeManager
 
 router = APIRouter(tags=["control"], dependencies=[Depends(get_current_user)])
+public_router = APIRouter(tags=["gateway-webhook"])
 
 
 class ApprovalCreateRequest(BaseModel):
     subject_type: str
     subject_id: str = ""
     payload: dict[str, Any] = Field(default_factory=dict)
+    turn_checkpoint: dict[str, Any] = Field(default_factory=dict)
+    original_tool_call: dict[str, Any] = Field(default_factory=dict)
+    allowed_decisions: list[str] = Field(default_factory=lambda: ["approve", "edit", "reject", "respond"])
+    resume_state: dict[str, Any] = Field(default_factory=dict)
 
 
 class ApprovalResolveRequest(BaseModel):
     status: str
+    edited_arguments: dict[str, Any] = Field(default_factory=dict)
+    response: str = ""
 
 
 class ApprovalRejectRequest(BaseModel):
     reason: str = ""
+
+
+class ApprovalResumeTurnRequest(BaseModel):
+    decision: str = "approve"
+    edited_arguments: dict[str, Any] = Field(default_factory=dict)
+    response: str = ""
 
 
 class EvolutionApplyRequest(BaseModel):
@@ -82,6 +97,11 @@ class MCPServerRequest(BaseModel):
     url: str = ""
     config: dict[str, Any] = Field(default_factory=dict)
     enabled: bool = True
+    config_source: str = "manual"
+    permission_policy: dict[str, Any] = Field(default_factory=dict)
+    session_mode: str = "transient"
+    health_status: str = "unknown"
+    last_imported_checksum: str = ""
 
 
 class GatewayRequest(BaseModel):
@@ -98,6 +118,17 @@ class GatewayInboundRequest(BaseModel):
     external_user_id: str
     text: str
     channel_id: str = ""
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class GatewayWebhookRequest(BaseModel):
+    gateway_name: str
+    external_user_id: str
+    text: str
+    channel_id: str = ""
+    timestamp: str
+    nonce: str
+    signature: str
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -141,7 +172,12 @@ def resolve_approval(
     service: PlatformService = Depends(get_platform_service),
 ) -> dict:
     try:
-        return {"ok": True, "approval": approval_to_dict(service.resolve_approval(db, approval_id, status=payload.status))}
+        approval = service.resolve_approval(db, approval_id, status=payload.status)
+        if payload.edited_arguments:
+            approval.edited_arguments = payload.edited_arguments
+        if payload.response:
+            approval.resume_state = {**(approval.resume_state or {}), "response": payload.response}
+        return {"ok": True, "approval": approval_to_dict(approval)}
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
@@ -154,6 +190,7 @@ def approve_and_run(
     db: Session = Depends(get_db),
     service: PlatformService = Depends(get_platform_service),
     executor: ToolExecutor = Depends(get_tool_executor),
+    runtime: AgentRuntime = Depends(get_agent_runtime),
 ) -> dict:
     approval = db.get(Approval, approval_id)
     if approval is None:
@@ -161,20 +198,42 @@ def approve_and_run(
     payload = approval.payload or {}
     if approval.subject_type != "tool_run":
         raise HTTPException(status_code=400, detail="approval is not for a tool run")
-    if approval.status != "pending":
-        raise HTTPException(status_code=400, detail="approval is not pending")
+    if approval.status not in {"pending", "approved"}:
+        raise HTTPException(status_code=400, detail="approval is not runnable")
+    if (approval.turn_checkpoint or {}).get("mode") == "agent_tool_loop" or (approval.resume_state or {}).get("mode") == "resume_turn":
+        try:
+            result = runtime.resume_turn(db, approval_id, decision="approve")
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (PermissionError, RuntimeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "ok": True,
+            "approval": approval_to_dict(approval),
+            "turn": {
+                "turn_id": result.turn_id,
+                "answer": result.answer,
+                "context": result.context,
+                "status": result.status,
+                "approval_id": result.approval_id,
+                "pending_tool_call": result.pending_tool_call or {},
+                "resume_available": result.resume_available,
+            },
+        }
     tool_name = str(payload.get("tool_name") or "")
     if not tool_name:
         raise HTTPException(status_code=400, detail="approval payload is missing tool_name")
-    try:
-        approval = service.resolve_approval(db, approval_id, status="approved")
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if approval.status == "pending":
+        try:
+            approval = service.resolve_approval(db, approval_id, status="approved")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    arguments = approval.edited_arguments if approval.edited_arguments else payload.get("arguments")
     try:
         result = executor.execute(
             db,
             tool_name=tool_name,
-            arguments=payload.get("arguments") if isinstance(payload.get("arguments"), dict) else {},
+            arguments=arguments if isinstance(arguments, dict) else {},
             turn_id=str(payload.get("turn_id") or ""),
             approved=True,
         )
@@ -183,6 +242,41 @@ def approve_and_run(
     except (PermissionError, RuntimeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"ok": True, "approval": approval_to_dict(approval), "tool_result": result}
+
+
+@router.post("/api/approvals/{approval_id}/resume-turn")
+def resume_turn(
+    approval_id: uuid.UUID,
+    payload: ApprovalResumeTurnRequest,
+    db: Session = Depends(get_db),
+    runtime: AgentRuntime = Depends(get_agent_runtime),
+) -> dict:
+    try:
+        result = runtime.resume_turn(
+            db,
+            approval_id,
+            decision=payload.decision,
+            edited_arguments=payload.edited_arguments,
+            response=payload.response,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (PermissionError, RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    approval = db.get(Approval, approval_id)
+    return {
+        "ok": True,
+        "approval": approval_to_dict(approval) if approval is not None else None,
+        "turn": {
+            "turn_id": result.turn_id,
+            "answer": result.answer,
+            "context": result.context,
+            "status": result.status,
+            "approval_id": result.approval_id,
+            "pending_tool_call": result.pending_tool_call or {},
+            "resume_available": result.resume_available,
+        },
+    }
 
 
 @router.post("/api/approvals/{approval_id}/reject")
@@ -362,6 +456,34 @@ def gateway_inbound(
         if x_soulclaw_signature:
             data["metadata"] = {**data.get("metadata", {}), "signature": x_soulclaw_signature}
         return runtime.handle_inbound(InboundGatewayMessage(**data))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@public_router.post("/api/gateways/webhook")
+def gateway_webhook(
+    payload: GatewayWebhookRequest,
+    runtime: GatewayRuntimeManager = Depends(get_gateway_runtime),
+) -> dict:
+    try:
+        metadata = {
+            **payload.metadata,
+            "timestamp": payload.timestamp,
+            "nonce": payload.nonce,
+            "signature": payload.signature,
+            "public_webhook": True,
+        }
+        return runtime.handle_inbound(
+            InboundGatewayMessage(
+                gateway_name=payload.gateway_name,
+                external_user_id=payload.external_user_id,
+                text=payload.text,
+                channel_id=payload.channel_id,
+                metadata=metadata,
+            )
+        )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except RuntimeError as exc:

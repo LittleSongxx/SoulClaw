@@ -210,9 +210,12 @@ Use only when the user wants a larger travel-agent stack with flights, hotels, e
 
 5. If a key is required, ask for the env var name only; never ask the user to paste a secret into a public group chat. Tell them it will be passed as the MCP subprocess environment.
 
-6. After the user chooses and provides/authorizes credentials, call `mcp_manage(action="add", ...)` using the JSON shape above. The tool itself will trigger IM confirmation.
+6. After the user chooses and provides/authorizes credentials, add the MCP server through SoulClaw's MCP control plane:
+   - UI path: Console -> MCP -> create/update server.
+   - API path: `POST /api/mcp` with `name`, `transport`, `command` or `url`, `enabled`, and `config`.
+   - Do not call nonexistent MCP management tools; use the control plane above.
 
-7. After install, call `mcp_manage(action="inspect", name="...")` and verify tools are listed. If connection failed, remove the server and explain the failure.
+7. After install, refresh discovery with `POST /api/mcp/{server_name}/refresh` or `POST /api/mcp/refresh`, then verify the newly exposed `mcp__...` tools through `tool_search` / `tool_describe`. If connection failed, disable or remove the server in the MCP control plane and explain the failure.
 
 8. Once connected, answer the original travel question using the newly available MCP tool.
 

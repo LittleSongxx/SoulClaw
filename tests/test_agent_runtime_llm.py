@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass
 from typing import Any
 
 from backend.domain.conversation import SessionContext
+from backend.domain.tools import ToolApprovalRequired
+from backend.infra.models import Approval
 from backend.runtime.agent import AgentRuntime
 from backend.runtime.llm import LLMResponse, LLMToolCall, OpenAICompatibleClient
 
@@ -98,6 +101,43 @@ class WikiReadLLM:
         if self.calls == 2:
             return LLMResponse(content="", tool_calls=[LLMToolCall(name="wiki_read", arguments={"page_key": "index"}, id="r1")], raw={})
         return LLMResponse(content="Answer with [[index]]", tool_calls=[], raw={})
+
+
+class ApprovalLLM:
+    configured = True
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def complete(self, *, messages, tools=None, temperature=0.2):
+        del messages, tools, temperature
+        self.calls += 1
+        if self.calls == 1:
+            return LLMResponse(content="", tool_calls=[LLMToolCall(name="gateway_send", arguments={"text": "hello"}, id="send_1")], raw={})
+        return LLMResponse(content="sent after approval", tool_calls=[], raw={})
+
+
+class ApprovalToolExecutor:
+    def __init__(self, approval_id: uuid.UUID) -> None:
+        self.approval_id = approval_id
+        self.calls: list[dict[str, Any]] = []
+
+    def execute(self, db, *, tool_name: str, arguments: dict[str, Any] | None = None, turn_id: str = "", approved: bool = False):
+        del db
+        self.calls.append({"tool_name": tool_name, "arguments": arguments or {}, "turn_id": turn_id, "approved": approved})
+        if not approved:
+            raise ToolApprovalRequired("tool requires approval: gateway_send", tool_name=tool_name, approval_id=str(self.approval_id))
+        return {"tool_name": tool_name, "status": "succeeded", "result": {"sent": True, "arguments": arguments or {}}}
+
+
+class ApprovalDB:
+    def __init__(self, approval: Approval) -> None:
+        self.approval = approval
+
+    def get(self, model, item_id):
+        if model is Approval and str(item_id) == str(self.approval.id):
+            return self.approval
+        return None
 
 
 class DummyConversation:
@@ -208,3 +248,45 @@ def test_agent_runtime_tool_loop_uses_wiki_read_before_answer() -> None:
     assert result.answer == "Answer with [[index]]"
     assert result.context["llm"]["wiki_read_used"] is True
     assert [call["tool_name"] for call in tool_executor.calls] == ["wiki_search", "wiki_read"]
+
+
+def test_agent_runtime_interrupts_and_resumes_approval_checkpoint() -> None:
+    approval_id = uuid.uuid4()
+    approval = Approval(
+        id=approval_id,
+        status="pending",
+        subject_type="tool_run",
+        subject_id="gateway_send",
+        payload={"tool_name": "gateway_send", "arguments": {"text": "hello"}},
+        turn_checkpoint={},
+        original_tool_call={},
+        allowed_decisions=[],
+        edited_arguments={},
+        resume_state={},
+    )
+    db = ApprovalDB(approval)
+    executor = ApprovalToolExecutor(approval_id)
+    llm = ApprovalLLM()
+    runtime = AgentRuntime(
+        wiki=DummyWiki(),
+        memory=DummyMemory(),
+        events=DummyEvents(),
+        tools=executor,
+        registry=DummyRegistry(),
+        llm=llm,
+    )
+
+    interrupted = runtime.run_turn(db, "send message", session_id="console")
+
+    assert interrupted.status == "approval_required"
+    assert interrupted.approval_id == str(approval_id)
+    assert interrupted.resume_available is True
+    assert approval.turn_checkpoint["mode"] == "agent_tool_loop"
+    assert approval.resume_state["mode"] == "resume_turn"
+
+    resumed = runtime.resume_turn(db, approval_id, decision="approve")
+
+    assert resumed.status == "completed"
+    assert resumed.answer == "sent after approval"
+    assert approval.status == "approved"
+    assert executor.calls[-1]["approved"] is True

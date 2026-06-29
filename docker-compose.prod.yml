@@ -1,0 +1,144 @@
+name: soulclaw-prod
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-}
+        APT_MIRROR_URL: ${APT_MIRROR_URL:-}
+        NPM_CONFIG_REGISTRY: ${NPM_CONFIG_REGISTRY:-}
+    image: soulclaw:prod
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment: &app-env
+      SOULCLAW_ENVIRONMENT: production
+      SOULCLAW_REQUIRE_PRODUCTION_SECRETS: "true"
+      SOULCLAW_HOST: 0.0.0.0
+      SOULCLAW_PORT: 8020
+      SOULCLAW_LOG_LEVEL: ${SOULCLAW_LOG_LEVEL:-INFO}
+      SOULCLAW_ADMIN_USERNAME: ${SOULCLAW_ADMIN_USERNAME:-admin}
+      SOULCLAW_ADMIN_PASSWORD: ${SOULCLAW_ADMIN_PASSWORD:?set SOULCLAW_ADMIN_PASSWORD in your production env file}
+      SOULCLAW_JWT_SECRET: ${SOULCLAW_JWT_SECRET:?set SOULCLAW_JWT_SECRET in your production env file}
+      SOULCLAW_CORS_ORIGINS: ${SOULCLAW_CORS_ORIGINS:?set explicit SOULCLAW_CORS_ORIGINS in production}
+      SOULCLAW_PUBLIC_BASE_URL: ${SOULCLAW_PUBLIC_BASE_URL:?set SOULCLAW_PUBLIC_BASE_URL for public callbacks}
+      SOULCLAW_DATABASE_URL: postgresql+psycopg://soulclaw:${SOULCLAW_POSTGRES_PASSWORD:?set SOULCLAW_POSTGRES_PASSWORD in your production env file}@postgres:5432/soulclaw
+      SOULCLAW_REDIS_URL: redis://redis:6379/0
+      SOULCLAW_REDIS_REQUIRED: "true"
+      SOULCLAW_CELERY_BROKER_URL: redis://redis:6379/0
+      SOULCLAW_CELERY_RESULT_BACKEND: redis://redis:6379/0
+      SOULCLAW_WORKSPACE_SEED_DIR: /app/workspace_seed
+      SOULCLAW_MCP_CONFIG_FILE: /app/config/mcp_servers.yaml
+      SOULCLAW_BOOTSTRAP_WIKI_ON_STARTUP: ${SOULCLAW_BOOTSTRAP_WIKI_ON_STARTUP:-true}
+      SOULCLAW_BOOTSTRAP_SKILLS_ON_STARTUP: ${SOULCLAW_BOOTSTRAP_SKILLS_ON_STARTUP:-true}
+      SOULCLAW_MCP_SEED_ON_STARTUP: ${SOULCLAW_MCP_SEED_ON_STARTUP:-true}
+      SOULCLAW_MCP_REFRESH_ON_STARTUP: ${SOULCLAW_MCP_REFRESH_ON_STARTUP:-true}
+      SOULCLAW_DREAM_REVIEW_ENABLED: ${SOULCLAW_DREAM_REVIEW_ENABLED:-true}
+      SOULCLAW_DREAM_REVIEW_CRON: "${SOULCLAW_DREAM_REVIEW_CRON:-30 3 * * *}"
+      SOULCLAW_DREAM_REVIEW_TIMEZONE: ${SOULCLAW_DREAM_REVIEW_TIMEZONE:-Asia/Shanghai}
+      SOULCLAW_API_SCHEDULER_ENABLED: ${SOULCLAW_API_SCHEDULER_ENABLED:-false}
+      SOULCLAW_A2A_REQUIRE_PUBLIC_AUTH: ${SOULCLAW_A2A_REQUIRE_PUBLIC_AUTH:-true}
+      SOULCLAW_A2A_PUBLIC_API_KEY: ${SOULCLAW_A2A_PUBLIC_API_KEY:?set SOULCLAW_A2A_PUBLIC_API_KEY when public A2A is enabled}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
+      OPENAI_MODEL: ${OPENAI_MODEL:-}
+      SOULCLAW_LLM_PROVIDER: ${SOULCLAW_LLM_PROVIDER:-openai-compatible}
+      SOULCLAW_LLM_CONTEXT_WINDOW_TOKENS: ${SOULCLAW_LLM_CONTEXT_WINDOW_TOKENS:-128000}
+    ports:
+      - "127.0.0.1:${SOULCLAW_HOST_PORT:-8020}:8020"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import os, urllib.request; urllib.request.urlopen(f'http://127.0.0.1:{os.environ.get(\"SOULCLAW_PORT\",\"8020\")}/api/health/ready', timeout=5).read()",
+        ]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+    volumes:
+      - soulclaw_config:/app/config
+      - soulclaw_workspace:/app/workspace
+      - soulclaw_packages:/app/.packages
+
+  worker:
+    image: soulclaw:prod
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: ["celery", "-A", "backend.worker.celery_app.celery_app", "worker", "--loglevel=INFO", "--concurrency=1"]
+    environment: *app-env
+    volumes:
+      - soulclaw_config:/app/config
+      - soulclaw_workspace:/app/workspace
+      - soulclaw_packages:/app/.packages
+
+  scheduler:
+    image: soulclaw:prod
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: ["python", "-m", "backend.worker.scheduler"]
+    environment: *app-env
+    volumes:
+      - soulclaw_config:/app/config
+      - soulclaw_workspace:/app/workspace
+      - soulclaw_packages:/app/.packages
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --maxmemory
+      - 512mb
+      - --maxmemory-policy
+      - allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    volumes:
+      - soulclaw_redis:/data
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: soulclaw
+      POSTGRES_USER: soulclaw
+      POSTGRES_PASSWORD: ${SOULCLAW_POSTGRES_PASSWORD:?set SOULCLAW_POSTGRES_PASSWORD in your production env file}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U soulclaw -d soulclaw"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    volumes:
+      - soulclaw_postgres:/var/lib/postgresql/data
+
+volumes:
+  soulclaw_config:
+  soulclaw_workspace:
+  soulclaw_packages:
+  soulclaw_redis:
+  soulclaw_postgres:

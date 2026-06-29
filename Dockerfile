@@ -113,10 +113,11 @@ USER root
 COPY backend ./backend
 COPY alembic.ini ./alembic.ini
 COPY alembic ./alembic
+COPY config ./config_seed
 COPY workspace_seed ./workspace_seed
 COPY docker-entrypoint.py ./docker-entrypoint.py
-RUN chown -R soulclaw:soulclaw /app/backend /app/alembic /app/alembic.ini /app/frontend /app/workspace_seed /app/docker-entrypoint.py \
-    && chmod -R u=rwX,go=rX /app/backend /app/alembic /app/frontend /app/workspace_seed \
+RUN chown -R soulclaw:soulclaw /app/backend /app/alembic /app/alembic.ini /app/frontend /app/config_seed /app/workspace_seed /app/docker-entrypoint.py \
+    && chmod -R u=rwX,go=rX /app/backend /app/alembic /app/frontend /app/config_seed /app/workspace_seed \
     && chmod 0444 /app/alembic.ini \
     && chmod 0555 /app/docker-entrypoint.py
 
@@ -127,6 +128,6 @@ EXPOSE 8020
 VOLUME ["/app/data", "/app/config", "/app/workspace", "/app/.packages"]
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD python -c "import os, urllib.request; urllib.request.urlopen(f'http://127.0.0.1:{os.environ.get(\"SOULCLAW_PORT\",\"8020\")}/api/health', timeout=5).read()" || exit 1
+    CMD python -c "import os, urllib.request; urllib.request.urlopen(f'http://127.0.0.1:{os.environ.get(\"SOULCLAW_PORT\",\"8020\")}/api/health/ready', timeout=5).read()" || exit 1
 
 ENTRYPOINT ["python", "/app/docker-entrypoint.py"]

@@ -15,6 +15,8 @@ def build_redis_client(settings: Settings | None = None) -> Redis | None:
         client.ping()
         return client
     except Exception as exc:  # noqa: BLE001
-        logger.warning("[redis] unavailable, continuing without hot cache: {}", exc)
+        if settings.redis_required:
+            logger.warning("[redis] required Redis is unavailable: {}", exc)
+        else:
+            logger.info("[redis] optional Redis unavailable; continuing in lightweight mode")
         return None
-

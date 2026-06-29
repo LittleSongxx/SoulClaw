@@ -262,6 +262,7 @@ class MCPRuntimeManager:
             server.last_error = error
             server.tool_count = len(cache)
             server.tools_cache = cache
+            server.health_status = "healthy" if status == "connected" else ("disabled" if status == "disabled" else "unhealthy")
             server.last_connected_at = datetime.now(UTC) if status == "connected" else server.last_connected_at
             db.flush()
             return {
@@ -276,11 +277,18 @@ class MCPRuntimeManager:
             del db
             return self.call_tool_sync(descriptor.server_name, descriptor.tool_name, arguments)
 
-        is_safe = descriptor.permission == "safe"
+        permission = descriptor.permission.lower()
+        is_safe = permission in {"safe", "read"}
+        if permission in {"safe", "read"}:
+            scope = "external.read"
+        elif permission in {"secret", "system"}:
+            scope = "system.write"
+        else:
+            scope = "external.write"
         return ToolDefinition(
             name=descriptor.registry_name,
             description=descriptor.description or f"MCP tool {descriptor.tool_name} from {descriptor.server_name}.",
-            scope="external.read" if is_safe else "external.write",
+            scope=scope,
             requires_approval=not is_safe,
             available=available,
             parameters=normalize_json_schema(descriptor.input_schema),
@@ -306,6 +314,8 @@ def _server_config(server: MCPServer) -> dict[str, Any]:
         "command": command,
         "args": args or [],
         "url": str(config.get("url") or server.url),
+        "permission_policy": getattr(server, "permission_policy", {}) or {},
+        "session_mode": getattr(server, "session_mode", "transient"),
     }
 
 
@@ -314,6 +324,8 @@ def _permission_overrides(config: dict[str, Any]) -> dict[str, str]:
     if not isinstance(tools, dict):
         return {}
     overrides = tools.get("override_permission")
+    if not isinstance(overrides, dict) and isinstance(config.get("permission_policy"), dict):
+        overrides = config["permission_policy"].get("override_permission")
     if not isinstance(overrides, dict):
         return {}
     return {str(key): str(value) for key, value in overrides.items()}

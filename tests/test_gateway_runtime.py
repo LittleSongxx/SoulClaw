@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import time
 import uuid
 from contextlib import contextmanager
 
@@ -128,3 +129,23 @@ def test_gateway_inbound_rejects_bad_hmac_signature(monkeypatch: pytest.MonkeyPa
                 metadata={"signature": "bad"},
             )
         )
+
+
+def test_gateway_public_webhook_requires_timestamp_nonce_and_blocks_replay(monkeypatch: pytest.MonkeyPatch) -> None:
+    gateway = DummyGateway(kind="webhook")
+    gateway.config = {"secret": "secret"}
+    monkeypatch.setattr("backend.runtime.gateway.session_scope", lambda: fake_session_scope(gateway))
+    manager = GatewayRuntimeManager(agent=DummyAgent(), events=DummyEvents())
+    timestamp = str(time.time())
+    nonce = "nonce-1"
+    signature = hmac.new(b"secret", f"{timestamp}.{nonce}.hello".encode(), hashlib.sha256).hexdigest()
+    message = InboundGatewayMessage(
+        gateway_name="local",
+        external_user_id="user-1",
+        text="hello",
+        metadata={"public_webhook": True, "timestamp": timestamp, "nonce": nonce, "signature": signature},
+    )
+
+    assert manager.handle_inbound(message)["answer"] == "reply: hello"
+    with pytest.raises(RuntimeError):
+        manager.handle_inbound(message)

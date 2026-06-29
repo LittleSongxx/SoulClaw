@@ -30,7 +30,9 @@ from backend.domain.conversation import ConversationService
 from backend.domain.jobs import BackgroundJobService
 from backend.domain.workspace import WorkspaceService
 from backend.infra.config import Settings, get_settings
+from backend.infra.db import database_backend, migration_status
 from backend.infra.events import RuntimeEventBus
+from backend.infra.health import readiness_summary
 from backend.infra.models import CronJob, ToolRun, User
 from backend.runtime.agent import AgentRuntime
 
@@ -76,7 +78,16 @@ def run_turn(
     user: User = Depends(get_current_user),
 ) -> dict:
     result = runtime.run_turn(db, payload.message, session_id=payload.session_id, tool_calls=payload.tool_calls)
-    return {"user": user.username, "turn_id": result.turn_id, "answer": result.answer, "context": result.context}
+    return {
+        "user": user.username,
+        "turn_id": result.turn_id,
+        "answer": result.answer,
+        "context": result.context,
+        "status": result.status,
+        "approval_id": result.approval_id,
+        "pending_tool_call": result.pending_tool_call or {},
+        "resume_available": result.resume_available,
+    }
 
 
 @router.get("/api/sessions")
@@ -162,15 +173,33 @@ def settings(
     db: Session = Depends(get_db),
     settings: Settings = Depends(get_settings),
 ) -> dict:
-    redis_client = request.app.state.redis_client
+    redis_client = getattr(request.app.state, "redis_client", None)
     dream_job = db.scalar(select(CronJob).where(CronJob.name == "system-dream-review"))
+    migrations = migration_status(settings)
+    readiness = readiness_summary(settings, redis_client)
     return {
         "app_name": settings.app_name,
         "environment": settings.environment,
         "database_url": "SOULCLAW_DATABASE_URL",
         "database_url_backup_alias": "DATABASE_URL",
-        "redis_url": settings.redis_url,
+        "database_backend": database_backend(settings.database_url),
+        "migration_revision": migrations.get("current_revision"),
+        "migration_head_revision": migrations.get("head_revision"),
+        "migration_current": migrations.get("is_current"),
+        "readiness": {
+            "ok": readiness["ok"],
+            "checks": {
+                name: {
+                    "ok": check.get("ok", False),
+                    "configured": check.get("configured"),
+                    "required": check.get("required"),
+                }
+                for name, check in readiness["checks"].items()
+            },
+        },
+        "redis_url": "SOULCLAW_REDIS_URL",
         "redis_available": redis_client is not None,
+        "redis_required": settings.redis_required,
         "celery_broker_url": "SOULCLAW_CELERY_BROKER_URL or SOULCLAW_REDIS_URL",
         "celery_result_backend": "SOULCLAW_CELERY_RESULT_BACKEND or SOULCLAW_REDIS_URL",
         "api_scheduler_enabled": settings.api_scheduler_enabled,
@@ -179,12 +208,17 @@ def settings(
         "workspace_dir": str(settings.workspace_dir),
         "workspace_seed_dir": str(settings.workspace_seed_dir),
         "openai_configured": bool(settings.openai_api_key),
+        "llm_provider": settings.llm_provider,
+        "llm_context_window_tokens": settings.llm_context_window_tokens,
         "cors_origins": settings.cors_origins,
         "require_production_secrets": settings.require_production_secrets,
         "login_rate_limit_enabled": settings.login_rate_limit_enabled,
         "bootstrap_wiki_on_startup": settings.bootstrap_wiki_on_startup,
         "bootstrap_skills_on_startup": settings.bootstrap_skills_on_startup,
         "mcp_refresh_on_startup": settings.mcp_refresh_on_startup,
+        "mcp_seed_on_startup": settings.mcp_seed_on_startup,
+        "mcp_config_file": str(settings.mcp_config_file),
+        "tool_schema_direct_limit": settings.tool_schema_direct_limit,
         "dream_review_enabled": settings.dream_review_enabled,
         "dream_review_cron": settings.dream_review_cron,
         "dream_review_timezone": settings.dream_review_timezone,
@@ -196,6 +230,11 @@ def settings(
         "heartbeat_cron": settings.heartbeat_cron,
         "heartbeat_timezone": settings.heartbeat_timezone,
         "gateway_heartbeat_timeout_seconds": settings.gateway_heartbeat_timeout_seconds,
+        "gateway_webhook_max_skew_seconds": settings.gateway_webhook_max_skew_seconds,
+        "gateway_webhook_nonce_cache_size": settings.gateway_webhook_nonce_cache_size,
+        "a2a_bootstrap_weaver_enabled": settings.a2a_bootstrap_weaver_enabled,
+        "a2a_require_public_auth": settings.a2a_require_public_auth,
+        "a2a_public_api_key_configured": bool(settings.a2a_public_api_key),
     }
 
 

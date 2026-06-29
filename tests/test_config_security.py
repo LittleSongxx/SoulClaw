@@ -32,6 +32,9 @@ def test_core_bootstrap_defaults_are_enabled() -> None:
     assert settings.dream_review_enabled is True
     assert settings.dream_review_cron == "30 3 * * *"
     assert settings.dream_review_timezone == "Asia/Shanghai"
+    assert settings.mcp_seed_on_startup is True
+    assert settings.a2a_bootstrap_weaver_enabled is False
+    assert settings.llm_provider == "openai-compatible"
 
 
 def test_password_hash_roundtrip() -> None:
@@ -50,7 +53,21 @@ def test_cors_origins_accepts_comma_separated_env(monkeypatch) -> None:
 
 
 def test_production_rejects_default_secrets() -> None:
-    settings = Settings(environment="production")
+    settings = Settings(environment="production", database_url="postgresql+psycopg://u:p@localhost:5432/soulclaw")
 
     with pytest.raises(RuntimeError, match="SOULCLAW_JWT_SECRET"):
+        settings.validate_runtime_secrets()
+
+
+def test_production_rejects_sqlite_even_with_secrets() -> None:
+    settings = Settings(
+        environment="production",
+        admin_password="changed",
+        jwt_secret="changed",
+        cors_origins=["https://soulclaw.example"],
+        public_base_url="https://soulclaw.example",
+        database_url="sqlite:///data/prod.sqlite3",
+    )
+
+    with pytest.raises(RuntimeError, match="SQLite is only allowed"):
         settings.validate_runtime_secrets()

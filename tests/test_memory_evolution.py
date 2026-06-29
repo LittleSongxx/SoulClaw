@@ -40,7 +40,7 @@ class FakeWorkspace:
 
     def read(self, kind: str):
         assert kind == "memory"
-        return type("WorkspaceFile", (), {"content": self.content})()
+        return type("WorkspaceFile", (), {"content": self.content, "path": "memory/MEMORY.md"})()
 
     def write(self, kind: str, content: str, *, actor: str = "admin"):
         del actor
@@ -98,3 +98,17 @@ def test_memory_proposal_archive_is_applyable() -> None:
 
     assert applied.status == "applied"
     assert memory.archived is True
+
+
+def test_memory_file_sync_updates_marked_entries() -> None:
+    db = FakeDB()
+    workspace = FakeWorkspace()
+    service = MemoryService(events=None, workspace=workspace)
+    memory = service.create(db, kind="agent_note", content="old lesson", source="test")
+    workspace.content = workspace.content.replace("old lesson", "edited lesson").replace("confidence=0.50", "confidence=0.80")
+
+    result = service.sync_from_memory_file(db)
+
+    assert result["updated"] == 1
+    assert memory.content == "edited lesson"
+    assert memory.confidence == 0.8

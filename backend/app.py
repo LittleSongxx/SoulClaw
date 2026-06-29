@@ -8,6 +8,7 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from loguru import logger
 
@@ -26,6 +27,7 @@ from .domain.workspace import WorkspaceService
 from .infra.config import get_settings
 from .infra.db import run_alembic_upgrade, session_scope
 from .infra.events import RuntimeEventBus
+from .infra.health import readiness_summary
 from .infra.redis_cache import build_redis_client
 from .infra.security import ensure_admin_user
 from .runtime.a2a import A2ARuntimeManager
@@ -46,6 +48,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     logger.remove()
     logger.add(lambda msg: print(msg, end=""), level=settings.log_level.upper())
     logger.info("starting {} v{} ({})", settings.app_name, __version__, settings.environment)
+    if (
+        settings.database_url.startswith("sqlite")
+        and (settings.redis_required or settings.api_scheduler_enabled)
+        and not settings.queue_eager
+    ):
+        logger.warning(
+            "SQLite is intended for single-process local development; use the Postgres profile for API + worker + scheduler deployments."
+        )
 
     if settings.auto_migrate:
         run_alembic_upgrade(settings)
@@ -74,12 +84,27 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         workspace=workspace_service,
         events=events,
     )
-    tool_registry = ToolRegistry(wiki=wiki_service, memory=memory_service, skills=skill_service, events=events)
+    tool_registry = ToolRegistry(
+        wiki=wiki_service,
+        memory=memory_service,
+        skills=skill_service,
+        events=events,
+        max_direct_tool_schemas=settings.tool_schema_direct_limit,
+    )
     mcp_runtime = MCPRuntimeManager(
         events=events,
         discovery_timeout_seconds=settings.mcp_discovery_timeout_seconds,
         call_timeout_seconds=settings.mcp_call_timeout_seconds,
     )
+    if settings.mcp_seed_on_startup:
+        try:
+            with session_scope() as db:
+                with events.bind_session(db):
+                    result = platform_service.import_mcp_seed(db, settings)
+                    events.emit("mcp.seed.bootstrap.succeeded", result)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[mcp] seed import failed: {}", exc)
+            events.emit("mcp.seed.bootstrap.failed", {"error": str(exc)}, severity="warning")
     if settings.mcp_refresh_on_startup:
         try:
             await mcp_runtime.refresh_all()
@@ -107,7 +132,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         workspace=workspace_service,
         a2a=a2a_runtime,
     )
-    gateway_runtime = GatewayRuntimeManager(agent=agent_runtime, events=events)
+    gateway_runtime = GatewayRuntimeManager(
+        agent=agent_runtime,
+        events=events,
+        webhook_max_skew_seconds=settings.gateway_webhook_max_skew_seconds,
+        webhook_nonce_cache_size=settings.gateway_webhook_nonce_cache_size,
+    )
     tool_registry.install_gateway(gateway_runtime)
     dream_runtime = DreamRuntime(skills=skill_service, events=events)
     heartbeat_runtime = HeartbeatRuntime(workspace=workspace_service, skills=skill_service, events=events)
@@ -245,6 +275,16 @@ def create_app() -> FastAPI:
     def health() -> dict:
         return {"ok": True, "app": settings.app_name, "version": __version__}
 
+    @app.get("/api/health/live")
+    def live() -> dict:
+        return {"ok": True, "app": settings.app_name, "version": __version__}
+
+    @app.get("/api/health/ready")
+    def ready() -> JSONResponse:
+        summary = readiness_summary(settings, getattr(app.state, "redis_client", None))
+        status_code = 200 if summary["ok"] else 503
+        return JSONResponse({"app": settings.app_name, "version": __version__, **summary}, status_code=status_code)
+
     app.include_router(auth.router)
     app.include_router(wiki.router)
     app.include_router(memory.router)
@@ -254,6 +294,7 @@ def create_app() -> FastAPI:
     app.include_router(tools.router)
     app.include_router(platform.router)
     app.include_router(control.router)
+    app.include_router(control.public_router)
 
     frontend_dist = Path("frontend/dist")
     if frontend_dist.exists():

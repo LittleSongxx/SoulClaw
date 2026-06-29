@@ -24,6 +24,7 @@ class Settings(BaseSettings):
         env_prefix="SOULCLAW_",
         case_sensitive=False,
         extra="ignore",
+        populate_by_name=True,
     )
 
     app_name: str = "SoulClaw"
@@ -49,6 +50,7 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("SOULCLAW_DATABASE_URL", "DATABASE_URL"),
     )
     redis_url: str = "redis://localhost:6379/0"
+    redis_required: bool = False
     celery_broker_url: str | None = None
     celery_result_backend: str | None = None
     api_scheduler_enabled: bool = False
@@ -69,10 +71,15 @@ class Settings(BaseSettings):
         validation_alias="OPENAI_BASE_URL",
     )
     openai_model: str | None = Field(default=None, validation_alias="OPENAI_MODEL")
+    llm_provider: str = "openai-compatible"
+    llm_context_window_tokens: int = 128000
 
     mcp_refresh_on_startup: bool = True
+    mcp_seed_on_startup: bool = True
+    mcp_config_file: Path = Path("config/mcp_servers.yaml")
     mcp_discovery_timeout_seconds: float = 8.0
     mcp_call_timeout_seconds: float = 60.0
+    tool_schema_direct_limit: int = 32
 
     dream_review_enabled: bool = True
     dream_review_cron: str = "30 3 * * *"
@@ -83,13 +90,17 @@ class Settings(BaseSettings):
     heartbeat_cron: str = "*/30 * * * *"
     heartbeat_timezone: str = "Asia/Shanghai"
     gateway_heartbeat_timeout_seconds: int = 120
+    gateway_webhook_max_skew_seconds: int = 300
+    gateway_webhook_nonce_cache_size: int = 200
     public_base_url: str = ""
     a2a_http_timeout_seconds: float = 60.0
-    a2a_bootstrap_weaver_enabled: bool = True
+    a2a_bootstrap_weaver_enabled: bool = False
     a2a_weaver_base_url: str = "http://127.0.0.1:8001"
     a2a_weaver_internal_api_key: str = ""
     a2a_weaver_auth_user_header: str = "X-Weaver-User"
     a2a_weaver_user_id: str = "soulclaw"
+    a2a_public_api_key: str = ""
+    a2a_require_public_auth: bool = True
 
     @property
     def resolved_celery_broker_url(self) -> str:
@@ -111,7 +122,15 @@ class Settings(BaseSettings):
             return [item.strip() for item in value.split(",") if item.strip()]
         return value
 
-    @field_validator("data_dir", "config_dir", "workspace_dir", "workspace_seed_dir", "packages_dir", mode="before")
+    @field_validator(
+        "data_dir",
+        "config_dir",
+        "workspace_dir",
+        "workspace_seed_dir",
+        "packages_dir",
+        "mcp_config_file",
+        mode="before",
+    )
     @classmethod
     def _expand_path(cls, value: str | Path) -> Path:
         return Path(value).expanduser()
@@ -142,12 +161,16 @@ class Settings(BaseSettings):
     def validate_runtime_secrets(self) -> None:
         if self.environment.lower() not in {"production", "prod"} or not self.require_production_secrets:
             return
+        if self.database_url.startswith("sqlite"):
+            raise RuntimeError("SQLite is only allowed for development/local; set SOULCLAW_DATABASE_URL to Postgres in production")
         if self.jwt_secret == "change-me-for-production":
             raise RuntimeError("SOULCLAW_JWT_SECRET must be changed in production")
         if self.admin_password == "soulclaw-admin":
             raise RuntimeError("SOULCLAW_ADMIN_PASSWORD must be changed in production")
         if not self.cors_origins or "*" in self.cors_origins:
             raise RuntimeError("SOULCLAW_CORS_ORIGINS must be explicit in production")
+        if not self.public_base_url:
+            raise RuntimeError("SOULCLAW_PUBLIC_BASE_URL must be set in production")
 
 
 @lru_cache(maxsize=1)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -41,10 +42,14 @@ class GatewayRuntimeManager:
         agent: AgentRuntime,
         events: RuntimeEventBus,
         http_timeout_seconds: float = 15.0,
+        webhook_max_skew_seconds: int = 300,
+        webhook_nonce_cache_size: int = 200,
     ) -> None:
         self.agent = agent
         self.events = events
         self.http_timeout_seconds = http_timeout_seconds
+        self.webhook_max_skew_seconds = webhook_max_skew_seconds
+        self.webhook_nonce_cache_size = webhook_nonce_cache_size
 
     def handle_inbound(self, message: InboundGatewayMessage) -> dict[str, Any]:
         with session_scope() as db:
@@ -140,18 +145,47 @@ class GatewayRuntimeManager:
             return {"mode": "http_post", "status_code": response.status_code}
         raise NotImplementedError(f"gateway kind '{gateway.kind}' is configured but no outbound adapter is active")
 
-    @staticmethod
-    def _verify_signature(gateway: GatewayConnection, message: InboundGatewayMessage) -> None:
+    def _verify_signature(self, gateway: GatewayConnection, message: InboundGatewayMessage) -> None:
         config = gateway.config or {}
         secret = str(config.get("secret") or "")
+        public_webhook = bool(message.metadata.get("public_webhook"))
+        if public_webhook and not secret:
+            raise RuntimeError("public gateway webhook requires a configured secret")
         if not secret:
             return
         signature = str(message.metadata.get("signature") or message.metadata.get("x_soulclaw_signature") or "")
-        expected = hmac.new(secret.encode("utf-8"), message.text.encode("utf-8"), hashlib.sha256).hexdigest()
+        timestamp = str(message.metadata.get("timestamp") or "")
+        nonce = str(message.metadata.get("nonce") or "")
+        if public_webhook:
+            self._verify_replay_window(gateway, timestamp=timestamp, nonce=nonce)
+        signed_text = f"{timestamp}.{nonce}.{message.text}" if timestamp or nonce else message.text
+        expected = hmac.new(secret.encode("utf-8"), signed_text.encode("utf-8"), hashlib.sha256).hexdigest()
         if signature.startswith("sha256="):
             signature = signature.removeprefix("sha256=")
         if not hmac.compare_digest(signature, expected):
             raise RuntimeError("invalid gateway signature")
+        if public_webhook:
+            self._record_nonce(gateway, timestamp=timestamp, nonce=nonce)
+
+    def _verify_replay_window(self, gateway: GatewayConnection, *, timestamp: str, nonce: str) -> None:
+        if not timestamp or not nonce:
+            raise RuntimeError("public gateway webhook requires timestamp and nonce")
+        try:
+            ts = float(timestamp)
+        except ValueError as exc:
+            raise RuntimeError("invalid gateway timestamp") from exc
+        if abs(time.time() - ts) > self.webhook_max_skew_seconds:
+            raise RuntimeError("gateway timestamp outside allowed window")
+        cache = (gateway.config or {}).get("nonce_cache")
+        if isinstance(cache, list) and any(isinstance(item, dict) and item.get("nonce") == nonce for item in cache):
+            raise RuntimeError("replayed gateway nonce")
+
+    def _record_nonce(self, gateway: GatewayConnection, *, timestamp: str, nonce: str) -> None:
+        config = dict(gateway.config or {})
+        cache = [item for item in config.get("nonce_cache", []) if isinstance(item, dict)]
+        cache.append({"nonce": nonce, "timestamp": timestamp})
+        config["nonce_cache"] = cache[-max(1, self.webhook_nonce_cache_size) :]
+        gateway.config = config
 
     @staticmethod
     def _session_id(gateway_name: str, channel_id: str, external_user_id: str) -> str:

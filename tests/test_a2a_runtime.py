@@ -5,6 +5,7 @@ import uuid
 
 import pytest
 
+from backend.api.admin.a2a import _a2a_public_authorized
 from backend.domain.a2a import A2AService
 from backend.domain.tools import ToolExecutor, ToolRegistry
 from backend.infra.config import Settings
@@ -364,3 +365,14 @@ def test_a2a_delegate_tool_runs_after_approval(monkeypatch: pytest.MonkeyPatch) 
 
     assert result["status"] == "succeeded"
     assert result["result"]["task_id"] == "approved-task"
+
+
+def test_a2a_public_auth_requires_key_when_public() -> None:
+    settings = type(
+        "Settings",
+        (),
+        {"a2a_require_public_auth": True, "public_base_url": "https://agent.example", "a2a_public_api_key": "secret"},
+    )()
+
+    assert _a2a_public_authorized(settings, authorization="Bearer secret", api_key=None) is True
+    assert _a2a_public_authorized(settings, authorization=None, api_key="bad") is False

@@ -58,7 +58,7 @@ flowchart LR
 | Weaver DeepResearch | 默认连接名 `weaver-deep-research`；通过 Weaver `/api/research/sse` 适配 DeepResearch 流事件、取消、最终报告和 evidence artifacts |
 | Dream/Reflection | 进入 Celery 队列执行，生成 pending proposals，不直接改文件 |
 | Heartbeat | 定时读取 `HEARTBEAT.md` 的 Active Tasks，生成待审批提案或记录 skipped |
-| 后台任务 | `dream_review`、`heartbeat_check`、`wiki_compile`、`wiki_lint`、`skill_scan`、`mcp_refresh` 通过 Celery/Redis 执行 |
+| 后台任务 | 轻量模式下可由 API 进程触发；长期运行时可启用 Celery/Redis 执行 `dream_review`、`heartbeat_check`、`wiki_compile`、`wiki_lint`、`skill_scan`、`mcp_refresh` |
 | 安全治理 | proposal apply/reject、工具审批、workspace 文件修改、cron/mcp/gateway/a2a 写操作都会进入审计 |
 
 ## A2A 多智能体
@@ -204,17 +204,31 @@ cp .env.example .env
 docker compose up -d --build
 ```
 
-默认服务：
+默认轻量服务：
 
 | 服务 | 用途 |
 |---|---|
-| `soulclaw` | FastAPI + 前端控制台 |
+| `soulclaw` | FastAPI + 前端控制台；默认使用 SQLite，本地不强制 Redis |
+
+本地需要后台队列时再显式启用 background profile：
+
+```bash
+docker compose --profile background up -d --build
+```
+
+| 可选服务 | 用途 |
+|---|---|
 | `soulclaw-worker` | Celery worker |
 | `soulclaw-scheduler` | 扫描 `cron_jobs` 并 enqueue 到期任务 |
 | `soulclaw-redis` | Celery broker/result backend |
-| `soulclaw-postgres` | 可选 Postgres/pgvector profile，不是默认必需 |
 
-SQLite 数据默认在 `data/soulclaw.sqlite3`。Postgres 可作为可选生产后端，通过 `SOULCLAW_DATABASE_URL` 切换。项目目录是：
+如果想在本地演练 Postgres，可单独启用 postgres profile 并把 `SOULCLAW_DATABASE_URL` 切到 Postgres：
+
+```bash
+docker compose --profile postgres up -d postgres
+```
+
+SQLite 数据默认在 `data/soulclaw.sqlite3`。Redis 在轻量模式下只是可选热缓存/队列依赖，未启动也不会让 readiness 失败。Postgres 可作为可选生产后端，通过 `SOULCLAW_DATABASE_URL` 切换。项目目录是：
 
 ```text
 /home/song/code/Agent/assistant/SoulClaw
@@ -225,6 +239,18 @@ SQLite 数据默认在 `data/soulclaw.sqlite3`。Postgres 可作为可选生产�
 - 控制台：<http://localhost:8020>
 - 健康检查：<http://localhost:8020/api/health>
 - Agent Card：<http://localhost:8020/.well-known/agent-card.json>
+
+### 个人服务器生产部署
+
+生产部署使用 Postgres + Redis + app + worker + scheduler，作为长期个人服务器形态；默认日常启动仍是单应用 + SQLite 的轻量形态。生产 app 端口默认只绑定 `127.0.0.1:8020`，建议放在外部 Caddy、Nginx 或 Cloudflare Tunnel 后面处理 TLS、域名和公网访问控制。
+
+```bash
+cp .env.production.example .env.production
+# 编辑 .env.production，替换所有密码、JWT secret、CORS、公开 URL 和 A2A 公网鉴权值
+docker compose --env-file .env.production -f docker-compose.prod.yml up -d --build
+```
+
+生产 compose 会强制要求关键变量，例如 `SOULCLAW_ADMIN_PASSWORD`、`SOULCLAW_JWT_SECRET`、`SOULCLAW_POSTGRES_PASSWORD`、`SOULCLAW_CORS_ORIGINS`、`SOULCLAW_PUBLIC_BASE_URL` 和 `SOULCLAW_A2A_PUBLIC_API_KEY`，并显式要求 Redis 可用。如果生产环境配置成 SQLite，后端会拒绝启动。
 
 默认开发账号：
 
@@ -240,6 +266,8 @@ SOULCLAW_ADMIN_PASSWORD=soulclaw-admin
 ```text
 POST    /api/auth/login
 GET     /api/health
+GET     /api/health/live
+GET     /api/health/ready
 
 GET/PUT /api/workspace/files/{soul|user|memory|heartbeat}
 
@@ -259,6 +287,7 @@ GET     /api/tools
 POST    /api/tools/{tool_name}/run
 GET     /api/approvals
 POST    /api/approvals/{approval_id}/approve-and-run
+POST    /api/approvals/{approval_id}/resume-turn
 
 GET     /api/a2a/connections
 POST    /api/a2a/delegate
@@ -284,16 +313,13 @@ POST    /api/evolution/proposals/{id}/apply
 ```bash
 conda run -n soulclaw env PYTHONPATH=. pytest -q
 conda run -n soulclaw env PYTHONPATH=. ruff check backend tests
+npm ci --prefix frontend
 npm run build --prefix frontend
+docker build -t soulclaw:local .
+docker compose --env-file .env.production.example -f docker-compose.prod.yml config
 ```
 
-验证结果：
-
-```text
-68 passed
-All checks passed
-frontend build passed
-```
+CI 使用同一组质量门禁：Python 3.11 后端测试、ruff、Node 20 前端构建、Docker build，以及 SQLite/Postgres 迁移验证。
 
 ## 参考
 
