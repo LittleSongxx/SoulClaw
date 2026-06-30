@@ -232,7 +232,7 @@ def settings(
         "gateway_heartbeat_timeout_seconds": settings.gateway_heartbeat_timeout_seconds,
         "gateway_webhook_max_skew_seconds": settings.gateway_webhook_max_skew_seconds,
         "gateway_webhook_nonce_cache_size": settings.gateway_webhook_nonce_cache_size,
-        "a2a_bootstrap_weaver_enabled": settings.a2a_bootstrap_weaver_enabled,
+        "a2a_bootstrap_soulsearcher_enabled": settings.a2a_bootstrap_soulsearcher_enabled,
         "a2a_require_public_auth": settings.a2a_require_public_auth,
         "a2a_public_api_key_configured": bool(settings.a2a_public_api_key),
     }

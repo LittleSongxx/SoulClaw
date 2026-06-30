@@ -13,7 +13,7 @@ SoulClaw 是一个本地优先的长期个人 AI Agent，也是一个 A2A 多智
 
 长期内容以 Markdown 文件为权威来源，SQLite 保存本地状态、索引镜像、审计、后台任务和 A2A 任务状态。搜索用于定位页面或记忆；使用事实前应通过 `wiki_read` 或 `memory_get` 读取原文。仓库模板位于 `workspace_seed/`，真实运行时内容位于本机私有 `workspace/`，启动时只补缺失文件，不覆盖已有个人数据。
 
-A2A 与 MCP 的分工是：MCP 用于工具和数据源接入；A2A 用于 DeepResearch、文档项目、日程项目、代码编写这类粗粒度、可跟踪、可返回 artifacts 的外部 Agent 协作。SoulClaw 内置 A2A runtime、Agent Card、JSON-RPC endpoint、任务/事件/artifact 持久化，以及 Weaver DeepResearch 兼容适配。
+A2A 与 MCP 的分工是：MCP 用于工具和数据源接入；A2A 用于 DeepResearch、文档项目、日程项目、代码编写这类粗粒度、可跟踪、可返回 artifacts 的外部 Agent 协作。SoulClaw 内置 A2A 1.0 runtime、Agent Card、JSON-RPC endpoint、任务/事件/artifact 持久化。
 
 ```mermaid
 flowchart LR
@@ -29,8 +29,7 @@ flowchart LR
     Tools --> Gateway[Gateway Runtime]
     Tools --> Approval[Approval]
     Agent --> A2A[A2A Runtime]
-    A2A --> Weaver[Weaver DeepResearch Adapter]
-    A2A --> Remote[Remote A2A Agents]
+    A2A --> Remote[Remote A2A 1.0 Agents]
     A2A --> Artifacts[A2A Tasks / Events / Artifacts]
     Dream[Dream / Reflection] --> Queue[Celery + Redis]
     Heartbeat[Heartbeat] --> Queue
@@ -54,8 +53,8 @@ flowchart LR
 | Memory | `memory_search` 定位记忆，`memory_get` 读取记忆；创建记忆会同步追加到 `MEMORY.md` |
 | Skills | 扫描、lint、proposal apply/reject、历史记录和 rollback |
 | Tools/MCP/Gateway | 工具统一注册和审计；高风险工具走 Approval；Gateway 支持 inbound/send/HMAC/heartbeat 状态 |
-| A2A 多智能体 | 发布本地 Agent Card；支持 JSON-RPC `message/send`、`tasks/get`、`tasks/cancel`、`tasks/resubscribe`；保存连接、任务、事件和 artifacts |
-| Weaver DeepResearch | 默认连接名 `weaver-deep-research`；通过 Weaver `/api/research/sse` 适配 DeepResearch 流事件、取消、最终报告和 evidence artifacts |
+| A2A 多智能体 | 发布 A2A 1.0 Agent Card；支持 JSON-RPC `SendMessage`、`SendStreamingMessage`、`GetTask`、`CancelTask`、`SubscribeToTask`、`ListTasks`；保存连接、任务、事件和 artifacts |
+| DeepResearch 委托 | 默认 SoulSearcher 连接名 `soulsearcher-deep-research`；通过 A2A 1.0 `SendStreamingMessage` 委托研究任务 |
 | Dream/Reflection | 进入 Celery 队列执行，生成 pending proposals，不直接改文件 |
 | Heartbeat | 定时读取 `HEARTBEAT.md` 的 Active Tasks，生成待审批提案或记录 skipped |
 | 后台任务 | 轻量模式下可由 API 进程触发；长期运行时可启用 Celery/Redis 执行 `dream_review`、`heartbeat_check`、`wiki_compile`、`wiki_lint`、`skill_scan`、`mcp_refresh` |
@@ -67,22 +66,22 @@ SoulClaw 会作为 orchestrator，把复杂任务委托给独立 Agent，而不�
 
 ```text
 GET  /.well-known/agent-card.json
-GET  /.well-known/agent-card
 GET  /api/a2a/card
 POST /api/a2a
 ```
 
-`POST /api/a2a` 是公开 JSON-RPC endpoint，支持：
+`POST /api/a2a` 是公开 A2A 1.0 JSON-RPC endpoint，支持：
 
 ```text
-message/send
-message/stream
-tasks/get
-tasks/cancel
-tasks/resubscribe
-tasks/list
-agent/getAuthenticatedExtendedCard
+SendMessage
+SendStreamingMessage
+GetTask
+ListTasks
+CancelTask
+SubscribeToTask
+GetExtendedAgentCard
 ```
+
 
 管理端接口需要登录：
 
@@ -97,15 +96,16 @@ POST /api/a2a/tasks/{task_id}/cancel
 GET  /api/a2a/tasks/{task_id}/events
 ```
 
-默认 DeepResearch 适配配置：
+默认 SoulSearcher A2A 1.0 DeepResearch 配置：
 
 ```env
-SOULCLAW_A2A_BOOTSTRAP_WEAVER_ENABLED=true
-SOULCLAW_A2A_WEAVER_BASE_URL=http://127.0.0.1:8001
-SOULCLAW_A2A_WEAVER_INTERNAL_API_KEY=
-SOULCLAW_A2A_WEAVER_AUTH_USER_HEADER=X-Weaver-User
-SOULCLAW_A2A_WEAVER_USER_ID=soulclaw
+SOULCLAW_A2A_BOOTSTRAP_SOULSEARCHER_ENABLED=true
+SOULCLAW_A2A_SOULSEARCHER_BASE_URL=http://127.0.0.1:8001
+SOULCLAW_A2A_SOULSEARCHER_INTERNAL_API_KEY=
+SOULCLAW_A2A_SOULSEARCHER_AUTH_USER_HEADER=X-SoulSearcher-User
+SOULCLAW_A2A_SOULSEARCHER_USER_ID=soulclaw
 ```
+
 
 低风险读取/研究类任务可以自动委托；代码写入、日程修改、外部发送、文档写入等高风险 capability 会通过现有 Approval 机制拦截。
 

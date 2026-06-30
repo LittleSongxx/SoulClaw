@@ -16,6 +16,7 @@ from backend.infra.events import RuntimeEventBus
 from backend.runtime.a2a import A2ARuntimeManager
 from backend.runtime.dream import DreamRuntime
 from backend.runtime.heartbeat import HeartbeatRuntime
+from backend.runtime.llm import OpenAICompatibleClient
 from backend.runtime.mcp import MCPRuntimeManager
 
 
@@ -31,6 +32,7 @@ class WorkerServices:
     platform: PlatformService
     mcp: MCPRuntimeManager
     a2a: A2ARuntimeManager
+    llm: OpenAICompatibleClient
 
 
 def build_worker_services() -> WorkerServices:
@@ -62,4 +64,5 @@ def build_worker_services() -> WorkerServices:
             settings=settings,
             http_timeout_seconds=settings.a2a_http_timeout_seconds,
         ),
+        llm=OpenAICompatibleClient(settings),
     )

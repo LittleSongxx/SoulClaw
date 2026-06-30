@@ -47,15 +47,11 @@ def public_agent_card(runtime: A2ARuntimeManager = Depends(get_a2a_runtime)) -> 
     return runtime.agent_card()
 
 
-@router.get("/.well-known/agent-card")
-def public_agent_card_legacy(runtime: A2ARuntimeManager = Depends(get_a2a_runtime)) -> dict:
-    return runtime.agent_card()
-
-
 @router.post("/api/a2a")
 def a2a_jsonrpc(
     payload: dict[str, Any],
     authorization: str | None = Header(default=None),
+    a2a_version: str | None = Header(default=None, alias="A2A-Version"),
     x_soulclaw_a2a_key: str | None = Header(default=None),
     db: Session = Depends(get_db),
     runtime: A2ARuntimeManager = Depends(get_a2a_runtime),
@@ -63,6 +59,8 @@ def a2a_jsonrpc(
 ) -> dict:
     if payload.get("jsonrpc") != "2.0":
         return {"jsonrpc": "2.0", "id": payload.get("id"), "error": {"code": -32600, "message": "invalid JSON-RPC request"}}
+    if a2a_version != "1.0":
+        return {"jsonrpc": "2.0", "id": payload.get("id"), "error": {"code": -32600, "message": "A2A-Version header must be 1.0"}}
     if not _a2a_public_authorized(settings, authorization=authorization, api_key=x_soulclaw_a2a_key):
         return {"jsonrpc": "2.0", "id": payload.get("id"), "error": {"code": -32003, "message": "A2A public API authentication required"}}
     return runtime.handle_jsonrpc(db, payload)
@@ -160,8 +158,8 @@ def get_a2a_task(
         raise HTTPException(status_code=404, detail=f"A2A task not found: {task_id}")
     return a2a_task_to_dict(
         task,
-        artifacts=service.list_artifacts(db, task_id),
-        events=service.list_events(db, task_id),
+        artifacts=service.list_artifacts(db, task.task_id),
+        events=service.list_events(db, task.task_id),
     )
 
 
@@ -187,7 +185,7 @@ def stream_a2a_task_events(
     task = service.get_task_by_any_id(db, task_id)
     if task is None:
         raise HTTPException(status_code=404, detail=f"A2A task not found: {task_id}")
-    events = service.list_events(db, task_id, after_sequence=after_sequence)
+    events = service.list_events(db, task.task_id, after_sequence=after_sequence)
 
     def generate():
         for item in events:

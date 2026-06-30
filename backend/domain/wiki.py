@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import uuid
 from dataclasses import dataclass
@@ -11,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from sqlalchemy import delete, desc, func, or_, select
+from sqlalchemy import delete, desc, func, or_, select, text
 from sqlalchemy.orm import Session
 
 from backend.infra.config import Settings, get_settings
@@ -31,6 +32,99 @@ HEADING_RE = re.compile(r"^#\s+(.+)$", re.MULTILINE)
 CANONICAL_WIKI_FILES = {"SCHEMA.md", "index.md", "log.md"}
 SPECIAL_WIKI_DIRS = {"raw", "entities", "concepts", "comparisons", "queries", "_archive"}
 WIKI_PROPOSAL_ACTIONS = {"create_page", "update_page", "archive_page", "fix_link", "update_index", "append_log"}
+LOW_RISK_REPAIR_TYPES = {"missing_canonical_file", "missing_index_entry", "orphan_page"}
+HIGH_RISK_REPAIR_TYPES = {
+    "broken_link",
+    "contested_claim",
+    "dangling_link",
+    "duplicate_page_key",
+    "insufficient_evidence",
+    "low_confidence",
+    "source_drift",
+    "stale_page",
+}
+BROWSE_FIRST_TERMS = {
+    "all",
+    "catalog",
+    "directory",
+    "index",
+    "list",
+    "map",
+    "overview",
+    "schema",
+    "什么",
+    "全部",
+    "列出",
+    "有哪些",
+    "概览",
+    "目录",
+    "索引",
+}
+BRIDGE_TERMS = {
+    "compare",
+    "compose",
+    "connect",
+    "difference",
+    "relationship",
+    "tradeoff",
+    "why",
+    "关系",
+    "区别",
+    "取舍",
+    "如何",
+    "为什么",
+    "比较",
+    "综合",
+    "联系",
+}
+STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "for",
+    "how",
+    "in",
+    "is",
+    "of",
+    "or",
+    "the",
+    "to",
+    "what",
+    "with",
+}
+DEFAULT_CANONICAL_CONTENT = {
+    "SCHEMA.md": """---
+title: Wiki Schema
+page_key: schema
+type: schema
+tags:
+  - llm-wiki
+confidence: 0.6
+summary: Control rules for the local LLM-Wiki.
+---
+
+# Wiki Schema
+
+Use Markdown frontmatter, stable page keys, summaries, wikilinks, and explicit sources so agents can browse, search, verify, and repair this Wiki.
+""",
+    "index.md": """---
+title: Wiki Index
+page_key: index
+type: index
+tags:
+  - llm-wiki
+confidence: 0.6
+summary: Root map for the local LLM-Wiki.
+---
+
+# Wiki Index
+
+Use this page as the browse-first map for durable Wiki knowledge.
+""",
+    "log.md": "# Wiki Log\n",
+}
 
 
 def normalize_page_key(value: str) -> str:
@@ -71,6 +165,75 @@ def _summary_from_body(body: str) -> str:
             continue
         return re.sub(r"\s+", " ", block)[:500]
     return ""
+
+
+def _query_tokens(value: str) -> list[str]:
+    lowered = value.lower()
+    tokens = re.findall(r"[\w\-/]+|[\u4e00-\u9fff]+", lowered)
+    return [token.strip("-_/") for token in tokens if len(token.strip("-_/")) > 1 and token not in STOPWORDS]
+
+
+def _field_contains(field: str, query: str, tokens: list[str]) -> bool:
+    lowered = field.lower()
+    if query and query.lower() in lowered:
+        return True
+    return any(token in lowered for token in tokens)
+
+
+def _snippet(text_value: str, query: str, *, limit: int = 260) -> str:
+    compact = re.sub(r"\s+", " ", text_value or "").strip()
+    if not compact:
+        return ""
+    lowered = compact.lower()
+    needles = [query.lower(), *_query_tokens(query)]
+    start = 0
+    for needle in needles:
+        if not needle:
+            continue
+        index = lowered.find(needle)
+        if index >= 0:
+            start = max(0, index - 70)
+            break
+    excerpt = compact[start : start + limit].strip()
+    prefix = "..." if start > 0 else ""
+    suffix = "..." if start + limit < len(compact) else ""
+    return f"{prefix}{excerpt}{suffix}"
+
+
+def _safe_fts_query(value: str) -> str:
+    tokens = _query_tokens(value)
+    if not tokens:
+        cleaned = re.sub(r'"', " ", value).strip()
+        return f'"{cleaned}"' if cleaned else ""
+    return " OR ".join(f'"{token.replace(chr(34), chr(32))}"' for token in tokens)
+
+
+def _result_scalar(result: Any, default: Any = None) -> Any:
+    for method in ("scalar_one_or_none", "scalar"):
+        if hasattr(result, method):
+            try:
+                value = getattr(result, method)()
+                return default if value is None else value
+            except Exception:  # noqa: BLE001
+                continue
+    if hasattr(result, "first"):
+        try:
+            row = result.first()
+        except Exception:  # noqa: BLE001
+            return default
+        if row is None:
+            return default
+        if isinstance(row, tuple):
+            return row[0]
+        return row
+    return default
+
+
+def _confidence(value: Any) -> float:
+    try:
+        return max(0.0, min(1.0, float(value if value is not None else 0.0)))
+    except (TypeError, ValueError):
+        return 0.0
 
 
 @dataclass(frozen=True)
@@ -186,6 +349,13 @@ class WikiService:
             "page_count": len(pages),
             "directories": sorted({Path(page.path).parts[0] for page in pages if Path(page.path).parts}),
             "page_types": sorted({page.page_type for page in pages}),
+            "fts": self.fts_status(db),
+            "route_rules": {
+                "search_first": "Use for named entities, exact page keys, aliases, tags, and focused facts.",
+                "browse_first": "Use for open-ended inventory, overview, map, directory, and schema questions.",
+                "bridge": "Use for comparisons, relationships, multi-hop questions, and synthesis across pages.",
+                "insufficient": "Use when the Wiki has no plausible page-level evidence or open constraints block trust.",
+            },
             "open_constraints": open_constraints,
             "pages": [
                 {
@@ -195,7 +365,7 @@ class WikiService:
                     "path": page.path,
                     "summary": page.summary,
                     "tags": page.tags,
-                    "confidence": page.confidence,
+                    "confidence": _confidence(page.confidence),
                 }
                 for page in pages[:120]
             ],
@@ -219,12 +389,11 @@ class WikiService:
             except Exception as exc:  # noqa: BLE001
                 errors.append({"type": "parse_error", "path": relative_path, "message": str(exc)})
                 new_errors.append(
-                    WikiErrorBook(
+                    self._error(
                         error_type="compile_error",
                         page_key=relative_path,
                         root_cause=str(exc),
                         constraint="Fix Markdown frontmatter/body so the compiler can parse this source.",
-                        status="open",
                         payload={"path": relative_path},
                     )
                 )
@@ -232,12 +401,11 @@ class WikiService:
             if page.page_key in seen_page_keys:
                 errors.append({"type": "duplicate_page_key", "path": relative_path, "page_key": page.page_key})
                 new_errors.append(
-                    WikiErrorBook(
+                    self._error(
                         error_type="duplicate_page_key",
                         page_key=page.page_key,
                         root_cause=f"Duplicate page_key declared by {relative_path}",
                         constraint="Give each Markdown Wiki page a unique page_key.",
-                        status="open",
                         payload={"path": relative_path},
                     )
                 )
@@ -317,16 +485,21 @@ class WikiService:
                 )
                 if not resolved:
                     db.add(
-                        WikiErrorBook(
+                        self._error(
                             error_type="dangling_link",
                             page_key=page.page_key,
                             root_cause=f"Unresolved wiki link: {target}",
                             constraint="Create the target page or add an alias/page_key matching the link.",
-                            status="open",
                             payload={"target": target, "anchor": anchor},
                         )
                     )
 
+        db.flush()
+        fts_result = (
+            self.refresh_fts(db, parsed_pages)
+            if not errors
+            else {"backend": self._db_backend(db), "available": False, "indexed_pages": 0, "fallback": True, "skipped": "compile_error"}
+        )
         run.status = "ok" if not errors else "error"
         run.pages_seen = len(source_keys)
         run.pages_indexed = len(parsed_pages)
@@ -336,6 +509,7 @@ class WikiService:
             "root": str(self.root),
             "errors": errors,
             "index": "page_mirror",
+            "fts": fts_result,
         }
         if self.events:
             self.events.emit("wiki.compile", run.payload, severity="info" if not errors else "warning")
@@ -344,6 +518,7 @@ class WikiService:
             "pages_seen": run.pages_seen,
             "pages_indexed": run.pages_indexed,
             "errors": run.errors,
+            "fts": fts_result,
             "llm_wiki": self._wiki_shape(),
         }
 
@@ -366,52 +541,241 @@ class WikiService:
             "backlinks": self.follow_links(db, page.page_key, direction="in"),
         }
 
-    def search(self, db: Session, query: str, limit: int = 10) -> list[dict[str, Any]]:
+    def search(
+        self,
+        db: Session,
+        query: str,
+        limit: int = 10,
+        *,
+        strategy: str = "",
+        path_prefix: str = "",
+        include_constraints: bool = False,
+    ) -> list[dict[str, Any]]:
         limit = max(1, min(limit, 50))
         query = query.strip()
-        if query:
-            pattern = f"%{query}%"
-            stmt = (
-                select(WikiPage)
-                .where(
-                    or_(
-                        WikiPage.title.ilike(pattern),
-                        WikiPage.summary.ilike(pattern),
-                        WikiPage.body.ilike(pattern),
-                    )
-                )
-                .order_by(desc(WikiPage.updated_at))
-                .limit(limit)
-            )
-        else:
-            stmt = select(WikiPage).order_by(desc(WikiPage.updated_at)).limit(limit)
-
-        lowered = query.lower()
+        tokens = _query_tokens(query)
+        fts_hits = {item["page_key"]: item for item in self._fts_search(db, query, limit=max(limit * 4, 20))}
+        pages = self._candidate_pages(
+            db,
+            query=query,
+            path_prefix=path_prefix,
+            page_keys=set(fts_hits),
+            limit=max(limit * 8, 200),
+        )
+        link_counts = self._link_counts(db)
         records: list[dict[str, Any]] = []
-        for page in db.scalars(stmt).all():
-            score = 1.0
-            if lowered:
-                title_or_summary = lowered in page.title.lower() or lowered in page.summary.lower()
-                alias_or_tag = any(lowered in str(item).lower() for item in [*(page.aliases or []), *(page.tags or [])])
-                key_hit = lowered in page.page_key.lower()
-                score = 1.0 if key_hit or title_or_summary or alias_or_tag else 0.6
+        for page in pages:
+            fts_hit = fts_hits.get(page.page_key)
+            score, matched_fields, match_reasons = self._score_page(
+                page,
+                query=query,
+                tokens=tokens,
+                fts_rank=float((fts_hit or {}).get("rank") or 0.0),
+                link_counts=link_counts,
+            )
+            if query and score <= 0 and not fts_hit:
+                continue
+            source = "wiki_fts" if fts_hit else "page_index"
+            snippet = str((fts_hit or {}).get("snippet") or "") or self._page_snippet(page, query)
+            constraints = self._constraints_for_pages(db, [page.page_key]) if include_constraints else []
             records.append(
                 {
                     "score": score,
-                    "source": "page_index",
+                    "source": source,
                     "page_key": page.page_key,
                     "title": page.title,
                     "path": page.path,
                     "summary": page.summary,
                     "tags": page.tags or [],
                     "page_type": page.page_type,
-                    "confidence": page.confidence,
+                    "confidence": _confidence(page.confidence),
+                    "match_reasons": match_reasons,
+                    "matched_fields": matched_fields,
+                    "snippet": snippet,
+                    "next_actions": self._next_actions_for_search_hit(page, strategy=strategy, constraints=constraints),
+                    "constraints": constraints,
                     "page": page,
                 }
             )
 
-        records.sort(key=lambda item: item["score"], reverse=True)
+        records.sort(key=lambda item: (item["score"], _confidence(item.get("confidence")), item["page_key"]), reverse=True)
         return records[:limit]
+
+    def route(self, db: Session, query: str, *, limit: int = 10) -> dict[str, Any]:
+        limit = max(1, min(limit, 50))
+        query = query.strip()
+        pages = self.list_pages(db, limit=500)
+        if not query or not pages:
+            return {
+                "query": query,
+                "strategy": "insufficient",
+                "required_fan_in": 0,
+                "recommended_steps": ["wiki_orient"],
+                "reason": "Wiki is empty or query is blank.",
+                "items": [],
+                "open_constraints": self._constraints_for_query(db, query, []),
+            }
+
+        lower = query.lower()
+        hits = self.search(db, query, limit=limit, include_constraints=True)
+        browse_intent = any(term in lower for term in BROWSE_FIRST_TERMS)
+        bridge_intent = any(term in lower for term in BRIDGE_TERMS)
+        if bridge_intent:
+            strategy = "bridge"
+            fan_in = min(3, max(2, len(hits) or min(len(pages), 2)))
+            steps = ["wiki_orient", "wiki_search", "wiki_read", "wiki_follow_links", "wiki_sufficiency_check"]
+            reason = "Query asks for synthesis, comparison, or relationship across Wiki pages."
+        elif browse_intent:
+            strategy = "browse_first"
+            fan_in = min(3, max(1, len(pages)))
+            steps = ["wiki_orient", "wiki_browse", "wiki_read", "wiki_sufficiency_check"]
+            reason = "Query asks for overview, directory, schema, or inventory-style knowledge."
+        elif not hits:
+            strategy = "insufficient"
+            fan_in = 0
+            steps = ["wiki_orient", "wiki_search", "wiki_sufficiency_check"]
+            reason = "No page-level Wiki evidence matched the query."
+        else:
+            strategy = "search_first"
+            fan_in = 1
+            steps = ["wiki_orient", "wiki_search", "wiki_read", "wiki_sufficiency_check"]
+            reason = "Query is focused enough for page-index search followed by page read."
+
+        open_constraints = self._constraints_for_query(db, query, hits)
+        if strategy != "insufficient" and hits and any(item.get("error_type") in HIGH_RISK_REPAIR_TYPES for item in open_constraints):
+            steps.append("wiki_follow_links")
+            reason += " Open Error Book constraints should be considered before relying on the result."
+        return {
+            "query": query,
+            "strategy": strategy,
+            "required_fan_in": fan_in,
+            "recommended_steps": steps,
+            "reason": reason,
+            "items": [
+                {
+                    "page_key": item["page_key"],
+                    "title": item["title"],
+                    "summary": item["summary"],
+                    "score": item["score"],
+                    "match_reasons": item.get("match_reasons", []),
+                    "next_actions": item.get("next_actions", []),
+                }
+                for item in hits
+            ],
+            "open_constraints": open_constraints,
+        }
+
+    def browse(
+        self,
+        db: Session,
+        *,
+        path_prefix: str = "",
+        page_type: str = "",
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        limit = max(1, min(limit, 500))
+        normalized_prefix = path_prefix.strip().strip("/")
+        expected_type = page_type.strip()
+        indexed = self._indexed_page_keys()
+        link_counts = self._link_counts(db)
+        pages = []
+        for page in self.list_pages(db, limit=1000):
+            path = (page.path or "").strip("/")
+            if normalized_prefix and not (path.startswith(normalized_prefix) or page.page_key.startswith(normalized_prefix)):
+                continue
+            if expected_type and page.page_type != expected_type:
+                continue
+            inbound, outbound = link_counts.get(page.page_key, (0, 0))
+            pages.append(
+                {
+                    "page_key": page.page_key,
+                    "title": page.title,
+                    "path": page.path,
+                    "summary": page.summary,
+                    "tags": page.tags or [],
+                    "page_type": page.page_type,
+                    "confidence": _confidence(page.confidence),
+                    "is_index_linked": page.page_key in indexed or page.page_key == "index",
+                    "inbound_links": inbound,
+                    "outbound_links": outbound,
+                    "source": "wiki_browse",
+                    "next_actions": ["wiki_read", "wiki_follow_links"],
+                }
+            )
+        pages.sort(key=lambda item: (not item["is_index_linked"], item["path"], item["page_key"]))
+        return {
+            "path_prefix": normalized_prefix,
+            "page_type": expected_type,
+            "items": pages[:limit],
+            "total": len(pages),
+            "next_actions": ["wiki_read selected pages", "wiki_sufficiency_check before answering"],
+        }
+
+    def sufficiency_check(
+        self,
+        db: Session,
+        *,
+        claim: str,
+        read_pages: list[str],
+        required_fan_in: int | None = None,
+        strategy: str = "",
+    ) -> dict[str, Any]:
+        normalized_pages = [normalize_page_key(item) for item in read_pages if str(item).strip()]
+        route = self.route(db, claim, limit=10) if required_fan_in is None else {}
+        fan_in = required_fan_in if required_fan_in is not None else int(route.get("required_fan_in") or 1)
+        fan_in = max(0, fan_in)
+        pages = [page for key in normalized_pages if (page := self.read(db, key)) is not None]
+        found_keys = {page.page_key for page in pages}
+        missing_keys = [key for key in normalized_pages if key not in found_keys]
+        coverage = self._claim_coverage(claim, pages)
+        constraints = self._constraints_for_pages(db, normalized_pages)
+        evidence_gaps: list[dict[str, Any]] = []
+        if not normalized_pages:
+            evidence_gaps.append({"type": "no_read_pages", "message": "No wiki_read page bodies were provided."})
+        if missing_keys:
+            evidence_gaps.append({"type": "missing_pages", "pages": missing_keys})
+        if fan_in and len(found_keys) < fan_in:
+            evidence_gaps.append({"type": "fan_in", "required": fan_in, "actual": len(found_keys)})
+        if claim.strip() and coverage["ratio"] < 0.35 and found_keys:
+            evidence_gaps.append({"type": "claim_terms_missing", "missing_terms": coverage["missing_terms"][:8]})
+        if constraints:
+            evidence_gaps.append(
+                {
+                    "type": "open_constraints",
+                    "constraints": [
+                        {
+                            "error_type": item["error_type"],
+                            "page_key": item["page_key"],
+                            "constraint_rule": item.get("constraint_rule") or item.get("constraint"),
+                        }
+                        for item in constraints
+                    ],
+                }
+            )
+        sufficient = not evidence_gaps
+        return {
+            "sufficient": sufficient,
+            "claim": claim,
+            "strategy": strategy or str(route.get("strategy") or ""),
+            "required_fan_in": fan_in,
+            "read_pages": normalized_pages,
+            "evidence_pages": [
+                {
+                    "page_key": page.page_key,
+                    "title": page.title,
+                    "summary": page.summary,
+                    "confidence": _confidence(page.confidence),
+                }
+                for page in pages
+            ],
+            "coverage": coverage,
+            "open_constraints": constraints,
+            "evidence_gaps": evidence_gaps,
+            "requirement": "Use wiki_read page bodies, enough fan-in, and no blocking Error Book constraints before making Wiki-backed claims.",
+            "next_action": ""
+            if sufficient
+            else "Read additional pages, follow links, repair Error Book constraints, or state that Wiki evidence is insufficient.",
+        }
 
     def follow_links(
         self,
@@ -506,14 +870,15 @@ class WikiService:
                         {"path": page.relative_path},
                     )
                 )
-            if page.confidence < 0.35:
+            confidence = _confidence(page.confidence)
+            if confidence < 0.35:
                 errors.append(
                     self._error(
                         "low_confidence",
                         page.page_key,
-                        f"Page confidence is low: {page.confidence:.2f}",
+                        f"Page confidence is low: {confidence:.2f}",
                         "Verify sources or mark the claim as contested.",
-                        {"confidence": page.confidence},
+                        {"confidence": confidence},
                     )
                 )
             if bool(page.metadata.get("contested", False)):
@@ -570,6 +935,123 @@ class WikiService:
                 }
                 for error in errors
             ],
+        }
+
+    def repair(
+        self,
+        db: Session,
+        *,
+        apply_safe: bool = True,
+        error_ids: list[str] | None = None,
+        llm: Any | None = None,
+        actor: str = "wiki_repair",
+    ) -> dict[str, Any]:
+        lint_result = self.lint(db)
+        db.flush()
+        selected_ids = {str(item) for item in (error_ids or []) if str(item).strip()}
+        open_errors = self.error_book(db, status="open", limit=500)
+        if selected_ids:
+            open_errors = [item for item in open_errors if str(item.id) in selected_ids]
+        created: list[dict[str, Any]] = []
+        applied: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        seen_low_risk_targets: set[tuple[str, str]] = set()
+
+        for error in open_errors:
+            if error.status != "open":
+                continue
+            error_type = str(error.error_type)
+            if error_type in LOW_RISK_REPAIR_TYPES:
+                proposal = self._low_risk_repair_proposal(error)
+                if proposal is None:
+                    skipped.append({"error_id": str(error.id), "error_type": error_type, "reason": "no deterministic repair"})
+                    continue
+                key = (proposal["action"], str(proposal["payload"].get("page_key") or proposal["payload"].get("path") or ""))
+                if key in seen_low_risk_targets:
+                    skipped.append({"error_id": str(error.id), "error_type": error_type, "reason": "duplicate safe repair"})
+                    continue
+                seen_low_risk_targets.add(key)
+                existing = self._find_existing_repair_proposal(db, error)
+                if existing is not None:
+                    skipped.append(
+                        {
+                            "error_id": str(error.id),
+                            "error_type": error_type,
+                            "reason": "existing repair proposal",
+                            "proposal_id": str(existing.id),
+                        }
+                    )
+                    continue
+                record = self._create_repair_proposal(db, error, proposal, risk_level="low")
+                created.append({"proposal_id": str(record.id), "error_id": str(error.id), "risk_level": "low"})
+                if apply_safe:
+                    applied_record = self.apply_proposal(db, record.id, actor=actor)
+                    error.status = "fixed"
+                    error.lifecycle_status = "fixed"
+                    error.fixed_at = datetime.now(UTC)
+                    applied.append(
+                        {
+                            "proposal_id": str(applied_record.id),
+                            "action": applied_record.action,
+                            "result": applied_record.result,
+                        }
+                    )
+                continue
+
+            if error_type in HIGH_RISK_REPAIR_TYPES or error_type:
+                existing = self._find_existing_repair_proposal(db, error)
+                if existing is not None:
+                    skipped.append(
+                        {
+                            "error_id": str(error.id),
+                            "error_type": error_type,
+                            "reason": "existing repair proposal",
+                            "proposal_id": str(existing.id),
+                        }
+                    )
+                    continue
+                diagnosis = self._diagnose_high_risk_error(error, llm=llm)
+                record = self._create_repair_proposal(
+                    db,
+                    error,
+                    {
+                        "action": "append_log",
+                        "payload": {
+                            "page_key": normalize_page_key(error.page_key),
+                            "error_id": str(error.id),
+                            "entry": (
+                                f"Review Wiki Error Book item `{error_type}` for `{error.page_key}`: "
+                                f"{diagnosis.get('root_cause') or error.root_cause}"
+                            ),
+                            "repair_kind": "semantic_review",
+                            "diagnosis": diagnosis,
+                        },
+                    },
+                    risk_level="medium",
+                    extra_evidence={"diagnosis": diagnosis},
+                )
+                created.append({"proposal_id": str(record.id), "error_id": str(error.id), "risk_level": "medium"})
+
+        if self.events:
+            self.events.emit(
+                "wiki.repair",
+                {
+                    "errors_seen": len(open_errors),
+                    "proposals_created": len(created),
+                    "proposals_applied": len(applied),
+                    "lint_errors": lint_result.get("errors", 0),
+                },
+                severity="info",
+            )
+        return {
+            "ok": True,
+            "errors_seen": len(open_errors),
+            "lint": lint_result,
+            "proposals_created": len(created),
+            "proposals_applied": len(applied),
+            "created": created,
+            "applied": applied,
+            "skipped": skipped,
         }
 
     def apply_proposal(self, db: Session, proposal_id: uuid.UUID, *, actor: str = "admin") -> EvolutionProposal:
@@ -645,6 +1127,520 @@ class WikiService:
                 "finished_at": last_run.finished_at.isoformat() if last_run.finished_at else None,
             },
             "llm_wiki": self._wiki_shape(),
+            "fts": self.fts_status(db),
+        }
+
+    def refresh_fts(self, db: Session, pages: list[ParsedWikiPage] | None = None) -> dict[str, Any]:
+        backend = self._db_backend(db)
+        if backend == "sqlite":
+            return self._refresh_sqlite_fts(db, pages or self.scan())
+        if backend == "postgresql":
+            return self._postgres_fts_status(db)
+        return {"backend": backend, "available": False, "indexed_pages": 0, "fallback": True}
+
+    def fts_status(self, db: Session) -> dict[str, Any]:
+        backend = self._db_backend(db)
+        if backend == "sqlite":
+            try:
+                result = db.execute(
+                    text("SELECT count(*) FROM sqlite_master WHERE type IN ('table', 'virtual table') AND name = 'wiki_pages_fts'")
+                )
+                exists = int(_result_scalar(result, 0) or 0) > 0
+                indexed = 0
+                if exists:
+                    indexed = int(_result_scalar(db.execute(text("SELECT count(*) FROM wiki_pages_fts")), 0) or 0)
+                return {"backend": "sqlite", "available": exists, "indexed_pages": indexed, "fallback": not exists}
+            except Exception as exc:  # noqa: BLE001
+                return {"backend": "sqlite", "available": False, "indexed_pages": 0, "fallback": True, "error": str(exc)}
+        if backend == "postgresql":
+            return self._postgres_fts_status(db)
+        return {"backend": backend, "available": False, "indexed_pages": 0, "fallback": True}
+
+    def _db_backend(self, db: Session) -> str:
+        try:
+            bind = db.get_bind()
+        except Exception:  # noqa: BLE001
+            bind = getattr(db, "bind", None)
+        dialect = getattr(getattr(bind, "dialect", None), "name", "")
+        return str(dialect or "unknown")
+
+    def _refresh_sqlite_fts(self, db: Session, pages: list[ParsedWikiPage]) -> dict[str, Any]:
+        try:
+            db.execute(
+                text(
+                    """
+                    CREATE VIRTUAL TABLE IF NOT EXISTS wiki_pages_fts USING fts5(
+                        page_key UNINDEXED,
+                        title,
+                        summary,
+                        body,
+                        aliases,
+                        tags,
+                        path UNINDEXED,
+                        page_type UNINDEXED
+                    )
+                    """
+                )
+            )
+            db.execute(text("DELETE FROM wiki_pages_fts"))
+            insert_sql = text(
+                """
+                INSERT INTO wiki_pages_fts(page_key, title, summary, body, aliases, tags, path, page_type)
+                VALUES (:page_key, :title, :summary, :body, :aliases, :tags, :path, :page_type)
+                """
+            )
+            for page in pages:
+                db.execute(
+                    insert_sql,
+                    {
+                        "page_key": page.page_key,
+                        "title": page.title,
+                        "summary": page.summary,
+                        "body": page.body,
+                        "aliases": " ".join(page.aliases),
+                        "tags": " ".join(page.tags),
+                        "path": page.relative_path,
+                        "page_type": page.page_type,
+                    },
+                )
+            return {"backend": "sqlite", "available": True, "indexed_pages": len(pages), "fallback": False}
+        except Exception as exc:  # noqa: BLE001
+            if self.events:
+                self.events.emit("wiki.fts.refresh_failed", {"backend": "sqlite", "error": str(exc)}, severity="warning")
+            return {"backend": "sqlite", "available": False, "indexed_pages": 0, "fallback": True, "error": str(exc)}
+
+    def _postgres_fts_status(self, db: Session) -> dict[str, Any]:
+        try:
+            exists = bool(_result_scalar(db.execute(text("SELECT to_regclass('ix_wiki_pages_fts')")), None))
+            indexed = int(_result_scalar(db.execute(text("SELECT count(*) FROM wiki_pages")), 0) or 0) if exists else 0
+            return {"backend": "postgresql", "available": exists, "indexed_pages": indexed, "fallback": not exists}
+        except Exception as exc:  # noqa: BLE001
+            return {"backend": "postgresql", "available": False, "indexed_pages": 0, "fallback": True, "error": str(exc)}
+
+    def _fts_search(self, db: Session, query: str, *, limit: int = 20) -> list[dict[str, Any]]:
+        if not query.strip():
+            return []
+        backend = self._db_backend(db)
+        if backend == "sqlite":
+            return self._sqlite_fts_search(db, query, limit=limit)
+        if backend == "postgresql":
+            return self._postgres_fts_search(db, query, limit=limit)
+        return []
+
+    def _sqlite_fts_search(self, db: Session, query: str, *, limit: int) -> list[dict[str, Any]]:
+        fts_query = _safe_fts_query(query)
+        if not fts_query:
+            return []
+        try:
+            sql = text(
+                """
+                SELECT
+                    page_key,
+                    bm25(wiki_pages_fts, 8.0, 4.0, 2.0, 1.0, 3.0, 2.0, 0.2, 0.5) AS raw_rank,
+                    snippet(wiki_pages_fts, 3, '[', ']', ' ... ', 24) AS snippet
+                FROM wiki_pages_fts
+                WHERE wiki_pages_fts MATCH :query
+                ORDER BY raw_rank
+                LIMIT :limit
+                """
+            )
+            rows = db.execute(sql, {"query": fts_query, "limit": limit}).mappings().all()
+        except Exception:
+            return []
+        hits: list[dict[str, Any]] = []
+        for row in rows:
+            raw_rank = abs(float(row.get("raw_rank") or 0.0))
+            hits.append(
+                {
+                    "page_key": str(row.get("page_key") or ""),
+                    "rank": 1.0 / (1.0 + raw_rank),
+                    "snippet": str(row.get("snippet") or ""),
+                }
+            )
+        return [item for item in hits if item["page_key"]]
+
+    def _postgres_fts_search(self, db: Session, query: str, *, limit: int) -> list[dict[str, Any]]:
+        try:
+            sql = text(
+                """
+                WITH q AS (SELECT plainto_tsquery('simple', :query) AS query),
+                pages AS (
+                    SELECT
+                        page_key,
+                        coalesce(body, summary, '') AS headline_text,
+                        setweight(to_tsvector('simple', coalesce(title, '')), 'A') ||
+                        setweight(to_tsvector('simple', coalesce(summary, '')), 'B') ||
+                        setweight(
+                            jsonb_to_tsvector(
+                                'simple',
+                                CASE WHEN jsonb_typeof(aliases) = 'array' THEN aliases ELSE '[]'::jsonb END,
+                                '["string"]'::jsonb
+                            ),
+                            'B'
+                        ) ||
+                        setweight(
+                            jsonb_to_tsvector(
+                                'simple',
+                                CASE WHEN jsonb_typeof(tags) = 'array' THEN tags ELSE '[]'::jsonb END,
+                                '["string"]'::jsonb
+                            ),
+                            'B'
+                        ) ||
+                        setweight(to_tsvector('simple', coalesce(body, '')), 'C') AS document
+                    FROM wiki_pages
+                )
+                SELECT
+                    page_key,
+                    ts_rank_cd(document, q.query) AS rank,
+                    ts_headline('simple', headline_text, q.query, 'MaxWords=24, MinWords=8') AS snippet
+                FROM pages, q
+                WHERE document @@ q.query
+                ORDER BY rank DESC
+                LIMIT :limit
+                """
+            )
+            rows = db.execute(sql, {"query": query, "limit": limit}).mappings().all()
+        except Exception:
+            return []
+        return [
+            {"page_key": str(row.get("page_key") or ""), "rank": float(row.get("rank") or 0.0), "snippet": str(row.get("snippet") or "")}
+            for row in rows
+            if row.get("page_key")
+        ]
+
+    def _candidate_pages(
+        self,
+        db: Session,
+        *,
+        query: str,
+        path_prefix: str,
+        page_keys: set[str],
+        limit: int,
+    ) -> list[WikiPage]:
+        pages = self.list_pages(db, limit=max(limit, 1000))
+        seen = {page.page_key for page in pages}
+        missing_fts_keys = [key for key in page_keys if key and key not in seen]
+        if missing_fts_keys:
+            missing_set = set(missing_fts_keys)
+            try:
+                fts_pages = list(db.scalars(select(WikiPage).where(WikiPage.page_key.in_(missing_fts_keys))).all())
+            except Exception:  # noqa: BLE001
+                fts_pages = []
+            for page in fts_pages:
+                if page.page_key in missing_set and page.page_key not in seen:
+                    pages.append(page)
+                    seen.add(page.page_key)
+        normalized_prefix = path_prefix.strip().strip("/")
+        if normalized_prefix:
+            pages = [
+                page
+                for page in pages
+                if (page.path or "").strip("/").startswith(normalized_prefix) or page.page_key.startswith(normalized_prefix)
+            ]
+        if not query.strip():
+            return pages[:limit]
+        tokens = _query_tokens(query)
+        selected: list[WikiPage] = []
+        for page in pages:
+            if page.page_key in page_keys or self._page_has_text_match(page, query, tokens):
+                selected.append(page)
+        return selected[:limit]
+
+    def _page_has_text_match(self, page: WikiPage, query: str, tokens: list[str]) -> bool:
+        fields = [
+            page.page_key,
+            page.title,
+            page.summary,
+            page.body,
+            page.path,
+            page.page_type,
+            " ".join(page.aliases or []),
+            " ".join(page.tags or []),
+        ]
+        return any(_field_contains(str(field or ""), query, tokens) for field in fields)
+
+    def _score_page(
+        self,
+        page: WikiPage,
+        *,
+        query: str,
+        tokens: list[str],
+        fts_rank: float,
+        link_counts: dict[str, tuple[int, int]],
+    ) -> tuple[float, list[str], list[str]]:
+        if not query.strip():
+            return (_confidence(page.confidence), [], ["recent_or_index_listing"])
+        normalized_query = normalize_page_key(query)
+        lower_query = query.lower()
+        aliases = [str(item) for item in (page.aliases or [])]
+        tags = [str(item) for item in (page.tags or [])]
+        field_values = {
+            "page_key": page.page_key,
+            "title": page.title,
+            "summary": page.summary,
+            "body": page.body,
+            "path": page.path,
+            "page_type": page.page_type,
+            "aliases": " ".join(aliases),
+            "tags": " ".join(tags),
+        }
+        score = 0.0
+        matched_fields: list[str] = []
+        reasons: list[str] = []
+        if normalized_query and page.page_key == normalized_query:
+            score += 9.0
+            matched_fields.append("page_key")
+            reasons.append("exact_page_key")
+        if lower_query and page.title.lower() == lower_query:
+            score += 8.0
+            matched_fields.append("title")
+            reasons.append("exact_title")
+        if any(normalize_page_key(alias) == normalized_query for alias in aliases):
+            score += 7.0
+            matched_fields.append("aliases")
+            reasons.append("exact_alias")
+        if any(tag.lower() == lower_query for tag in tags):
+            score += 5.5
+            matched_fields.append("tags")
+            reasons.append("exact_tag")
+        weights = {
+            "page_key": 4.0,
+            "title": 3.2,
+            "aliases": 2.8,
+            "tags": 2.4,
+            "path": 1.6,
+            "summary": 1.4,
+            "page_type": 1.0,
+            "body": 0.8,
+        }
+        for field, value in field_values.items():
+            text_value = str(value or "")
+            if _field_contains(text_value, query, tokens):
+                if field not in matched_fields:
+                    matched_fields.append(field)
+                score += weights[field]
+                reasons.append(f"{field}_match")
+        if fts_rank:
+            score += min(3.0, fts_rank * 3.0)
+            reasons.append("fts_match")
+        inbound, outbound = link_counts.get(page.page_key, (0, 0))
+        if inbound:
+            score += min(1.0, inbound * 0.2)
+            reasons.append("backlinked")
+        if outbound:
+            score += min(0.5, outbound * 0.1)
+        score += _confidence(page.confidence)
+        return round(score, 4), sorted(set(matched_fields)), sorted(set(reasons))
+
+    def _link_counts(self, db: Session) -> dict[str, tuple[int, int]]:
+        try:
+            links = list(db.scalars(select(WikiLink).where(WikiLink.status == "resolved")).all())
+        except Exception:  # noqa: BLE001
+            return {}
+        counts: dict[str, list[int]] = {}
+        for link in links:
+            counts.setdefault(link.dst_page_key, [0, 0])[0] += 1
+            counts.setdefault(link.src_page_key, [0, 0])[1] += 1
+        return {key: (value[0], value[1]) for key, value in counts.items()}
+
+    def _page_snippet(self, page: WikiPage, query: str) -> str:
+        return _snippet(page.summary, query) or _snippet(page.body, query) or page.summary[:260]
+
+    def _next_actions_for_search_hit(self, page: WikiPage, *, strategy: str, constraints: list[dict[str, Any]]) -> list[str]:
+        actions = ["wiki_read"]
+        if strategy == "bridge" or constraints:
+            actions.append("wiki_follow_links")
+        if _confidence(page.confidence) < 0.5 or constraints:
+            actions.append("wiki_sufficiency_check")
+        return actions
+
+    def _find_existing_repair_proposal(self, db: Session, error: WikiErrorBook) -> EvolutionProposal | None:
+        error_id = str(error.id)
+        try:
+            proposals = list(
+                db.scalars(
+                    select(EvolutionProposal).where(
+                        EvolutionProposal.target_type == "wiki",
+                        EvolutionProposal.status.in_(("pending", "approved", "applied")),
+                    )
+                ).all()
+            )
+        except Exception:  # noqa: BLE001
+            return None
+        for proposal in proposals:
+            payload = proposal.payload or {}
+            evidence = proposal.evidence or {}
+            evidence_error = evidence.get("error") if isinstance(evidence.get("error"), dict) else {}
+            if str(payload.get("error_id") or "") == error_id or str(evidence_error.get("id") or "") == error_id:
+                return proposal
+        return None
+
+    def _constraints_for_query(self, db: Session, query: str, hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        page_keys = [str(item.get("page_key") or "") for item in hits]
+        tokens = _query_tokens(query)
+        constraints = []
+        for item in self.error_book(db, status="open", limit=100):
+            haystack = " ".join(
+                [
+                    item.page_key,
+                    item.error_type,
+                    item.root_cause,
+                    item.constraint,
+                    item.constraint_rule,
+                    json.dumps(item.payload or {}, ensure_ascii=False),
+                ]
+            ).lower()
+            if item.page_key in page_keys or any(token in haystack for token in tokens):
+                constraints.append(self._error_summary(item))
+        return constraints[:20]
+
+    def _constraints_for_pages(self, db: Session, page_keys: list[str]) -> list[dict[str, Any]]:
+        keys = {normalize_page_key(str(key)) for key in page_keys if str(key).strip()}
+        if not keys:
+            return []
+        constraints = []
+        for item in self.error_book(db, status="open", limit=200):
+            if normalize_page_key(item.page_key) in keys:
+                constraints.append(self._error_summary(item))
+        return constraints
+
+    def _claim_coverage(self, claim: str, pages: list[WikiPage]) -> dict[str, Any]:
+        tokens = _query_tokens(claim)
+        if not tokens:
+            return {"ratio": 1.0, "matched_terms": [], "missing_terms": []}
+        haystack = "\n".join(
+            f"{page.page_key} {page.title} {page.summary} {page.body} {' '.join(page.aliases or [])} {' '.join(page.tags or [])}"
+            for page in pages
+        ).lower()
+        matched = [token for token in tokens if token in haystack]
+        missing = [token for token in tokens if token not in haystack]
+        return {"ratio": round(len(matched) / max(1, len(tokens)), 4), "matched_terms": matched, "missing_terms": missing}
+
+    def _low_risk_repair_proposal(self, error: WikiErrorBook) -> dict[str, Any] | None:
+        error_type = error.error_type
+        payload = error.payload or {}
+        if error_type == "missing_canonical_file":
+            path = str(payload.get("path") or error.page_key)
+            if path not in CANONICAL_WIKI_FILES:
+                return None
+            return {
+                "action": "create_page",
+                "payload": {
+                    "path": path,
+                    "content": DEFAULT_CANONICAL_CONTENT[path],
+                    "repair_kind": "create_canonical_file",
+                    "error_id": str(error.id),
+                },
+            }
+        if error_type in {"missing_index_entry", "orphan_page"}:
+            page_key = normalize_page_key(error.page_key)
+            if not page_key:
+                return None
+            content = self._index_content_with_link(page_key)
+            return {
+                "action": "update_index",
+                "payload": {
+                    "path": "index.md",
+                    "page_key": page_key,
+                    "content": content,
+                    "repair_kind": "index_link",
+                    "error_id": str(error.id),
+                },
+            }
+        return None
+
+    def _index_content_with_link(self, page_key: str) -> str:
+        current = self._read_optional_file("index.md")
+        if not current.strip():
+            current = DEFAULT_CANONICAL_CONTENT["index.md"]
+        if f"[[{page_key}]]" in current:
+            return current
+        label = page_key.split("/")[-1].replace("-", " ").title()
+        return current.rstrip() + f"\n\n- [[{page_key}]] {label}\n"
+
+    def _create_repair_proposal(
+        self,
+        db: Session,
+        error: WikiErrorBook,
+        proposal: dict[str, Any],
+        *,
+        risk_level: str,
+        extra_evidence: dict[str, Any] | None = None,
+    ) -> EvolutionProposal:
+        record = EvolutionProposal(
+            target_type="wiki",
+            action=str(proposal["action"]),
+            status="pending",
+            risk_level=risk_level,
+            payload=proposal.get("payload") if isinstance(proposal.get("payload"), dict) else {},
+            evidence={
+                "source": "wiki_repair",
+                "error": self._error_summary(error),
+                **(extra_evidence or {}),
+            },
+        )
+        db.add(record)
+        db.flush()
+        if self.events:
+            self.events.emit(
+                "wiki.repair.proposal_created",
+                {"proposal_id": str(record.id), "error_id": str(error.id), "risk_level": risk_level},
+            )
+        return record
+
+    def _diagnose_high_risk_error(self, error: WikiErrorBook, *, llm: Any | None = None) -> dict[str, Any]:
+        fallback = {
+            "root_cause": error.root_cause,
+            "constraint_rule": error.constraint_rule or error.constraint,
+            "verification_method": error.verification_method or "Run wiki lint/compile and answer a retrieval probe before trusting this page.",
+            "source_refs": error.source_refs or [],
+            "proposed_action": "review_before_apply",
+        }
+        if llm is None or not bool(getattr(llm, "configured", False)):
+            return fallback
+        try:
+            response = llm.complete(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "Diagnose one LLM-Wiki Error Book item. Return compact JSON only.",
+                    },
+                    {
+                        "role": "user",
+                        "content": json.dumps(
+                            {
+                                "error_type": error.error_type,
+                                "page_key": error.page_key,
+                                "root_cause": error.root_cause,
+                                "constraint": error.constraint,
+                                "payload": error.payload or {},
+                            },
+                            ensure_ascii=False,
+                        ),
+                    },
+                ],
+                tools=None,
+                temperature=0.1,
+            )
+            parsed = json.loads(response.content)
+            if isinstance(parsed, dict):
+                return {**fallback, **parsed}
+        except Exception as exc:  # noqa: BLE001
+            fallback["llm_error"] = str(exc)
+        return fallback
+
+    @staticmethod
+    def _error_summary(error: WikiErrorBook) -> dict[str, Any]:
+        return {
+            "id": str(error.id),
+            "error_type": error.error_type,
+            "page_key": error.page_key,
+            "root_cause": error.root_cause,
+            "constraint": error.constraint,
+            "constraint_rule": getattr(error, "constraint_rule", "") or "",
+            "verification_method": getattr(error, "verification_method", "") or "",
+            "source_refs": getattr(error, "source_refs", []) or [],
+            "payload": error.payload or {},
         }
 
     def _markdown_paths(self) -> list[Path]:

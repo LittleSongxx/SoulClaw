@@ -1,0 +1,23 @@
+[
+  {
+    "query": "SoulClaw Platform Wiki",
+    "expected_pages": ["index"],
+    "expected_strategy": "search_first"
+  },
+  {
+    "query": "列出所有 Wiki 页面",
+    "expected_pages": [],
+    "expected_strategy": "browse_first"
+  },
+  {
+    "query": "比较 Wiki Schema 和 Platform Wiki 的关系",
+    "expected_pages": ["index", "schema"],
+    "expected_strategy": "bridge"
+  },
+  {
+    "query": "definitely-missing-wiki-topic",
+    "expected_pages": [],
+    "expected_strategy": "insufficient",
+    "insufficient": true
+  }
+]

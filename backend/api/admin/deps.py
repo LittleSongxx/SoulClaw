@@ -100,6 +100,10 @@ def get_agent_runtime(request: Request):
     return request.app.state.agent_runtime
 
 
+def get_llm_client(request: Request):
+    return request.app.state.llm_client
+
+
 def get_a2a_service(request: Request):
     return request.app.state.a2a_service
 

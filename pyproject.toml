@@ -20,7 +20,7 @@ dependencies = [
     "loguru>=0.7.3",
     "croniter>=5.0.0",
     "mcp>=1.0.0",
-    "a2a-sdk[fastapi]>=1.1.0",
+    "a2a-sdk[fastapi]>=1.1.0,<2.0.0",
 ]
 
 [project.optional-dependencies]

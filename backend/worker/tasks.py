@@ -16,6 +16,7 @@ def dispatch_task(task_name: str, job_id: str, payload: dict[str, Any], *, queue
         "dream_review": dream_review_task,
         "wiki_compile": wiki_compile_task,
         "wiki_lint": wiki_lint_task,
+        "wiki_repair": wiki_repair_task,
         "skill_scan": skill_scan_task,
         "mcp_refresh": mcp_refresh_task,
         "heartbeat_check": heartbeat_check_task,
@@ -77,6 +78,21 @@ def wiki_compile_task(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
 def wiki_lint_task(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     del payload
     return _run_job(job_id, lambda services, db: services.wiki.lint(db))
+
+
+@celery_app.task(name="soulclaw.wiki_repair")
+def wiki_repair_task(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    error_ids = payload.get("error_ids")
+    parsed_error_ids = [str(item) for item in error_ids] if isinstance(error_ids, list) else []
+    return _run_job(
+        job_id,
+        lambda services, db: services.wiki.repair(
+            db,
+            apply_safe=bool(payload.get("apply_safe", True)),
+            error_ids=parsed_error_ids,
+            llm=services.llm,
+        ),
+    )
 
 
 @celery_app.task(name="soulclaw.skill_scan")

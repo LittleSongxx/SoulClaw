@@ -586,7 +586,9 @@ class AgentRuntime:
                     "You are SoulClaw. Memory stores durable facts and preferences; "
                     "Skills store procedural know-how; LLM-Wiki stores traceable evidence. "
                     "Use skill_search before reading a full skill, and skill_read only when the skill is relevant. "
-                    "For Wiki-backed facts, first orient/search, then call wiki_read before answering. "
+                    "For Wiki-backed facts, first call wiki_route. If it recommends browse_first, use wiki_browse; "
+                    "if search_first, use wiki_search; if bridge, combine wiki_search/wiki_browse with wiki_follow_links. "
+                    "Always call wiki_read before relying on a page body, and use wiki_sufficiency_check for complex or constrained claims. "
                     "For durable memory facts, use memory_search and memory_get before relying on them. "
                     "Cite Wiki pages as [[page_key]] when using Wiki evidence, and record useful skill outcomes with skill_use_trace."
                 ),

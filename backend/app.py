@@ -217,34 +217,34 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("[heartbeat] startup cron ensure failed: {}", exc)
                     events.emit("heartbeat.bootstrap.failed", {"error": str(exc)}, severity="warning")
-            if settings.a2a_bootstrap_weaver_enabled and settings.a2a_weaver_base_url:
+            if settings.a2a_bootstrap_soulsearcher_enabled and settings.a2a_soulsearcher_base_url:
                 try:
                     a2a_service.upsert_connection(
                         db,
-                        name="weaver-deep-research",
-                        kind="weaver",
-                        endpoint=settings.a2a_weaver_base_url,
+                        name="soulsearcher-deep-research",
+                        kind="a2a",
+                        endpoint=settings.a2a_soulsearcher_base_url,
                         config={
-                            "base_url": settings.a2a_weaver_base_url,
-                            "internal_api_key": settings.a2a_weaver_internal_api_key,
-                            "auth_user_header": settings.a2a_weaver_auth_user_header,
-                            "user_id": settings.a2a_weaver_user_id,
-                            "skill_ids": ["deep-research"],
+                            "base_url": settings.a2a_soulsearcher_base_url,
+                            "internal_api_key": settings.a2a_soulsearcher_internal_api_key,
+                            "auth_user_header": settings.a2a_soulsearcher_auth_user_header,
+                            "user_id": settings.a2a_soulsearcher_user_id,
+                            "accepted_output_modes": ["text/markdown", "text/html", "application/json"],
                         },
                         enabled=True,
                         status="pending",
-                        capabilities=["deep-research", "research", "weaver"],
+                        capabilities=["deep-research", "research", "soulsearcher"],
                         skills=[
                             {
                                 "id": "deep-research",
                                 "name": "Deep Research",
-                                "description": "Delegate evidence-driven deep research to Weaver.",
-                                "tags": ["research", "deep-research", "weaver"],
+                                "description": "Delegate evidence-driven deep research to SoulSearcher over A2A 1.0.",
+                                "tags": ["research", "deep-research", "soulsearcher"],
                             }
                         ],
                     )
                 except Exception as exc:  # noqa: BLE001
-                    logger.warning("[a2a] startup Weaver connection ensure failed: {}", exc)
+                    logger.warning("[a2a] startup SoulSearcher connection ensure failed: {}", exc)
                     events.emit("a2a.bootstrap.failed", {"error": str(exc)}, severity="warning")
     cron_scheduler.schedule_missing()
     if settings.api_scheduler_enabled:

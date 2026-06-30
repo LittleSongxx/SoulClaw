@@ -33,7 +33,8 @@ def test_core_bootstrap_defaults_are_enabled() -> None:
     assert settings.dream_review_cron == "30 3 * * *"
     assert settings.dream_review_timezone == "Asia/Shanghai"
     assert settings.mcp_seed_on_startup is True
-    assert settings.a2a_bootstrap_weaver_enabled is False
+    assert settings.a2a_bootstrap_soulsearcher_enabled is False
+    assert settings.a2a_soulsearcher_base_url == "http://127.0.0.1:8001"
     assert settings.llm_provider == "openai-compatible"
 
 

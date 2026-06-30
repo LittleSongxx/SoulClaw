@@ -11,6 +11,10 @@ def dt(value: datetime | None) -> str | None:
 
 
 def wiki_page_to_dict(page) -> dict[str, Any]:
+    try:
+        confidence = max(0.0, min(1.0, float(page.confidence if page.confidence is not None else 0.0)))
+    except (TypeError, ValueError):
+        confidence = 0.0
     return {
         "id": str(page.id),
         "page_key": page.page_key,
@@ -20,7 +24,7 @@ def wiki_page_to_dict(page) -> dict[str, Any]:
         "summary": page.summary,
         "aliases": page.aliases or [],
         "tags": page.tags or [],
-        "confidence": page.confidence,
+        "confidence": confidence,
         "metadata": page.metadata_json or {},
         "updated_at": dt(page.updated_at),
     }

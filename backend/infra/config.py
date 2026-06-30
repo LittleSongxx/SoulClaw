@@ -94,11 +94,11 @@ class Settings(BaseSettings):
     gateway_webhook_nonce_cache_size: int = 200
     public_base_url: str = ""
     a2a_http_timeout_seconds: float = 60.0
-    a2a_bootstrap_weaver_enabled: bool = False
-    a2a_weaver_base_url: str = "http://127.0.0.1:8001"
-    a2a_weaver_internal_api_key: str = ""
-    a2a_weaver_auth_user_header: str = "X-Weaver-User"
-    a2a_weaver_user_id: str = "soulclaw"
+    a2a_bootstrap_soulsearcher_enabled: bool = False
+    a2a_soulsearcher_base_url: str = "http://127.0.0.1:8001"
+    a2a_soulsearcher_internal_api_key: str = ""
+    a2a_soulsearcher_auth_user_header: str = "X-SoulSearcher-User"
+    a2a_soulsearcher_user_id: str = "soulclaw"
     a2a_public_api_key: str = ""
     a2a_require_public_auth: bool = True
 

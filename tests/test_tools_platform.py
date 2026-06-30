@@ -14,7 +14,16 @@ class DummyWiki:
         del db, recent_log_lines
         return {"index": "[[index]]", "pages": []}
 
-    def search(self, db, query: str, limit: int = 10):
+    def route(self, db, query: str, limit: int = 10):
+        del db, query, limit
+        return {"strategy": "search_first", "required_fan_in": 1, "recommended_steps": ["wiki_search"], "items": []}
+
+    def browse(self, db, *, path_prefix: str = "", page_type: str = "", limit: int = 100):
+        del db, path_prefix, page_type, limit
+        return {"items": [{"page_key": "index", "source": "wiki_browse"}]}
+
+    def search(self, db, query: str, limit: int = 10, **kwargs):
+        del kwargs
         page = type("Page", (), {"page_key": "index", "title": "Index", "summary": "Summary", "path": "index.md", "tags": [], "page_type": "note", "confidence": 0.8})()
         return [
             {
@@ -28,6 +37,11 @@ class DummyWiki:
                 "confidence": 0.8,
                 "source": "page_index",
                 "score": 1.0,
+                "match_reasons": ["exact_title"],
+                "matched_fields": ["title"],
+                "snippet": "Summary",
+                "next_actions": ["wiki_read"],
+                "constraints": [],
             }
         ]
 
@@ -50,6 +64,14 @@ class DummyWiki:
 
     def compile(self, db):
         return {"status": "ok"}
+
+    def sufficiency_check(self, db, *, claim: str, read_pages, required_fan_in=None, strategy: str = ""):
+        del db, claim, required_fan_in, strategy
+        return {"sufficient": bool(read_pages), "read_pages": read_pages}
+
+    def repair(self, db, *, apply_safe: bool = True, error_ids=None):
+        del db, apply_safe, error_ids
+        return {"ok": True, "proposals_created": 0}
 
 
 class DummyMemory:
@@ -161,6 +183,7 @@ def test_wiki_search_tool_returns_page_index_shape() -> None:
     assert result["items"][0]["summary"] == "Summary"
     assert "chunk_index" not in result["items"][0]
     assert "candidate_only" not in result["items"][0]
+    assert result["items"][0]["match_reasons"] == ["exact_title"]
 
 
 def test_wiki_read_tool_returns_page_graph() -> None:
@@ -201,14 +224,31 @@ def test_tool_search_bridge_finds_tools_without_full_schema() -> None:
         "tool_describe",
         "tool_call",
         "wiki_orient",
+        "wiki_route",
+        "wiki_browse",
         "wiki_search",
         "wiki_read",
+        "wiki_follow_links",
         "memory_search",
         "skill_search",
         "skill_read",
         "wiki_sufficiency_check",
     }
     assert any(item["name"] == "wiki_search" for item in result["items"])
+
+
+def test_wiki_route_browse_and_repair_tools_are_registered() -> None:
+    registry = ToolRegistry(wiki=DummyWiki(), memory=DummyMemory(), skills=DummySkills())
+
+    route = registry.get("wiki_route").handler(None, {"query": "index"})
+    browse = registry.get("wiki_browse").handler(None, {})
+    repair_tool = registry.get("wiki_repair")
+    repair = repair_tool.handler(None, {})
+
+    assert route["strategy"] == "search_first"
+    assert browse["items"][0]["source"] == "wiki_browse"
+    assert repair_tool.requires_approval is True
+    assert repair["ok"] is True
 
 
 def test_wiki_sufficiency_requires_read_pages() -> None:

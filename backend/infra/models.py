@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Any
 
 from sqlalchemy import JSON, Boolean, DateTime, Float, Integer, String, Text, func, text
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.types import Uuid
 
@@ -34,6 +35,14 @@ def _json_default() -> Any:
 
 def _json_list_default() -> Any:
     return mapped_column(JSON, nullable=False, default=list)
+
+
+def _jsonb_list_default() -> Any:
+    return mapped_column(
+        JSON().with_variant(postgresql.JSONB(astext_type=Text()), "postgresql"),
+        nullable=False,
+        default=list,
+    )
 
 
 class User(Base, TimestampMixin):
@@ -144,8 +153,8 @@ class WikiPage(Base, TimestampMixin):
     path: Mapped[str] = mapped_column(Text, nullable=False)
     summary: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
     body: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
-    aliases: Mapped[list[str]] = _json_list_default()
-    tags: Mapped[list[str]] = _json_list_default()
+    aliases: Mapped[list[str]] = _jsonb_list_default()
+    tags: Mapped[list[str]] = _jsonb_list_default()
     confidence: Mapped[float] = mapped_column(Float, nullable=False, server_default="0.5")
     checksum: Mapped[str] = mapped_column(String(128), nullable=False, server_default="")
     metadata_json: Mapped[dict[str, Any]] = mapped_column(

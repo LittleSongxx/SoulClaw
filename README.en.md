@@ -13,7 +13,7 @@ SoulClaw is a local-first long-term personal AI agent and an A2A multi-agent orc
 
 Long-lived content is authoritative in Markdown files, while SQLite stores local state, rebuildable indexes, audit trails, background jobs, and A2A task state. Search locates pages or memories; evidence should be read through `wiki_read` or `memory_get`. Tracked templates live in `workspace_seed/`; real runtime context lives in the private local `workspace/` directory. Startup merges missing seed files without overwriting user data.
 
-A2A and MCP have separate jobs here: MCP connects tools and data sources; A2A coordinates coarse-grained specialist agents such as DeepResearch, document-project, scheduling, and coding agents that need trackable task lifecycles and artifacts. SoulClaw includes an A2A runtime, Agent Card, JSON-RPC endpoint, persistent tasks/events/artifacts, and a Weaver DeepResearch compatibility adapter.
+A2A and MCP have separate jobs here: MCP connects tools and data sources; A2A coordinates coarse-grained specialist agents such as DeepResearch, document-project, scheduling, and coding agents that need trackable task lifecycles and artifacts. SoulClaw includes an A2A 1.0 runtime, Agent Card, JSON-RPC endpoint, and persistent tasks/events/artifacts.
 
 ```mermaid
 flowchart LR
@@ -29,8 +29,7 @@ flowchart LR
     Tools --> Gateway[Gateway Runtime]
     Tools --> Approval[Approval]
     Agent --> A2A[A2A Runtime]
-    A2A --> Weaver[Weaver DeepResearch Adapter]
-    A2A --> Remote[Remote A2A Agents]
+    A2A --> Remote[Remote A2A 1.0 Agents]
     A2A --> Artifacts[A2A Tasks / Events / Artifacts]
     Dream[Dream / Reflection] --> Queue[Celery + Redis]
     Heartbeat[Heartbeat] --> Queue
@@ -54,8 +53,8 @@ flowchart LR
 | Memory | `memory_search` locates memories; `memory_get` reads them; creating memory appends to `MEMORY.md` |
 | Skills | Scan, lint, proposal apply/reject, history, and rollback |
 | Tools/MCP/Gateway | Unified tool registry and audit; risky tools require approval; gateways support inbound/send/HMAC/heartbeat status |
-| A2A multi-agent | Publishes a local Agent Card; supports JSON-RPC `message/send`, `tasks/get`, `tasks/cancel`, `tasks/resubscribe`; persists connections, tasks, events, and artifacts |
-| Weaver DeepResearch | Default connection name is `weaver-deep-research`; adapts Weaver `/api/research/sse` into DeepResearch progress, cancellation, final reports, and evidence artifacts |
+| A2A multi-agent | Publishes an A2A 1.0 Agent Card; supports JSON-RPC `SendMessage`, `SendStreamingMessage`, `GetTask`, `CancelTask`, `SubscribeToTask`, `ListTasks`; persists connections, tasks, events, and artifacts |
+| DeepResearch delegation | Default SoulSearcher connection name is `soulsearcher-deep-research`; delegates research over A2A 1.0 `SendStreamingMessage` |
 | Dream/Reflection | Runs in Celery workers and creates pending proposals; file edits require approval |
 | Heartbeat | Periodically reads `HEARTBEAT.md` Active Tasks and creates review proposals or skipped history |
 | Background jobs | Lightweight mode can trigger jobs from the API process; long-running deployments can enable Celery/Redis for `dream_review`, `heartbeat_check`, `wiki_compile`, `wiki_lint`, `skill_scan`, and `mcp_refresh` |
@@ -67,22 +66,22 @@ SoulClaw acts as an orchestrator and delegates complex work to independent agent
 
 ```text
 GET  /.well-known/agent-card.json
-GET  /.well-known/agent-card
 GET  /api/a2a/card
 POST /api/a2a
 ```
 
-`POST /api/a2a` is the public JSON-RPC endpoint. Supported methods:
+`POST /api/a2a` is the public A2A 1.0 JSON-RPC endpoint. Supported methods:
 
 ```text
-message/send
-message/stream
-tasks/get
-tasks/cancel
-tasks/resubscribe
-tasks/list
-agent/getAuthenticatedExtendedCard
+SendMessage
+SendStreamingMessage
+GetTask
+ListTasks
+CancelTask
+SubscribeToTask
+GetExtendedAgentCard
 ```
+
 
 Authenticated admin APIs:
 
@@ -97,15 +96,16 @@ POST /api/a2a/tasks/{task_id}/cancel
 GET  /api/a2a/tasks/{task_id}/events
 ```
 
-Default DeepResearch adapter settings:
+Default SoulSearcher A2A 1.0 DeepResearch settings:
 
 ```env
-SOULCLAW_A2A_BOOTSTRAP_WEAVER_ENABLED=true
-SOULCLAW_A2A_WEAVER_BASE_URL=http://127.0.0.1:8001
-SOULCLAW_A2A_WEAVER_INTERNAL_API_KEY=
-SOULCLAW_A2A_WEAVER_AUTH_USER_HEADER=X-Weaver-User
-SOULCLAW_A2A_WEAVER_USER_ID=soulclaw
+SOULCLAW_A2A_BOOTSTRAP_SOULSEARCHER_ENABLED=true
+SOULCLAW_A2A_SOULSEARCHER_BASE_URL=http://127.0.0.1:8001
+SOULCLAW_A2A_SOULSEARCHER_INTERNAL_API_KEY=
+SOULCLAW_A2A_SOULSEARCHER_AUTH_USER_HEADER=X-SoulSearcher-User
+SOULCLAW_A2A_SOULSEARCHER_USER_ID=soulclaw
 ```
+
 
 Low-risk reading and research delegation can run automatically. High-risk capabilities such as code writing, calendar changes, external sending, and document writes are routed through the Approval system.
 

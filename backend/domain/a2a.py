@@ -35,7 +35,7 @@ class A2AService:
         name = str(name or "").strip()
         if not name:
             raise ValueError("A2A connection name is required")
-        if kind not in {"a2a", "weaver"}:
+        if kind != "a2a":
             raise ValueError("unsupported A2A connection kind")
         if not endpoint and not rpc_url:
             raise ValueError("A2A connection requires endpoint or rpc_url")
@@ -222,7 +222,7 @@ class A2AService:
             mime_type=mime_type,
             content=content,
             uri=uri,
-            parts=parts or ([{"kind": "text", "text": content}] if content else []),
+            parts=parts or ([{"text": content, "mediaType": mime_type or "text/plain"}] if content else []),
             metadata_json=metadata or {},
         )
         db.add(artifact)

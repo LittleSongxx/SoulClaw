@@ -119,8 +119,11 @@ class ToolRegistry:
             "tool_describe",
             "tool_call",
             "wiki_orient",
+            "wiki_route",
+            "wiki_browse",
             "wiki_search",
             "wiki_read",
+            "wiki_follow_links",
             "memory_search",
             "skill_search",
             "skill_read",
@@ -159,8 +162,40 @@ class ToolRegistry:
         )
         self.register(
             ToolDefinition(
+                name="wiki_route",
+                description="Plan an LLM-Wiki retrieval route: search-first, browse-first, bridge, or insufficient.",
+                scope="wiki.read",
+                parameters={
+                    "type": "object",
+                    "required": ["query"],
+                    "properties": {
+                        "query": {"type": "string"},
+                        "limit": {"type": "integer"},
+                    },
+                },
+                handler=self._wiki_route,
+            )
+        )
+        self.register(
+            ToolDefinition(
+                name="wiki_browse",
+                description="Browse LLM-Wiki pages by path prefix, page type, and index-linked map.",
+                scope="wiki.read",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "path_prefix": {"type": "string"},
+                        "page_type": {"type": "string"},
+                        "limit": {"type": "integer"},
+                    },
+                },
+                handler=self._wiki_browse,
+            )
+        )
+        self.register(
+            ToolDefinition(
                 name="wiki_search",
-                description="Search the Wiki page index. Use wiki_read before relying on a page as evidence.",
+                description="Search the Wiki page index with structured ranking and FTS fallback. Use wiki_read before relying on a page as evidence.",
                 scope="wiki.read",
                 handler=self._wiki_search,
             )
@@ -200,6 +235,8 @@ class ToolRegistry:
                     "properties": {
                         "claim": {"type": "string"},
                         "read_pages": {"type": "array", "items": {"type": "string"}},
+                        "required_fan_in": {"type": "integer"},
+                        "strategy": {"type": "string"},
                     },
                 },
                 handler=self._wiki_sufficiency_check,
@@ -212,6 +249,22 @@ class ToolRegistry:
                 scope="wiki.write",
                 requires_approval=False,
                 handler=self._wiki_lint,
+            )
+        )
+        self.register(
+            ToolDefinition(
+                name="wiki_repair",
+                description="Repair low-risk LLM-Wiki structure issues and create review proposals for high-risk Error Book items.",
+                scope="wiki.write",
+                requires_approval=True,
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "apply_safe": {"type": "boolean"},
+                        "error_ids": {"type": "array", "items": {"type": "string"}},
+                    },
+                },
+                handler=self._wiki_repair,
             )
         )
         self.register(
@@ -412,6 +465,21 @@ class ToolRegistry:
     def _wiki_orient(self, db: Session, arguments: dict[str, Any]) -> dict[str, Any]:
         return self.wiki.orientation(db, recent_log_lines=int(arguments.get("recent_log_lines") or 40))
 
+    def _wiki_route(self, db: Session, arguments: dict[str, Any]) -> dict[str, Any]:
+        return self.wiki.route(
+            db,
+            str(arguments.get("query") or ""),
+            limit=int(arguments.get("limit") or 10),
+        )
+
+    def _wiki_browse(self, db: Session, arguments: dict[str, Any]) -> dict[str, Any]:
+        return self.wiki.browse(
+            db,
+            path_prefix=str(arguments.get("path_prefix") or ""),
+            page_type=str(arguments.get("page_type") or ""),
+            limit=int(arguments.get("limit") or 100),
+        )
+
     def _wiki_search(self, db: Session, arguments: dict[str, Any]) -> dict[str, Any]:
         query = str(arguments.get("query") or "")
         limit = int(arguments.get("limit") or 10)
@@ -427,8 +495,20 @@ class ToolRegistry:
                     "confidence": item.get("confidence", 0.5),
                     "source": item["source"],
                     "score": item["score"],
+                    "match_reasons": item.get("match_reasons", []),
+                    "matched_fields": item.get("matched_fields", []),
+                    "snippet": item.get("snippet", ""),
+                    "next_actions": item.get("next_actions", []),
+                    "constraints": item.get("constraints", []),
                 }
-                for item in self.wiki.search(db, query, limit=limit)
+                for item in self.wiki.search(
+                    db,
+                    query,
+                    limit=limit,
+                    strategy=str(arguments.get("strategy") or ""),
+                    path_prefix=str(arguments.get("path_prefix") or ""),
+                    include_constraints=bool(arguments.get("include_constraints", False)),
+                )
             ]
         }
 
@@ -459,16 +539,15 @@ class ToolRegistry:
         }
 
     def _wiki_sufficiency_check(self, db: Session, arguments: dict[str, Any]) -> dict[str, Any]:
-        del db
         read_pages = [str(item).strip() for item in arguments.get("read_pages", []) if str(item).strip()] if isinstance(arguments.get("read_pages"), list) else []
-        sufficient = bool(read_pages)
-        return {
-            "sufficient": sufficient,
-            "read_pages": read_pages,
-            "claim": str(arguments.get("claim") or ""),
-            "requirement": "Use wiki_read page bodies before answering Wiki-backed facts.",
-            "next_action": "" if sufficient else "Call wiki_read for at least one relevant page or state that evidence is insufficient.",
-        }
+        required = arguments.get("required_fan_in")
+        return self.wiki.sufficiency_check(
+            db,
+            claim=str(arguments.get("claim") or ""),
+            read_pages=read_pages,
+            required_fan_in=int(required) if required is not None else None,
+            strategy=str(arguments.get("strategy") or ""),
+        )
 
     def _wiki_compile(self, db: Session, arguments: dict[str, Any]) -> dict[str, Any]:
         return self.wiki.compile(db)
@@ -476,6 +555,14 @@ class ToolRegistry:
     def _wiki_lint(self, db: Session, arguments: dict[str, Any]) -> dict[str, Any]:
         del arguments
         return self.wiki.lint(db)
+
+    def _wiki_repair(self, db: Session, arguments: dict[str, Any]) -> dict[str, Any]:
+        error_ids = arguments.get("error_ids") if isinstance(arguments.get("error_ids"), list) else []
+        return self.wiki.repair(
+            db,
+            apply_safe=bool(arguments.get("apply_safe", False)),
+            error_ids=[str(item) for item in error_ids],
+        )
 
     def _memory_search(self, db: Session, arguments: dict[str, Any]) -> dict[str, Any]:
         query = str(arguments.get("query") or "")
