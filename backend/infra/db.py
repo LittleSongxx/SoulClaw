@@ -151,6 +151,11 @@ def _ensure_sqlite_additive_schema(engine: Engine) -> None:
             ("source_refs", "JSON NOT NULL DEFAULT '[]'"),
             ("lifecycle_status", "VARCHAR(32) NOT NULL DEFAULT 'open'"),
         ],
+        "wiki_pages": [
+            ("claims", "JSON NOT NULL DEFAULT '[]'"),
+            ("source_refs", "JSON NOT NULL DEFAULT '[]'"),
+            ("stale_after", "DATETIME"),
+        ],
         "memories": [
             ("status", "VARCHAR(32) NOT NULL DEFAULT 'active'"),
             ("superseded_by", "CHAR(32)"),
@@ -173,6 +178,33 @@ def _ensure_sqlite_additive_schema(engine: Engine) -> None:
             ("health_status", "VARCHAR(32) NOT NULL DEFAULT 'unknown'"),
             ("last_imported_checksum", "VARCHAR(128) NOT NULL DEFAULT ''"),
         ],
+        "evolution_proposals": [
+            ("target_checksum", "VARCHAR(128) NOT NULL DEFAULT ''"),
+            ("stale_reason", "TEXT NOT NULL DEFAULT ''"),
+        ],
+        "background_jobs": [
+            ("trace_id", "VARCHAR(128) NOT NULL DEFAULT ''"),
+            ("request_id", "VARCHAR(128) NOT NULL DEFAULT ''"),
+            ("idempotency_key", "VARCHAR(256) NOT NULL DEFAULT ''"),
+            ("attempt_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("max_attempts", "INTEGER NOT NULL DEFAULT 3"),
+            ("next_retry_at", "DATETIME"),
+            ("locked_at", "DATETIME"),
+            ("lock_owner", "VARCHAR(128) NOT NULL DEFAULT ''"),
+            ("dead_letter_reason", "TEXT NOT NULL DEFAULT ''"),
+        ],
+        "cron_jobs": [
+            ("backoff_until", "DATETIME"),
+            ("last_enqueue_key", "VARCHAR(256) NOT NULL DEFAULT ''"),
+        ],
+        "runtime_events": [
+            ("trace_id", "VARCHAR(128) NOT NULL DEFAULT ''"),
+            ("request_id", "VARCHAR(128) NOT NULL DEFAULT ''"),
+        ],
+        "audit_events": [
+            ("trace_id", "VARCHAR(128) NOT NULL DEFAULT ''"),
+            ("request_id", "VARCHAR(128) NOT NULL DEFAULT ''"),
+        ],
     }
     inspector = inspect(engine)
     table_names = set(inspector.get_table_names())
@@ -184,3 +216,89 @@ def _ensure_sqlite_additive_schema(engine: Engine) -> None:
             for column_name, ddl in table_columns:
                 if column_name not in existing:
                     connection.exec_driver_sql(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {ddl}")
+        _ensure_sqlite_index(connection, inspector, "runtime_events", "ix_runtime_events_trace_id", "trace_id")
+        _ensure_sqlite_index(connection, inspector, "runtime_events", "ix_runtime_events_request_id", "request_id")
+        _ensure_sqlite_index(connection, inspector, "audit_events", "ix_audit_events_trace_id", "trace_id")
+        _ensure_sqlite_index(connection, inspector, "audit_events", "ix_audit_events_request_id", "request_id")
+        _ensure_sqlite_index(connection, inspector, "background_jobs", "ix_background_jobs_trace_id", "trace_id")
+        _ensure_sqlite_index(connection, inspector, "background_jobs", "ix_background_jobs_request_id", "request_id")
+        if "memory_history" not in table_names:
+            connection.exec_driver_sql(
+                """
+                CREATE TABLE memory_history (
+                    id CHAR(32) NOT NULL,
+                    memory_id CHAR(32),
+                    action VARCHAR(64) NOT NULL,
+                    before_snapshot JSON NOT NULL DEFAULT '{}',
+                    after_snapshot JSON NOT NULL DEFAULT '{}',
+                    actor VARCHAR(80) NOT NULL DEFAULT 'system',
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (id)
+                )
+                """
+            )
+            connection.exec_driver_sql("CREATE INDEX ix_memory_history_memory_id ON memory_history(memory_id)")
+            connection.exec_driver_sql("CREATE INDEX ix_memory_history_action ON memory_history(action)")
+            connection.exec_driver_sql("CREATE INDEX ix_memory_history_actor ON memory_history(actor)")
+            connection.exec_driver_sql("CREATE INDEX ix_memory_history_created_at ON memory_history(created_at)")
+        if "outbox_messages" not in table_names:
+            connection.exec_driver_sql(
+                """
+                CREATE TABLE outbox_messages (
+                    id CHAR(32) NOT NULL,
+                    trace_id VARCHAR(128) NOT NULL DEFAULT '',
+                    request_id VARCHAR(128) NOT NULL DEFAULT '',
+                    topic VARCHAR(128) NOT NULL,
+                    aggregate_type VARCHAR(64) NOT NULL,
+                    aggregate_id VARCHAR(128) NOT NULL,
+                    idempotency_key VARCHAR(256) NOT NULL DEFAULT '',
+                    status VARCHAR(32) NOT NULL DEFAULT 'pending',
+                    payload JSON NOT NULL DEFAULT '{}',
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    max_attempts INTEGER NOT NULL DEFAULT 5,
+                    next_attempt_at DATETIME,
+                    last_error TEXT NOT NULL DEFAULT '',
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    dispatched_at DATETIME,
+                    PRIMARY KEY (id)
+                )
+                """
+            )
+            connection.exec_driver_sql("CREATE INDEX ix_outbox_messages_trace_id ON outbox_messages(trace_id)")
+            connection.exec_driver_sql("CREATE INDEX ix_outbox_messages_request_id ON outbox_messages(request_id)")
+            connection.exec_driver_sql("CREATE UNIQUE INDEX uq_outbox_messages_idempotency_key ON outbox_messages(idempotency_key)")
+            connection.exec_driver_sql("CREATE INDEX ix_outbox_messages_topic ON outbox_messages(topic)")
+            connection.exec_driver_sql("CREATE INDEX ix_outbox_messages_aggregate_type ON outbox_messages(aggregate_type)")
+            connection.exec_driver_sql("CREATE INDEX ix_outbox_messages_aggregate_id ON outbox_messages(aggregate_id)")
+            connection.exec_driver_sql("CREATE INDEX ix_outbox_messages_status ON outbox_messages(status)")
+            connection.exec_driver_sql("CREATE INDEX ix_outbox_messages_next_attempt_at ON outbox_messages(next_attempt_at)")
+            connection.exec_driver_sql("CREATE INDEX ix_outbox_messages_created_at ON outbox_messages(created_at)")
+        if "idempotency_records" not in table_names:
+            connection.exec_driver_sql(
+                """
+                CREATE TABLE idempotency_records (
+                    id CHAR(32) NOT NULL,
+                    scope VARCHAR(128) NOT NULL,
+                    idempotency_key VARCHAR(256) NOT NULL,
+                    request_hash VARCHAR(128) NOT NULL DEFAULT '',
+                    status VARCHAR(32) NOT NULL DEFAULT 'processing',
+                    response JSON NOT NULL DEFAULT '{}',
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    expires_at DATETIME,
+                    PRIMARY KEY (id)
+                )
+                """
+            )
+            connection.exec_driver_sql("CREATE UNIQUE INDEX uq_idempotency_scope_key ON idempotency_records(scope, idempotency_key)")
+            connection.exec_driver_sql("CREATE INDEX ix_idempotency_records_scope ON idempotency_records(scope)")
+            connection.exec_driver_sql("CREATE INDEX ix_idempotency_records_idempotency_key ON idempotency_records(idempotency_key)")
+            connection.exec_driver_sql("CREATE INDEX ix_idempotency_records_status ON idempotency_records(status)")
+            connection.exec_driver_sql("CREATE INDEX ix_idempotency_records_created_at ON idempotency_records(created_at)")
+            connection.exec_driver_sql("CREATE INDEX ix_idempotency_records_expires_at ON idempotency_records(expires_at)")
+
+
+def _ensure_sqlite_index(connection, inspector, table_name: str, index_name: str, column_name: str) -> None:
+    if table_name not in inspector.get_table_names():
+        return
+    connection.exec_driver_sql(f"CREATE INDEX IF NOT EXISTS {index_name} ON {table_name}({column_name})")

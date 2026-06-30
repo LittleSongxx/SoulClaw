@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from backend.api.admin.deps import get_current_user, get_db, get_memory_service
-from backend.api.admin.serializers import conflict_to_dict, memory_to_dict, probe_to_dict
+from backend.api.admin.serializers import conflict_to_dict, memory_history_to_dict, memory_to_dict, probe_to_dict
 from backend.domain.memory import MemoryService
 
 router = APIRouter(prefix="/api/memory", tags=["memory"], dependencies=[Depends(get_current_user)])
@@ -50,6 +50,10 @@ class ProbeCreateRequest(BaseModel):
     expected: str = ""
 
 
+class MemoryRestoreRequest(BaseModel):
+    history_id: uuid.UUID
+
+
 @router.get("")
 def list_memory(
     kind: str | None = None,
@@ -82,6 +86,8 @@ def search_memory(
             {
                 "score": item["score"],
                 "source": item["source"],
+                "match_reasons": item.get("match_reasons", []),
+                "snippet": item.get("snippet", ""),
                 "id": str(item["memory"].id),
                 "kind": item["memory"].kind,
                 "summary": item["memory"].content[:500],
@@ -90,6 +96,31 @@ def search_memory(
             for item in service.search(db, payload.query, limit=payload.limit)
         ]
     }
+
+
+@router.get("/search/status")
+def search_status(
+    db: Session = Depends(get_db),
+    service: MemoryService = Depends(get_memory_service),
+) -> dict:
+    return service.fts_status(db)
+
+
+@router.post("/search/refresh")
+def refresh_search_index(
+    db: Session = Depends(get_db),
+    service: MemoryService = Depends(get_memory_service),
+) -> dict:
+    return service.refresh_fts(db)
+
+
+@router.get("/governance")
+def governance(
+    budget_chars: int = 12000,
+    db: Session = Depends(get_db),
+    service: MemoryService = Depends(get_memory_service),
+) -> dict:
+    return service.governance_status(db, budget_chars=budget_chars)
 
 
 @router.post("/sync")
@@ -110,6 +141,30 @@ def get_memory(
     if memory is None:
         raise HTTPException(status_code=404, detail="memory not found")
     return memory_to_dict(memory)
+
+
+@router.get("/history")
+def history(
+    memory_id: uuid.UUID | None = None,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+    service: MemoryService = Depends(get_memory_service),
+) -> dict:
+    return {"items": [memory_history_to_dict(item) for item in service.history(db, memory_id=memory_id, limit=limit)]}
+
+
+@router.post("/restore")
+def restore(
+    payload: MemoryRestoreRequest,
+    db: Session = Depends(get_db),
+    service: MemoryService = Depends(get_memory_service),
+) -> dict:
+    try:
+        return memory_to_dict(service.restore(db, payload.history_id))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/{memory_id}/supersede")

@@ -24,6 +24,7 @@ from backend.domain.tools import ToolDefinition
 from backend.infra.db import session_scope
 from backend.infra.events import RuntimeEventBus
 from backend.infra.models import MCPServer
+from backend.infra.resilience import ResilienceManager, ResiliencePolicy
 
 
 @dataclass(frozen=True)
@@ -84,10 +85,34 @@ class MCPRuntimeManager:
         events: RuntimeEventBus,
         discovery_timeout_seconds: float = 12.0,
         call_timeout_seconds: float = 60.0,
+        resilience: ResilienceManager | None = None,
     ) -> None:
         self.events = events
         self.discovery_timeout_seconds = discovery_timeout_seconds
         self.call_timeout_seconds = call_timeout_seconds
+        self.resilience = resilience or ResilienceManager(events=events)
+        self.discovery_policy = ResiliencePolicy(
+            name="mcp.discovery",
+            max_attempts=2,
+            base_delay_seconds=0.5,
+            max_delay_seconds=3.0,
+            failure_threshold=5,
+            recovery_seconds=45.0,
+        )
+        self.tool_policy = ResiliencePolicy(
+            name="mcp.tool_call",
+            max_attempts=2,
+            base_delay_seconds=0.5,
+            max_delay_seconds=4.0,
+            failure_threshold=5,
+            recovery_seconds=60.0,
+        )
+        self.write_tool_policy = ResiliencePolicy(
+            name="mcp.tool_call.write_once",
+            max_attempts=1,
+            failure_threshold=5,
+            recovery_seconds=60.0,
+        )
 
     async def refresh_all(self) -> dict[str, Any]:
         with session_scope() as db:
@@ -112,9 +137,9 @@ class MCPRuntimeManager:
             return self._persist_status(server_name, status="disabled", tools=[], error="")
 
         try:
-            descriptors = await asyncio.wait_for(
-                self._discover(config),
-                timeout=self.discovery_timeout_seconds,
+            descriptors = await self.resilience.async_call(
+                self.discovery_policy,
+                lambda: asyncio.wait_for(self._discover(config), timeout=self.discovery_timeout_seconds),
             )
         except Exception as exc:  # noqa: BLE001
             error = str(exc)
@@ -161,14 +186,13 @@ class MCPRuntimeManager:
             if not server.enabled:
                 raise RuntimeError(f"MCP server disabled: {server_name}")
             config = _server_config(server)
+            permission = _tool_permission(config, tool_name)
         self.events.emit("mcp.tool.started", {"server": server_name, "tool": tool_name})
         try:
-            async with self._client_session(config) as session:
-                result = await session.call_tool(
-                    tool_name,
-                    arguments or {},
-                    read_timeout_seconds=timedelta(seconds=self.call_timeout_seconds),
-                )
+            result = await self.resilience.async_call(
+                self.tool_policy if permission in {"safe", "read"} else self.write_tool_policy,
+                lambda: self._call_tool_once(config, tool_name, arguments or {}),
+            )
         except Exception as exc:  # noqa: BLE001
             self.events.emit(
                 "mcp.tool.failed",
@@ -179,6 +203,17 @@ class MCPRuntimeManager:
         payload = serialize_mcp_result(result)
         self.events.emit("mcp.tool.succeeded", {"server": server_name, "tool": tool_name})
         return payload
+
+    async def _call_tool_once(self, config: dict[str, Any], tool_name: str, arguments: dict[str, Any]):
+        async with self._client_session(config) as session:
+            return await session.call_tool(
+                tool_name,
+                arguments,
+                read_timeout_seconds=timedelta(seconds=self.call_timeout_seconds),
+            )
+
+    def resilience_state(self) -> dict[str, Any]:
+        return self.resilience.state()
 
     async def _discover(self, config: dict[str, Any]) -> list[MCPToolDescriptor]:
         async with self._client_session(config) as session:
@@ -321,14 +356,16 @@ def _server_config(server: MCPServer) -> dict[str, Any]:
 
 def _permission_overrides(config: dict[str, Any]) -> dict[str, str]:
     tools = config.get("tools")
-    if not isinstance(tools, dict):
-        return {}
-    overrides = tools.get("override_permission")
+    overrides = tools.get("override_permission") if isinstance(tools, dict) else None
     if not isinstance(overrides, dict) and isinstance(config.get("permission_policy"), dict):
         overrides = config["permission_policy"].get("override_permission")
     if not isinstance(overrides, dict):
         return {}
     return {str(key): str(value) for key, value in overrides.items()}
+
+
+def _tool_permission(config: dict[str, Any], tool_name: str) -> str:
+    return str(_permission_overrides(config).get(tool_name) or "write").lower()
 
 
 def normalize_json_schema(schema: dict[str, Any]) -> dict[str, Any]:

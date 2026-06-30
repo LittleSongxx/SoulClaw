@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 
 from .db import session_scope
 from .models import AuditEvent, RuntimeEvent
+from .trace import current_request_id, current_trace_id
 
 
 class RuntimeEventBus:
@@ -60,6 +61,8 @@ class RuntimeEventBus:
                 session_id=session_id,
                 turn_id=turn_id,
                 payload=_jsonable(payload),
+                trace_id=current_trace_id(),
+                request_id=current_request_id(),
             )
             bound = self._bound_session.get()
             if bound is not None:
@@ -86,6 +89,8 @@ class RuntimeEventBus:
                 target_type=target_type,
                 target_id=target_id,
                 payload=_jsonable(payload),
+                trace_id=current_trace_id(),
+                request_id=current_request_id(),
             )
             bound = self._bound_session.get()
             if bound is not None:

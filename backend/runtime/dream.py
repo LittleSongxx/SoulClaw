@@ -193,8 +193,19 @@ class DreamRuntime:
             "  - memory_get\n"
             "test_cases:\n"
             "  - name: manifest-lint\n"
-            "    input: Validate this generated skill proposal.\n"
-            "    expected: Required checks pass before apply.\n"
+            "    kind: lint\n"
+            "  - name: required retrieval tools\n"
+            "    kind: mock_tool\n"
+            "    required_tools:\n"
+            "      - wiki_search\n"
+            "      - wiki_read\n"
+            "      - memory_search\n"
+            "      - memory_get\n"
+            "  - name: regression unsafe commands absent\n"
+            "    kind: regression\n"
+            "    must_not_contain:\n"
+            "      - git reset --hard\n"
+            "      - rm -rf /\n"
             "---\n\n"
             f"# Dream Review - {title}\n\n"
             "## Trigger Evidence\n\n"
@@ -213,7 +224,7 @@ class DreamRuntime:
                 "frontmatter",
                 "required_tools",
                 "static_safety_scan",
-                "manifest_test_cases",
+                "safe_manifest_test_cases",
                 "human_review_before_apply",
             ],
         }

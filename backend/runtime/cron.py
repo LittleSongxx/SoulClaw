@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 from contextlib import nullcontext
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from loguru import logger
 from sqlalchemy import select
@@ -71,11 +73,14 @@ class CronScheduler:
         with session_scope() as db:
             bind_session = getattr(self.events, "bind_session", None)
             with bind_session(db) if bind_session is not None else nullcontext():
+                self.jobs.dispatch_outbox(db, limit=100)
+                self._dispatch_retryable_jobs(db, now=now)
                 jobs = list(
                     db.scalars(
                         select(CronJob)
                         .where(CronJob.enabled.is_(True))
                         .where((CronJob.next_run_at.is_(None)) | (CronJob.next_run_at <= now))
+                        .where((CronJob.backoff_until.is_(None)) | (CronJob.backoff_until <= now))
                         .order_by(CronJob.next_run_at.asc().nullsfirst(), CronJob.name)
                         .limit(limit)
                         .with_for_update(skip_locked=True)
@@ -95,6 +100,7 @@ class CronScheduler:
 
     def _run_job(self, db, job: CronJob, *, now: datetime) -> None:
         self.events.emit("cron.job.started", {"job_id": str(job.id), "name": job.name}, session_id=f"cron:{job.name}")
+        enqueue_key = _cron_enqueue_key(job, now)
         try:
             if self._is_dream_review_job(job):
                 background = enqueue_background_job(
@@ -107,6 +113,7 @@ class CronScheduler:
                     triggered_by=f"cron:{job.name}",
                     cron_job_id=job.id,
                     service=self.jobs,
+                    idempotency_key=enqueue_key,
                 )
                 result_payload = {
                     "mode": "enqueue",
@@ -121,6 +128,7 @@ class CronScheduler:
                     triggered_by=f"cron:{job.name}",
                     cron_job_id=job.id,
                     service=self.jobs,
+                    idempotency_key=enqueue_key,
                 )
                 result_payload = {
                     "mode": "enqueue",
@@ -135,12 +143,14 @@ class CronScheduler:
                     triggered_by=f"cron:{job.name}",
                     cron_job_id=job.id,
                     service=self.jobs,
+                    idempotency_key=enqueue_key,
                 )
                 result_payload = {"mode": "enqueue", "task_name": background.task_name, "job_id": str(background.id)}
         except Exception as exc:  # noqa: BLE001
             job.last_status = "failed"
             job.failure_count = int(job.failure_count or 0) + 1
             job.last_result = {"error": str(exc)}
+            job.backoff_until = now + timedelta(seconds=_cron_backoff_seconds(int(job.failure_count or 0)))
             self.events.emit(
                 "cron.job.failed",
                 {"job_id": str(job.id), "name": job.name, "error": str(exc)},
@@ -150,6 +160,8 @@ class CronScheduler:
         else:
             job.last_status = "succeeded"
             job.last_result = result_payload
+            job.backoff_until = None
+            job.last_enqueue_key = enqueue_key
             self.events.emit(
                 "cron.job.succeeded",
                 {"job_id": str(job.id), "name": job.name, "mode": result_payload.get("mode", "agent_turn")},
@@ -160,6 +172,12 @@ class CronScheduler:
             job.run_count = int(job.run_count or 0) + 1
             job.next_run_at = compute_next_run(job.cron_expr, job.timezone, base=now)
 
+    def _dispatch_retryable_jobs(self, db, *, now: datetime) -> int:
+        ready = self.jobs.ready_for_retry(db, now=now, limit=100)
+        for job in ready:
+            self.jobs.reschedule_job(db, job, reason=f"retry:{int(job.attempt_count or 0)}")
+        return len(ready)
+
     @staticmethod
     def _is_dream_review_job(job: CronJob) -> bool:
         metadata = job.metadata_json or {}
@@ -169,3 +187,19 @@ class CronScheduler:
     def _is_heartbeat_job(job: CronJob) -> bool:
         metadata = job.metadata_json or {}
         return metadata.get("system_task") == "heartbeat"
+
+
+def _cron_enqueue_key(job: CronJob, now: datetime) -> str:
+    window = now.replace(second=0, microsecond=0).isoformat()
+    payload = {
+        "cron_job_id": str(job.id),
+        "name": job.name,
+        "window": window,
+        "metadata": job.metadata_json or {},
+    }
+    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+    return f"cron:{job.name}:{hashlib.sha256(raw.encode('utf-8')).hexdigest()}"
+
+
+def _cron_backoff_seconds(failure_count: int) -> int:
+    return min(900, 2 ** min(max(1, failure_count), 10))

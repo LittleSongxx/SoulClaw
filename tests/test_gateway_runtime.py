@@ -7,6 +7,7 @@ import uuid
 from contextlib import contextmanager
 
 import pytest
+import httpx
 
 from backend.runtime.gateway import (
     GatewayRuntimeManager,
@@ -149,3 +150,40 @@ def test_gateway_public_webhook_requires_timestamp_nonce_and_blocks_replay(monke
     assert manager.handle_inbound(message)["answer"] == "reply: hello"
     with pytest.raises(RuntimeError):
         manager.handle_inbound(message)
+
+
+def test_gateway_webhook_send_uses_idempotency_key_header(monkeypatch: pytest.MonkeyPatch) -> None:
+    gateway = DummyGateway(kind="webhook")
+    gateway.endpoint = "https://hooks.example.test/send"
+    monkeypatch.setattr("backend.runtime.gateway.session_scope", lambda: fake_session_scope(gateway))
+    seen = {}
+
+    class FakeClient:
+        def __init__(self, timeout):
+            self.timeout = timeout
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, url, json=None, headers=None):
+            seen["url"] = url
+            seen["headers"] = headers or {}
+            return httpx.Response(200, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr("backend.runtime.gateway.httpx.Client", FakeClient)
+    manager = GatewayRuntimeManager(agent=DummyAgent(), events=DummyEvents())
+
+    result = manager.send(
+        OutboundGatewayMessage(
+            gateway_name="local",
+            target_id="",
+            text="hi",
+            metadata={"idempotency_key": "msg-1"},
+        )
+    )
+
+    assert result["status_code"] == 200
+    assert seen["headers"]["Idempotency-Key"] == "msg-1"

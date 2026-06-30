@@ -14,6 +14,9 @@ from backend.domain.workspace import WorkspaceService
 from backend.infra.events import RuntimeEventBus
 from backend.infra.models import Approval
 from backend.runtime.a2a import A2ADelegateRequest, A2ARuntimeManager
+from backend.infra.rate_limit import RateLimitExceeded
+from backend.infra.resilience import CircuitOpenError
+from backend.infra.trace import current_trace_id
 from backend.runtime.llm import OpenAICompatibleClient
 
 
@@ -225,7 +228,7 @@ class AgentRuntime:
                         content=json.dumps(tool_results[-1], ensure_ascii=False, default=str)[:4000],
                         metadata={"tool_name": call.get("name") or call.get("tool_name")},
                     )
-        answer = llm_answer or self._fallback_answer(wiki_hits, memory_context, tool_results)
+        answer = llm_answer or self._degraded_answer(llm_status) or self._fallback_answer(wiki_hits, memory_context, tool_results)
         self.events.emit(
             "agent.node.final_answer",
             {"llm_status": llm_status, "tool_results": len(tool_results), "answer_preview": answer[:200]},
@@ -284,6 +287,7 @@ class AgentRuntime:
             "tools": tool_results,
             "a2a": delegated_result or {},
             "llm": {"status": llm_status, "tool_calls": inferred_tool_calls, "wiki_read_used": wiki_read_used},
+            "trace": {"trace_id": current_trace_id()},
             "turn": {
                 "status": turn_status,
                 "approval_id": approval_id,
@@ -604,6 +608,12 @@ class AgentRuntime:
         max_rounds = 4
         try:
             response = self.llm.complete(messages=messages, tools=tools)
+        except RateLimitExceeded as exc:
+            self.events.emit("llm.rate_limited", {"policy": exc.policy, "retry_after": exc.retry_after}, severity="warning")
+            return "", [], "rate_limited", messages, []
+        except CircuitOpenError as exc:
+            self.events.emit("llm.circuit_open", {"error": str(exc)}, severity="warning")
+            return "", [], "circuit_open", messages, []
         except Exception as exc:  # noqa: BLE001
             self.events.emit("llm.failed", {"error": str(exc)}, severity="warning")
             return "", [], "failed", messages, []
@@ -654,6 +664,12 @@ class AgentRuntime:
             messages = self._append_tool_messages(messages, calls, round_results)
             try:
                 response = self.llm.complete(messages=messages, tools=tools)
+            except RateLimitExceeded as exc:
+                self.events.emit("llm.tool_loop.rate_limited", {"policy": exc.policy, "retry_after": exc.retry_after}, severity="warning")
+                return "", all_calls, "rate_limited", messages, tool_results
+            except CircuitOpenError as exc:
+                self.events.emit("llm.tool_loop.circuit_open", {"error": str(exc)}, severity="warning")
+                return "", all_calls, "circuit_open", messages, tool_results
             except Exception as exc:  # noqa: BLE001
                 self.events.emit("llm.tool_loop.failed", {"error": str(exc)}, severity="warning")
                 return "", all_calls, "failed", messages, tool_results
@@ -916,3 +932,12 @@ class AgentRuntime:
         if tool_results:
             parts.append(f"Executed {len(tool_results)} tool call(s).")
         return " ".join(parts)
+
+    @staticmethod
+    def _degraded_answer(llm_status: str) -> str:
+        messages = {
+            "failed": "The model call failed. The turn was recorded with trace context for troubleshooting.",
+            "rate_limited": "The model call was rate limited. Please retry after the configured cooldown window.",
+            "circuit_open": "The model circuit breaker is open. Please retry after the recovery window.",
+        }
+        return messages.get(llm_status, "")

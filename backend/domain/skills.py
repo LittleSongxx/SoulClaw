@@ -27,6 +27,10 @@ FORBIDDEN_PATTERNS = (
     r"chmod\s+-R\s+777\s+/",
     r"mkfs\.",
 )
+MAX_SKILL_FILES = 12
+MAX_SKILL_FILE_BYTES = 64 * 1024
+MAX_SKILL_TOTAL_BYTES = 256 * 1024
+ALLOWED_TEST_KINDS = {"lint", "golden_prompt", "mock_tool", "regression"}
 
 
 def normalize_skill_key(value: str) -> str:
@@ -39,6 +43,16 @@ def normalize_skill_key(value: str) -> str:
 
 def checksum(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def snapshot_checksum(files: dict[str, str]) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(files):
+        digest.update(path.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(files[path].encode("utf-8"))
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def parse_skill_markdown(text: str) -> tuple[dict[str, Any], str]:
@@ -178,6 +192,9 @@ class SkillService:
     def lint_files(self, files: dict[str, str]) -> SkillLintResult:
         errors: list[str] = []
         warnings: list[str] = []
+        total_bytes = 0
+        if len(files) > MAX_SKILL_FILES:
+            errors.append(f"too many skill files: {len(files)} > {MAX_SKILL_FILES}")
         if "SKILL.md" not in files:
             errors.append("SKILL.md is required")
             metadata: dict[str, Any] = {}
@@ -189,14 +206,27 @@ class SkillService:
             except Exception as exc:  # noqa: BLE001
                 errors.append(str(exc))
                 metadata = {}
+                body = files.get("SKILL.md", "")
 
         for path, content in files.items():
             normalized = Path(path)
             if normalized.is_absolute() or ".." in normalized.parts:
                 errors.append(f"unsafe file path: {path}")
+            if any(part.startswith(".") for part in normalized.parts):
+                errors.append(f"hidden skill file path is not allowed: {path}")
+            size = len(content.encode("utf-8"))
+            total_bytes += size
+            if size > MAX_SKILL_FILE_BYTES:
+                errors.append(f"skill file too large: {path}")
+            scan_content = content
+            if path == "SKILL.md":
+                safety_metadata = {key: value for key, value in metadata.items() if key not in {"test_cases", "tests"}}
+                scan_content = yaml.safe_dump(safety_metadata, allow_unicode=True, sort_keys=True) + "\n" + body
             for pattern in FORBIDDEN_PATTERNS:
-                if re.search(pattern, content):
+                if re.search(pattern, scan_content):
                     errors.append(f"forbidden unsafe pattern `{pattern}` in {path}")
+        if total_bytes > MAX_SKILL_TOTAL_BYTES:
+            errors.append(f"skill files exceed total size budget: {total_bytes} > {MAX_SKILL_TOTAL_BYTES}")
 
         required_tools = metadata.get("required_tools") or metadata.get("tools") or []
         if isinstance(required_tools, str):
@@ -208,9 +238,16 @@ class SkillService:
         if tests and not isinstance(tests, list):
             errors.append("test_cases/tests must be a list")
             tests = []
+        normalized_tests: list[dict[str, Any]] = []
+        for index, test in enumerate(tests):
+            spec = test if isinstance(test, dict) else {"name": f"case-{index + 1}", "input": test}
+            kind = str(spec.get("kind") or ("golden_prompt" if spec.get("input") or spec.get("expected") else "lint"))
+            if kind not in ALLOWED_TEST_KINDS:
+                errors.append(f"unsupported test kind `{kind}`")
+            normalized_tests.append({**spec, "kind": kind, "name": str(spec.get("name") or f"case-{index + 1}")})
         if not tests:
             warnings.append("No manifest test cases declared")
-        return SkillLintResult(ok=not errors, errors=errors, warnings=warnings, tests=list(tests))
+        return SkillLintResult(ok=not errors, errors=errors, warnings=warnings, tests=normalized_tests)
 
     def test(self, db: Session, skill_key: str) -> dict[str, Any]:
         key = normalize_skill_key(skill_key)
@@ -220,18 +257,20 @@ class SkillService:
             if skill:
                 files = self._read_skill_files(Path(skill.path))
         result = self.lint_files(files)
+        case_results = [self._run_test_case(spec, files, lint=result) for spec in result.tests]
+        all_cases_passed = all(item["status"] == "passed" for item in case_results)
         payload = {
-            "ok": result.ok,
+            "ok": result.ok and all_cases_passed,
             "errors": result.errors,
             "warnings": result.warnings,
-            "tests": result.tests,
-            "required_checks": ["frontmatter", "required_tools", "static_safety_scan", "manifest_test_cases"],
+            "tests": case_results,
+            "required_checks": ["frontmatter", "required_tools", "static_safety_scan", "safe_manifest_test_cases"],
         }
         test_record = SkillTest(
             skill_key=key,
-            name="manifest-lint",
-            spec={"kind": "lint"},
-            last_status="passed" if result.ok else "failed",
+            name="skill-test-suite",
+            spec={"kind": "suite", "checksum": snapshot_checksum(files)},
+            last_status="passed" if payload["ok"] else "failed",
             last_result=payload,
             last_run_at=datetime.now(UTC),
         )
@@ -248,6 +287,19 @@ class SkillService:
         evidence: dict[str, Any] | None = None,
         risk_level: str = "medium",
     ) -> EvolutionProposal:
+        payload = dict(payload)
+        target_checksum = ""
+        before_snapshot: dict[str, Any] = {}
+        if target_type == "skill":
+            skill_key = normalize_skill_key(str(payload.get("skill_key") or ""))
+            files = payload.get("files")
+            if skill_key and isinstance(files, dict):
+                current = self._snapshot(self._safe_skill_dir(skill_key))
+                proposed = {str(path): str(content) for path, content in files.items()}
+                target_checksum = snapshot_checksum(current)
+                before_snapshot = {"files": current, "checksum": target_checksum}
+                payload.setdefault("base_checksum", target_checksum)
+                payload.setdefault("diff", self._diff_summary(current, proposed))
         proposal = EvolutionProposal(
             target_type=target_type,
             action=action,
@@ -255,6 +307,8 @@ class SkillService:
             risk_level=risk_level,
             payload=payload,
             evidence=evidence or {},
+            before_snapshot=before_snapshot,
+            target_checksum=target_checksum,
         )
         db.add(proposal)
         db.flush()
@@ -299,6 +353,19 @@ class SkillService:
 
         skill_dir = self._safe_skill_dir(skill_key)
         before = self._snapshot(skill_dir)
+        current_checksum = snapshot_checksum(before)
+        expected_checksum = str(proposal.payload.get("base_checksum") or proposal.target_checksum or "")
+        if expected_checksum and current_checksum != expected_checksum:
+            reason = f"target checksum changed: expected {expected_checksum}, got {current_checksum}"
+            proposal.status = "stale"
+            proposal.stale_reason = reason
+            proposal.result = {"ok": False, "stale": True, "reason": reason}
+            return proposal
+        test_payload = self._test_files(skill_key, files)
+        if not test_payload["ok"]:
+            proposal.status = "rejected"
+            proposal.result = {"ok": False, "errors": test_payload.get("errors", []), "warnings": test_payload.get("warnings", []), "tests": test_payload.get("tests", [])}
+            return proposal
         for relative_path, content in files.items():
             target = self._safe_child(skill_dir, relative_path)
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -309,15 +376,15 @@ class SkillService:
             SkillHistory(
                 skill_key=skill_key,
                 action="apply_proposal",
-                before_snapshot={"files": before},
-                after_snapshot={"files": after},
+                before_snapshot={"files": before, "checksum": current_checksum},
+                after_snapshot={"files": after, "checksum": snapshot_checksum(after), "proposal_id": str(proposal.id)},
                 actor=actor,
             )
         )
         proposal.status = "applied"
-        proposal.before_snapshot = {"files": before}
-        proposal.after_snapshot = {"files": after}
-        proposal.result = {"ok": True, "warnings": lint.warnings, "tests": lint.tests}
+        proposal.before_snapshot = {"files": before, "checksum": current_checksum}
+        proposal.after_snapshot = {"files": after, "checksum": snapshot_checksum(after)}
+        proposal.result = {"ok": True, "warnings": lint.warnings, "tests": test_payload["tests"], "diff": proposal.payload.get("diff", {})}
         proposal.applied_at = datetime.now(UTC)
         self.scan(db)
         if self.events:
@@ -361,6 +428,115 @@ class SkillService:
             self.events.emit("skill.rollback", {"skill_key": key})
             self.events.audit("skill.rollback", "skill", target_id=key, payload={"actor": actor})
         return {"ok": True, "skill_key": key, "restored_files": sorted(before)}
+
+    def _test_files(self, skill_key: str, files: dict[str, str]) -> dict[str, Any]:
+        lint = self.lint_files(files)
+        tests = [self._run_test_case(spec, files, lint=lint) for spec in lint.tests]
+        ok = lint.ok and all(item["status"] == "passed" for item in tests)
+        return {
+            "ok": ok,
+            "errors": lint.errors,
+            "warnings": lint.warnings,
+            "tests": tests,
+            "skill_key": normalize_skill_key(skill_key),
+        }
+
+    def _run_test_case(self, spec: dict[str, Any], files: dict[str, str], *, lint: SkillLintResult) -> dict[str, Any]:
+        kind = str(spec.get("kind") or "lint")
+        name = str(spec.get("name") or kind)
+        if kind == "lint":
+            passed = lint.ok
+            return {
+                "name": name,
+                "kind": kind,
+                "status": "passed" if passed else "failed",
+                "assertions": ["lint.ok"],
+                "evidence": {"errors": lint.errors, "warnings": lint.warnings},
+            }
+        haystack = self._operational_text(files)
+        if kind == "golden_prompt":
+            expected = spec.get("expected_contains") or spec.get("expected")
+            expected_items = [str(item) for item in expected] if isinstance(expected, list) else ([str(expected)] if expected else [])
+            missing = [item for item in expected_items if item and item not in haystack]
+            status = "passed" if not missing else "failed"
+            return {
+                "name": name,
+                "kind": kind,
+                "status": status,
+                "assertions": ["expected content appears in skill files"],
+                "evidence": {"missing": missing, "input": spec.get("input", "")},
+            }
+        if kind == "mock_tool":
+            required = spec.get("required_tools") or spec.get("tools") or []
+            if isinstance(required, str):
+                required = [required]
+            declared = self._declared_tools(files)
+            missing = [str(item) for item in required if str(item) not in declared]
+            return {
+                "name": name,
+                "kind": kind,
+                "status": "passed" if not missing else "failed",
+                "assertions": ["required mock tools are declared"],
+                "evidence": {"declared_tools": declared, "missing": missing},
+            }
+        if kind == "regression":
+            patterns = spec.get("must_not_contain") or spec.get("forbidden") or []
+            if isinstance(patterns, str):
+                patterns = [patterns]
+            found = [str(pattern) for pattern in patterns if str(pattern) and str(pattern) in haystack]
+            return {
+                "name": name,
+                "kind": kind,
+                "status": "passed" if not found else "failed",
+                "assertions": ["regression forbidden patterns are absent"],
+                "evidence": {"found": found},
+            }
+        return {
+            "name": name,
+            "kind": kind,
+            "status": "failed",
+            "assertions": ["test kind is supported"],
+            "evidence": {"allowed": sorted(ALLOWED_TEST_KINDS)},
+        }
+
+    @staticmethod
+    def _declared_tools(files: dict[str, str]) -> list[str]:
+        try:
+            metadata, _body = parse_skill_markdown(files.get("SKILL.md", ""))
+        except Exception:  # noqa: BLE001
+            return []
+        tools = metadata.get("required_tools") or metadata.get("tools") or []
+        if isinstance(tools, str):
+            tools = [tools]
+        return [str(item) for item in tools] if isinstance(tools, list) else []
+
+    @staticmethod
+    def _operational_text(files: dict[str, str]) -> str:
+        parts: list[str] = []
+        for path in sorted(files):
+            content = files.get(path, "")
+            if path != "SKILL.md":
+                parts.append(content)
+                continue
+            try:
+                metadata, body = parse_skill_markdown(content)
+                metadata = {key: value for key, value in metadata.items() if key not in {"test_cases", "tests"}}
+                parts.append(yaml.safe_dump(metadata, allow_unicode=True, sort_keys=True))
+                parts.append(body)
+            except Exception:  # noqa: BLE001
+                parts.append(content)
+        return "\n\n".join(parts)
+
+    @staticmethod
+    def _diff_summary(before: dict[str, str], after: dict[str, str]) -> dict[str, list[str]]:
+        before_keys = set(before)
+        after_keys = set(after)
+        changed = sorted(path for path in before_keys & after_keys if before[path] != after[path])
+        return {
+            "added": sorted(after_keys - before_keys),
+            "changed": changed,
+            "removed": sorted(before_keys - after_keys),
+        }
 
     def _sync_declared_tests(self, db: Session, skill_key: str, metadata: dict[str, Any]) -> None:
         declared = metadata.get("test_cases") or metadata.get("tests") or []

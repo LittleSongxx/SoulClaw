@@ -363,7 +363,7 @@ class ToolRegistry:
         self.register(
             ToolDefinition(
                 name="skill_test",
-                description="Run manifest lint/static safety tests for a skill.",
+                description="Run safe skill tests, including lint, golden prompt, mock tool, and regression checks.",
                 scope="skill.read",
                 handler=self._skill_test,
             )

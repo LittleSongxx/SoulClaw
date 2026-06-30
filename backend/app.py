@@ -6,10 +6,11 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.base import BaseHTTPMiddleware
 from loguru import logger
 
 from . import __version__
@@ -25,11 +26,15 @@ from .domain.tools import ToolExecutor, ToolRegistry
 from .domain.wiki import WikiService
 from .domain.workspace import WorkspaceService
 from .infra.config import get_settings
-from .infra.db import run_alembic_upgrade, session_scope
+from .infra.db import get_engine, run_alembic_upgrade, session_scope
 from .infra.events import RuntimeEventBus
 from .infra.health import readiness_summary
+from .infra.observability import Observability, ObservabilityMiddleware, setup_opentelemetry
+from .infra.rate_limit import FixedWindowRateLimiter, RateLimitExceeded
+from .infra.resilience import ResilienceManager
 from .infra.redis_cache import build_redis_client
 from .infra.security import ensure_admin_user
+from .infra.trace import bind_trace_context, trace_id_from_traceparent, traceparent_from_trace_id
 from .runtime.a2a import A2ARuntimeManager
 from .runtime.agent import AgentRuntime
 from .runtime.cron import CronScheduler
@@ -67,6 +72,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         logger.info("admin user ready: {}", admin.username)
 
     redis_client = build_redis_client(settings)
+    resilience = ResilienceManager(events=events, observability=getattr(app.state, "observability", None))
+    rate_limiter = FixedWindowRateLimiter(settings=settings, redis_client=redis_client, events=events)
 
     workspace_service = WorkspaceService(settings=settings, events=events)
     workspace_service.ensure_files()
@@ -95,6 +102,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         events=events,
         discovery_timeout_seconds=settings.mcp_discovery_timeout_seconds,
         call_timeout_seconds=settings.mcp_call_timeout_seconds,
+        resilience=resilience,
     )
     if settings.mcp_seed_on_startup:
         try:
@@ -117,10 +125,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         events=events,
         settings=settings,
         http_timeout_seconds=settings.a2a_http_timeout_seconds,
+        resilience=resilience,
     )
     tool_registry.install_a2a(a2a_runtime)
     tool_executor = ToolExecutor(tool_registry, events=events, platform=platform_service)
-    llm_client = OpenAICompatibleClient(settings)
+    llm_client = OpenAICompatibleClient(settings, events=events, resilience=resilience, rate_limiter=rate_limiter)
     agent_runtime = AgentRuntime(
         wiki=wiki_service,
         memory=memory_service,
@@ -137,6 +146,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         events=events,
         webhook_max_skew_seconds=settings.gateway_webhook_max_skew_seconds,
         webhook_nonce_cache_size=settings.gateway_webhook_nonce_cache_size,
+        resilience=resilience,
     )
     tool_registry.install_gateway(gateway_runtime)
     dream_runtime = DreamRuntime(skills=skill_service, events=events)
@@ -145,6 +155,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     app.state.settings = settings
     app.state.event_bus = events
+    app.state.resilience = resilience
+    app.state.rate_limiter = rate_limiter
     app.state.redis_client = redis_client
     app.state.workspace_service = workspace_service
     app.state.wiki_service = wiki_service
@@ -263,6 +275,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 def create_app() -> FastAPI:
     settings = get_settings()
     app = FastAPI(title=settings.app_name, version=__version__, lifespan=lifespan)
+    app.state.settings = settings
+    observability = Observability(settings=settings)
+    app.state.observability = observability
+    otel_state = setup_opentelemetry(app, settings=settings, engine=get_engine())
+    app.state.otel = otel_state
+    app.add_middleware(ObservabilityMiddleware, observability=observability)
+    app.add_middleware(TraceContextMiddleware)
+    app.add_middleware(RateLimitMiddleware)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origins,
@@ -285,6 +305,11 @@ def create_app() -> FastAPI:
         status_code = 200 if summary["ok"] else 503
         return JSONResponse({"app": settings.app_name, "version": __version__, **summary}, status_code=status_code)
 
+    if settings.metrics_enabled:
+        @app.get(settings.metrics_path)
+        def metrics() -> JSONResponse:
+            return app.state.observability.metrics_response()
+
     app.include_router(auth.router)
     app.include_router(wiki.router)
     app.include_router(memory.router)
@@ -301,6 +326,73 @@ def create_app() -> FastAPI:
         app.mount("/", StaticFiles(directory=str(frontend_dist), html=True), name="frontend")
 
     return app
+
+
+class TraceContextMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        trace_id = trace_id_from_traceparent(request.headers.get("traceparent", ""))
+        request_id = request.headers.get("X-Request-ID", "")
+        with bind_trace_context(trace_id=trace_id, request_id=request_id) as context:
+            response = await call_next(request)
+            response.headers["X-Request-ID"] = context.request_id
+            if "traceparent" not in response.headers:
+                response.headers["traceparent"] = traceparent_from_trace_id(context.trace_id)
+            return response
+
+
+class RateLimitMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        path = request.url.path
+        settings = getattr(request.app.state, "settings", get_settings())
+        if _rate_limit_exempt(path, settings):
+            return await call_next(request)
+        limiter = getattr(request.app.state, "rate_limiter", None)
+        if limiter is None:
+            return await call_next(request)
+        policy, limit = _rate_limit_policy(path, settings)
+        identity = _rate_limit_identity(request)
+        try:
+            decision = limiter.enforce(policy=policy, identity=identity, limit=limit)
+        except RateLimitExceeded as exc:
+            observability = getattr(request.app.state, "observability", None)
+            if observability is not None:
+                observability.record_rate_limit(policy=policy, allowed=False)
+            return JSONResponse(
+                {
+                    "detail": "rate limit exceeded",
+                    "code": "rate_limit_exceeded",
+                    "policy": exc.policy,
+                    "retry_after": exc.retry_after,
+                },
+                status_code=429,
+                headers={"Retry-After": str(exc.retry_after)},
+            )
+        observability = getattr(request.app.state, "observability", None)
+        if observability is not None:
+            observability.record_rate_limit(policy=policy, allowed=decision.allowed)
+        response = await call_next(request)
+        response.headers["X-RateLimit-Limit"] = str(decision.limit)
+        response.headers["X-RateLimit-Remaining"] = str(decision.remaining)
+        response.headers["X-RateLimit-Reset"] = str(decision.reset_at)
+        return response
+
+
+def _rate_limit_exempt(path: str, settings) -> bool:
+    return path in {"/api/health", "/api/health/live", "/api/health/ready", settings.metrics_path}
+
+
+def _rate_limit_policy(path: str, settings):
+    if path == "/api/runs/turn":
+        return "turn", settings.rate_limit_turn_per_minute
+    if path in {"/api/gateways/inbound", "/api/gateways/webhook"}:
+        return "gateway", settings.rate_limit_gateway_per_minute
+    return "admin", settings.rate_limit_admin_per_minute
+
+
+def _rate_limit_identity(request: Request) -> str:
+    auth = request.headers.get("Authorization", "")
+    host = request.client.host if request.client else "unknown"
+    return auth[-32:] if auth else host
 
 
 app = create_app()

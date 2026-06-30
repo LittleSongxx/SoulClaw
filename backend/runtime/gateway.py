@@ -15,6 +15,7 @@ from sqlalchemy import select
 from backend.infra.db import session_scope
 from backend.infra.events import RuntimeEventBus
 from backend.infra.models import GatewayConnection
+from backend.infra.resilience import ResilienceManager, ResiliencePolicy
 from backend.runtime.agent import AgentRuntime
 
 
@@ -44,12 +45,22 @@ class GatewayRuntimeManager:
         http_timeout_seconds: float = 15.0,
         webhook_max_skew_seconds: int = 300,
         webhook_nonce_cache_size: int = 200,
+        resilience: ResilienceManager | None = None,
     ) -> None:
         self.agent = agent
         self.events = events
         self.http_timeout_seconds = http_timeout_seconds
         self.webhook_max_skew_seconds = webhook_max_skew_seconds
         self.webhook_nonce_cache_size = webhook_nonce_cache_size
+        self.resilience = resilience or ResilienceManager(events=events)
+        self.http_policy = ResiliencePolicy(
+            name="gateway.outbound_http",
+            max_attempts=3,
+            base_delay_seconds=0.3,
+            max_delay_seconds=5.0,
+            failure_threshold=5,
+            recovery_seconds=45.0,
+        )
 
     def handle_inbound(self, message: InboundGatewayMessage) -> dict[str, Any]:
         with session_scope() as db:
@@ -139,11 +150,26 @@ class GatewayRuntimeManager:
                 "gateway": gateway.name,
                 "kind": gateway.kind,
             }
-            with httpx.Client(timeout=self.http_timeout_seconds) as client:
-                response = client.post(url, json=payload)
-                response.raise_for_status()
-            return {"mode": "http_post", "status_code": response.status_code}
+            idempotency_key = str(message.metadata.get("idempotency_key") or message.metadata.get("message_id") or "")
+            policy = self.http_policy if idempotency_key else ResiliencePolicy(
+                name="gateway.outbound_http.non_idempotent",
+                max_attempts=1,
+                failure_threshold=self.http_policy.failure_threshold,
+                recovery_seconds=self.http_policy.recovery_seconds,
+            )
+            def post() -> httpx.Response:
+                headers = {"Idempotency-Key": idempotency_key} if idempotency_key else {}
+                with httpx.Client(timeout=self.http_timeout_seconds) as client:
+                    response = client.post(url, json=payload, headers=headers)
+                    response.raise_for_status()
+                    return response
+
+            response = self.resilience.call(policy, post)
+            return {"mode": "http_post", "status_code": response.status_code, "idempotency_key": idempotency_key}
         raise NotImplementedError(f"gateway kind '{gateway.kind}' is configured but no outbound adapter is active")
+
+    def resilience_state(self) -> dict[str, Any]:
+        return self.resilience.state()
 
     def _verify_signature(self, gateway: GatewayConnection, message: InboundGatewayMessage) -> None:
         config = gateway.config or {}

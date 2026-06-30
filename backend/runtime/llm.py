@@ -9,6 +9,9 @@ from typing import Any
 import httpx
 
 from backend.infra.config import Settings, get_settings
+from backend.infra.events import RuntimeEventBus
+from backend.infra.rate_limit import FixedWindowRateLimiter
+from backend.infra.resilience import ResilienceManager, ResiliencePolicy
 
 
 @dataclass(frozen=True)
@@ -56,8 +59,26 @@ class LLMProviderRegistry:
 
 
 class OpenAICompatibleClient:
-    def __init__(self, settings: Settings | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings | None = None,
+        *,
+        events: RuntimeEventBus | None = None,
+        resilience: ResilienceManager | None = None,
+        rate_limiter: FixedWindowRateLimiter | None = None,
+    ) -> None:
         self.settings = settings or get_settings()
+        self.events = events
+        self.resilience = resilience or ResilienceManager(events=events)
+        self.rate_limiter = rate_limiter
+        self.policy = ResiliencePolicy(
+            name="llm.openai_compatible",
+            max_attempts=3,
+            base_delay_seconds=0.5,
+            max_delay_seconds=8.0,
+            failure_threshold=5,
+            recovery_seconds=60.0,
+        )
 
     @property
     def configured(self) -> bool:
@@ -76,6 +97,12 @@ class OpenAICompatibleClient:
     ) -> LLMResponse:
         if not self.configured:
             raise RuntimeError("LLM is not configured")
+        if self.rate_limiter is not None:
+            self.rate_limiter.enforce(
+                policy="llm",
+                identity=self.settings.openai_model or self.settings.llm_provider,
+                limit=self.settings.rate_limit_llm_per_minute,
+            )
         url = f"{self.settings.openai_base_url.rstrip('/')}/chat/completions"
         headers = {
             "Authorization": f"Bearer {self.settings.openai_api_key}",
@@ -89,13 +116,19 @@ class OpenAICompatibleClient:
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
-        with httpx.Client(timeout=60) as client:
-            response = client.post(url, headers=headers, json=payload)
-            response.raise_for_status()
-            raw = response.json()
+        def request() -> dict[str, Any]:
+            with httpx.Client(timeout=60) as client:
+                response = client.post(url, headers=headers, json=payload)
+                response.raise_for_status()
+                return response.json()
+
+        raw = self.resilience.call(self.policy, request)
         message = raw["choices"][0]["message"]
         tool_calls = self._parse_tool_calls(message.get("tool_calls") or [])
         return LLMResponse(content=message.get("content") or "", tool_calls=tool_calls, raw=raw)
+
+    def resilience_state(self) -> dict[str, Any]:
+        return self.resilience.state()
 
     @staticmethod
     def _parse_tool_calls(raw_calls: list[dict[str, Any]]) -> list[LLMToolCall]:

@@ -16,6 +16,7 @@ from backend.domain.a2a import A2AService
 from backend.infra.config import Settings
 from backend.infra.events import RuntimeEventBus
 from backend.infra.models import A2AAgentConnection, A2ATask
+from backend.infra.resilience import ResilienceManager, ResiliencePolicy
 
 A2A_VERSION = "1.0"
 TERMINAL_TASK_STATES = {"completed", "failed", "canceled", "rejected"}
@@ -73,11 +74,21 @@ class A2ARuntimeManager:
         events: RuntimeEventBus,
         settings: Settings,
         http_timeout_seconds: float = 60.0,
+        resilience: ResilienceManager | None = None,
     ) -> None:
         self.service = service
         self.events = events
         self.settings = settings
         self.http_timeout_seconds = http_timeout_seconds
+        self.resilience = resilience or ResilienceManager(events=events)
+        self.http_policy = ResiliencePolicy(
+            name="a2a.http_jsonrpc",
+            max_attempts=3,
+            base_delay_seconds=0.5,
+            max_delay_seconds=6.0,
+            failure_threshold=5,
+            recovery_seconds=60.0,
+        )
 
     def agent_card(self) -> dict[str, Any]:
         base_url = str(getattr(self.settings, "public_base_url", "") or "").rstrip("/")
@@ -130,17 +141,21 @@ class A2ARuntimeManager:
         connection = self._require_connection(db, connection_name)
         urls = self._agent_card_urls(connection)
         last_error = ""
-        with httpx.Client(timeout=self.http_timeout_seconds) as client:
-            for url in urls:
-                try:
-                    response = client.get(url, headers=self._headers(connection))
-                    response.raise_for_status()
-                    card = response.json()
-                    rpc_url = self._rpc_url_from_card(card, fallback=connection.rpc_url or connection.endpoint)
-                    self.service.update_discovery(db, connection, agent_card=card, rpc_url=rpc_url, status="online")
-                    return card
-                except Exception as exc:  # noqa: BLE001
-                    last_error = str(exc)
+        for url in urls:
+            try:
+                def get_card() -> httpx.Response:
+                    with httpx.Client(timeout=self.http_timeout_seconds) as client:
+                        response = client.get(url, headers=self._headers(connection))
+                        response.raise_for_status()
+                        return response
+
+                response = self.resilience.call(self.http_policy, get_card)
+                card = response.json()
+                rpc_url = self._rpc_url_from_card(card, fallback=connection.rpc_url or connection.endpoint)
+                self.service.update_discovery(db, connection, agent_card=card, rpc_url=rpc_url, status="online")
+                return card
+            except Exception as exc:  # noqa: BLE001
+                last_error = str(exc)
         self.service.update_discovery(db, connection, agent_card=connection.agent_card or {}, status="failed", error=last_error)
         raise RuntimeError(f"A2A discovery failed for {connection.name}: {last_error}")
 
@@ -464,13 +479,17 @@ class A2ARuntimeManager:
     def _call_jsonrpc(self, connection: A2AAgentConnection, method: str, params: dict[str, Any]) -> dict[str, Any]:
         url = self._rpc_url(connection)
         payload = {"jsonrpc": "2.0", "id": str(uuid.uuid4()), "method": method, "params": params}
-        with httpx.Client(timeout=self.http_timeout_seconds) as client:
-            response = client.post(url, json=payload, headers={"Content-Type": "application/json", **self._headers(connection)})
-            response.raise_for_status()
-            data = response.json()
+        def post() -> dict[str, Any]:
+            with httpx.Client(timeout=self.http_timeout_seconds) as client:
+                response = client.post(url, json=payload, headers={"Content-Type": "application/json", **self._headers(connection)})
+                response.raise_for_status()
+                data = response.json()
+            return data if isinstance(data, dict) else {"result": data}
+
+        data = self.resilience.call(self.http_policy, post)
         if isinstance(data, dict) and data.get("error"):
             raise RuntimeError(json.dumps(data["error"], ensure_ascii=False))
-        return data if isinstance(data, dict) else {"result": data}
+        return data
 
     def _call_jsonrpc_stream(
         self,
@@ -485,7 +504,8 @@ class A2ARuntimeManager:
             "Content-Type": "application/json",
             **self._headers(connection),
         }
-        with httpx.Client(timeout=None) as client:
+        timeout = httpx.Timeout(self.http_timeout_seconds, read=self.http_timeout_seconds)
+        with httpx.Client(timeout=timeout) as client:
             with client.stream("POST", url, json=payload, headers=headers) as response:
                 response.raise_for_status()
                 for event in _iter_sse_events(response):
@@ -497,6 +517,9 @@ class A2ARuntimeManager:
                     result = envelope.get("result")
                     if isinstance(result, dict):
                         yield result
+
+    def resilience_state(self) -> dict[str, Any]:
+        return self.resilience.state()
 
     def _require_connection(self, db: Session, connection_name: str) -> A2AAgentConnection:
         connection = self.service.get_connection(db, connection_name)

@@ -236,6 +236,24 @@ def _confidence(value: Any) -> float:
         return 0.0
 
 
+def _json_list(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
+def _parse_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+    except ValueError:
+        return None
+
+
 @dataclass(frozen=True)
 class ParsedWikiPage:
     page_key: str
@@ -248,6 +266,9 @@ class ParsedWikiPage:
     aliases: list[str]
     tags: list[str]
     confidence: float
+    claims: list[dict[str, Any]]
+    source_refs: list[dict[str, Any]]
+    stale_after: datetime | None
     metadata: dict[str, Any]
     checksum: str
     links: list[tuple[str, str]]
@@ -278,6 +299,9 @@ def parse_markdown_page(path: Path, root: Path) -> ParsedWikiPage:
     except (TypeError, ValueError):
         confidence = 0.5
     confidence = max(0.0, min(confidence, 1.0))
+    claims = _json_list(metadata.get("claims"))
+    source_refs = _json_list(metadata.get("source_refs") or metadata.get("evidence"))
+    stale_after = _parse_datetime(metadata.get("stale_after") or metadata.get("expires_at"))
 
     links: list[tuple[str, str]] = []
     for link_match in WIKILINK_RE.finditer(body):
@@ -297,6 +321,9 @@ def parse_markdown_page(path: Path, root: Path) -> ParsedWikiPage:
         aliases=aliases,
         tags=tags,
         confidence=confidence,
+        claims=claims,
+        source_refs=source_refs,
+        stale_after=stale_after,
         metadata=metadata,
         checksum=_checksum(raw),
         links=links,
@@ -468,6 +495,9 @@ class WikiService:
             record.aliases = page.aliases
             record.tags = page.tags
             record.confidence = page.confidence
+            record.claims = page.claims
+            record.source_refs = page.source_refs
+            record.stale_after = page.stale_after
             record.checksum = page.checksum
             record.metadata_json = page.metadata
 
@@ -834,6 +864,9 @@ class WikiService:
             "missing_index_entry",
             "low_confidence",
             "contested_claim",
+            "claim_low_confidence",
+            "claim_contradiction",
+            "claim_missing_evidence",
             "missing_canonical_file",
             "stale_page",
             "source_drift",
@@ -891,6 +924,19 @@ class WikiService:
                         {"path": page.relative_path},
                     )
                 )
+            if page.stale_after is not None:
+                stale_after = page.stale_after if page.stale_after.tzinfo else page.stale_after.replace(tzinfo=UTC)
+                if stale_after < now:
+                    errors.append(
+                        self._error(
+                            "stale_page",
+                            page.page_key,
+                            "Page stale_after has passed.",
+                            "Review the page and refresh its evidence or stale_after metadata.",
+                            {"stale_after": stale_after.isoformat(), "path": page.relative_path},
+                        )
+                    )
+            errors.extend(self._claim_quality_errors(page))
             if (
                 page.page_key not in linked_targets
                 and page.page_key not in {"index", "schema", "log"}
@@ -921,10 +967,12 @@ class WikiService:
             db.add(error)
         if self.events:
             self.events.emit("wiki.lint", {"errors": len(errors), "canonical_missing": canonical_missing})
+        quality = self.quality_summary(db, parsed_pages=pages, errors=errors)
         return {
             "ok": not errors,
             "errors": len(errors),
             "canonical_missing": canonical_missing,
+            "quality": quality,
             "items": [
                 {
                     "error_type": error.error_type,
@@ -1128,6 +1176,42 @@ class WikiService:
             },
             "llm_wiki": self._wiki_shape(),
             "fts": self.fts_status(db),
+        }
+
+    def quality_summary(
+        self,
+        db: Session,
+        *,
+        parsed_pages: list[ParsedWikiPage] | None = None,
+        errors: list[WikiErrorBook] | None = None,
+    ) -> dict[str, Any]:
+        if parsed_pages is None:
+            pages = self.list_pages(db, limit=1000)
+            total_claims = sum(len(getattr(page, "claims", []) or []) for page in pages)
+            pages_with_evidence = sum(1 for page in pages if getattr(page, "source_refs", []) or (page.metadata_json or {}).get("sources"))
+            stale_pages = sum(1 for page in pages if getattr(page, "stale_after", None) and self._is_past(getattr(page, "stale_after")))
+            low_confidence_pages = sum(1 for page in pages if _confidence(getattr(page, "confidence", 0.0)) < 0.35)
+        else:
+            total_claims = sum(len(page.claims) for page in parsed_pages)
+            pages_with_evidence = sum(1 for page in parsed_pages if page.source_refs or page.metadata.get("sources"))
+            stale_pages = sum(1 for page in parsed_pages if page.stale_after is not None and self._is_past(page.stale_after))
+            low_confidence_pages = sum(1 for page in parsed_pages if _confidence(page.confidence) < 0.35)
+            pages = parsed_pages
+        if errors is None:
+            open_errors = self.error_book(db, status="open", limit=500)
+        else:
+            open_errors = errors
+        quality_error_types = {"low_confidence", "claim_low_confidence", "claim_contradiction", "claim_missing_evidence", "stale_page", "source_drift"}
+        quality_errors = [item for item in open_errors if item.error_type in quality_error_types]
+        page_count = len(pages)
+        return {
+            "pages": page_count,
+            "claims": total_claims,
+            "pages_with_evidence": pages_with_evidence,
+            "evidence_coverage": round(pages_with_evidence / page_count, 4) if page_count else 0.0,
+            "low_confidence_pages": low_confidence_pages,
+            "stale_pages": stale_pages,
+            "quality_errors": len(quality_errors),
         }
 
     def refresh_fts(self, db: Session, pages: list[ParsedWikiPage] | None = None) -> dict[str, Any]:
@@ -1628,6 +1712,61 @@ class WikiService:
         except Exception as exc:  # noqa: BLE001
             fallback["llm_error"] = str(exc)
         return fallback
+
+    def _claim_quality_errors(self, page: ParsedWikiPage) -> list[WikiErrorBook]:
+        errors: list[WikiErrorBook] = []
+        page_sources = page.source_refs or [{"ref": item} for item in _listify(page.metadata.get("sources"))]
+        seen_claims: dict[str, dict[str, Any]] = {}
+        for index, claim in enumerate(page.claims):
+            text_value = str(claim.get("text") or claim.get("claim") or "").strip()
+            claim_id = str(claim.get("id") or f"claim-{index + 1}")
+            confidence = _confidence(claim.get("confidence", page.confidence))
+            evidence = claim.get("evidence") or claim.get("source_refs") or []
+            if isinstance(evidence, str):
+                evidence = [evidence]
+            if confidence < 0.35:
+                errors.append(
+                    self._error(
+                        "claim_low_confidence",
+                        page.page_key,
+                        f"Claim `{claim_id}` confidence is low: {confidence:.2f}",
+                        "Verify the claim with explicit evidence or mark it contested.",
+                        {"claim_id": claim_id, "confidence": confidence, "claim": text_value},
+                    )
+                )
+            if not evidence and not page_sources:
+                errors.append(
+                    self._error(
+                        "claim_missing_evidence",
+                        page.page_key,
+                        f"Claim `{claim_id}` has no evidence reference.",
+                        "Attach source_refs/evidence at the claim or page level.",
+                        {"claim_id": claim_id, "claim": text_value},
+                    )
+                )
+            normalized = re.sub(r"\s+", " ", text_value.lower())
+            polarity = str(claim.get("polarity") or claim.get("status") or "asserted").lower()
+            if normalized and normalized in seen_claims:
+                previous = seen_claims[normalized]
+                previous_polarity = str(previous.get("polarity") or previous.get("status") or "asserted").lower()
+                if {polarity, previous_polarity} & {"contested", "false", "negated"} and polarity != previous_polarity:
+                    errors.append(
+                        self._error(
+                            "claim_contradiction",
+                            page.page_key,
+                            f"Claim `{claim_id}` contradicts another claim on the same page.",
+                            "Resolve the contradiction or split contested claims with evidence.",
+                            {"claim_id": claim_id, "claim": text_value},
+                        )
+                    )
+            if normalized:
+                seen_claims[normalized] = claim
+        return errors
+
+    @staticmethod
+    def _is_past(value: datetime) -> bool:
+        current = value if value.tzinfo else value.replace(tzinfo=UTC)
+        return current < datetime.now(UTC)
 
     @staticmethod
     def _error_summary(error: WikiErrorBook) -> dict[str, Any]:

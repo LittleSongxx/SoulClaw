@@ -14,6 +14,7 @@ import {
   PlugZap,
   RefreshCw,
   Search,
+  ServerCog,
   Settings,
   ShieldCheck,
   Timer,
@@ -31,6 +32,7 @@ type ViewKey =
   | "mcp"
   | "gateways"
   | "heartbeat"
+  | "reliability"
   | "sessions"
   | "jobs"
   | "proposals"
@@ -49,6 +51,7 @@ const navItems: Array<{ key: ViewKey; label: string; icon: unknown }> = [
   { key: "mcp", label: "MCP", icon: PlugZap },
   { key: "gateways", label: "Gateways", icon: Globe2 },
   { key: "heartbeat", label: "Heartbeat", icon: Activity },
+  { key: "reliability", label: "Reliability", icon: ServerCog },
   { key: "sessions", label: "Sessions", icon: FileText },
   { key: "jobs", label: "Jobs", icon: Timer },
   { key: "proposals", label: "Proposals", icon: CheckCircle2 },
@@ -113,6 +116,10 @@ const memoryProbes = ref<Array<Record<string, unknown>>>([]);
 const workspaceFiles = ref<Array<Record<string, unknown>>>([]);
 const heartbeatStatus = ref<Record<string, unknown> | null>(null);
 const gatewayStatuses = ref<Array<Record<string, unknown>>>([]);
+const reliabilityStatus = ref<Record<string, unknown>>({});
+const reliabilityAlerts = ref<Array<Record<string, unknown>>>([]);
+const reliabilityLimits = ref<Record<string, unknown>>({});
+const recentTraces = ref<Array<Record<string, unknown>>>([]);
 
 const loggedIn = computed(() => Boolean(token.value));
 const pageTitle = computed(() => navItems.find((item) => item.key === active.value)?.label || "Dashboard");
@@ -222,6 +229,18 @@ async function loadActive() {
     const [status, files] = await Promise.all([api("/api/heartbeat/status"), api("/api/workspace/files")]);
     heartbeatStatus.value = status;
     workspaceFiles.value = files.items || [];
+  }
+  if (active.value === "reliability") {
+    const [status, alerts, limits, traceEvents] = await Promise.all([
+      api("/api/reliability"),
+      api("/api/reliability/alerts"),
+      api("/api/reliability/limits"),
+      api("/api/events?limit=20")
+    ]);
+    reliabilityStatus.value = status;
+    reliabilityAlerts.value = alerts.items || [];
+    reliabilityLimits.value = limits;
+    recentTraces.value = (traceEvents.items || []).filter((item: Record<string, unknown>) => item.trace_id);
   }
   if (active.value === "sessions") sessions.value = (await api("/api/sessions")).items || [];
   if (active.value === "jobs") jobs.value = (await api("/api/jobs")).items || [];
@@ -803,6 +822,61 @@ onMounted(refreshAll);
         <pre>{{ fmt({ status: heartbeatStatus, files: workspaceFiles, job: jobResult }) }}</pre>
       </section>
 
+      <section v-if="active === 'reliability'" class="stack">
+        <div class="metrics">
+          <article>
+            <span>Alerts</span>
+            <strong>{{ reliabilityAlerts.length }}</strong>
+          </article>
+          <article>
+            <span>Dead Letter</span>
+            <strong>{{ isRecord(reliabilityStatus.jobs) ? reliabilityStatus.jobs.dead_letter || 0 : 0 }}</strong>
+          </article>
+          <article>
+            <span>Outbox Pending</span>
+            <strong>{{ isRecord(reliabilityStatus.outbox) ? Number(reliabilityStatus.outbox.pending || 0) + Number(reliabilityStatus.outbox.retrying || 0) : 0 }}</strong>
+          </article>
+          <article>
+            <span>Cron Backoff</span>
+            <strong>{{ isRecord(reliabilityStatus.cron) ? reliabilityStatus.cron.backoff || 0 : 0 }}</strong>
+          </article>
+        </div>
+        <section v-if="reliabilityAlerts.length" class="alert-list">
+          <article v-for="item in reliabilityAlerts" :key="String(item.kind) + String(item.message)">
+            <AlertTriangle :size="18" />
+            <div>
+              <strong>{{ item.severity }} · {{ item.kind }}</strong>
+              <p>{{ item.message }}</p>
+            </div>
+          </article>
+        </section>
+        <section class="settings-grid">
+          <article>
+            <span>Jobs</span>
+            <strong>{{ fmt(reliabilityStatus.jobs) }}</strong>
+          </article>
+          <article>
+            <span>Outbox</span>
+            <strong>{{ fmt(reliabilityStatus.outbox) }}</strong>
+          </article>
+          <article>
+            <span>Rate Limit</span>
+            <strong>{{ fmt(reliabilityLimits.policies || reliabilityStatus.rate_limit) }}</strong>
+          </article>
+          <article>
+            <span>Resilience</span>
+            <strong>{{ fmt(reliabilityStatus.resilience) }}</strong>
+          </article>
+        </section>
+        <section class="list">
+          <article v-for="item in recentTraces" :key="String(item.id)">
+            <strong>{{ item.event_type }}</strong>
+            <span>{{ item.trace_id }} · {{ item.severity }}</span>
+            <p>{{ fmt(item.payload) }}</p>
+          </article>
+        </section>
+      </section>
+
       <section v-if="active === 'sessions'" class="stack">
         <section class="list">
           <article v-for="item in sessions" :key="String(item.session_id)">
@@ -824,11 +898,11 @@ onMounted(refreshAll);
         <section class="list">
           <article v-for="item in jobs" :key="String(item.id)">
             <strong>{{ item.task_name }}</strong>
-            <span>{{ item.status }} · {{ item.created_at }}</span>
+            <span>{{ item.status }} · attempt {{ item.attempt_count || 0 }}/{{ item.max_attempts || 0 }} · {{ item.created_at }}</span>
             <div class="actions">
-              <button class="secondary" @click="cancelJob(item.id)" :disabled="!['queued', 'running'].includes(String(item.status))">Cancel</button>
+              <button class="secondary" @click="cancelJob(item.id)" :disabled="!['queued', 'running', 'retrying'].includes(String(item.status))">Cancel</button>
             </div>
-            <pre>{{ fmt({ payload: item.payload, result: item.result, error: item.error, queue_id: item.queue_id }) }}</pre>
+            <pre>{{ fmt({ payload: item.payload, result: item.result, error: item.error, queue_id: item.queue_id, next_retry_at: item.next_retry_at, dead_letter_reason: item.dead_letter_reason, trace_id: item.trace_id }) }}</pre>
           </article>
         </section>
       </section>

@@ -6,6 +6,7 @@ from backend.runtime.mcp import (
     MCPRuntimeManager,
     MCPToolDescriptor,
     _server_config,
+    _tool_permission,
     safe_tool_token,
 )
 
@@ -88,3 +89,9 @@ def test_mcp_safe_permission_override_registers_read_tool(monkeypatch: pytest.Mo
 
     assert definition.scope == "external.read"
     assert definition.requires_approval is False
+
+
+def test_mcp_tool_permission_defaults_write_and_reads_overrides() -> None:
+    assert _tool_permission({"tools": {"override_permission": {"search": "safe"}}}, "search") == "safe"
+    assert _tool_permission({"permission_policy": {"override_permission": {"read": "read"}}}, "read") == "read"
+    assert _tool_permission({}, "write_file") == "write"

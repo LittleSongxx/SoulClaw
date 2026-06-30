@@ -25,6 +25,9 @@ def wiki_page_to_dict(page) -> dict[str, Any]:
         "aliases": page.aliases or [],
         "tags": page.tags or [],
         "confidence": confidence,
+        "claims": getattr(page, "claims", []) or [],
+        "source_refs": getattr(page, "source_refs", []) or [],
+        "stale_after": dt(getattr(page, "stale_after", None)),
         "metadata": page.metadata_json or {},
         "updated_at": dt(page.updated_at),
     }
@@ -98,6 +101,18 @@ def probe_to_dict(probe) -> dict[str, Any]:
     }
 
 
+def memory_history_to_dict(item) -> dict[str, Any]:
+    return {
+        "id": str(item.id),
+        "memory_id": str(item.memory_id) if item.memory_id else None,
+        "action": item.action,
+        "before_snapshot": item.before_snapshot or {},
+        "after_snapshot": item.after_snapshot or {},
+        "actor": item.actor,
+        "created_at": dt(item.created_at),
+    }
+
+
 def session_message_to_dict(message) -> dict[str, Any]:
     return {
         "id": str(message.id),
@@ -162,6 +177,8 @@ def proposal_to_dict(proposal) -> dict[str, Any]:
         "before_snapshot": proposal.before_snapshot or {},
         "after_snapshot": proposal.after_snapshot or {},
         "result": proposal.result or {},
+        "target_checksum": getattr(proposal, "target_checksum", "") or "",
+        "stale_reason": getattr(proposal, "stale_reason", "") or "",
         "created_at": dt(proposal.created_at),
         "updated_at": dt(proposal.updated_at),
         "applied_at": dt(proposal.applied_at),
@@ -171,14 +188,23 @@ def proposal_to_dict(proposal) -> dict[str, Any]:
 def background_job_to_dict(job) -> dict[str, Any]:
     return {
         "id": str(job.id),
+        "trace_id": getattr(job, "trace_id", "") or "",
+        "request_id": getattr(job, "request_id", "") or "",
         "task_name": job.task_name,
         "queue_id": job.queue_id,
         "status": job.status,
+        "idempotency_key": getattr(job, "idempotency_key", "") or "",
         "payload": job.payload or {},
         "result": job.result or {},
         "error": job.error,
         "triggered_by": job.triggered_by,
         "cron_job_id": str(job.cron_job_id) if job.cron_job_id else None,
+        "attempt_count": getattr(job, "attempt_count", 0) or 0,
+        "max_attempts": getattr(job, "max_attempts", 3) or 3,
+        "next_retry_at": dt(getattr(job, "next_retry_at", None)),
+        "locked_at": dt(getattr(job, "locked_at", None)),
+        "lock_owner": getattr(job, "lock_owner", "") or "",
+        "dead_letter_reason": getattr(job, "dead_letter_reason", "") or "",
         "created_at": dt(job.created_at),
         "started_at": dt(job.started_at),
         "finished_at": dt(job.finished_at),
@@ -188,6 +214,8 @@ def background_job_to_dict(job) -> dict[str, Any]:
 def runtime_event_to_dict(event) -> dict[str, Any]:
     return {
         "id": str(event.id),
+        "trace_id": getattr(event, "trace_id", "") or "",
+        "request_id": getattr(event, "request_id", "") or "",
         "event_type": event.event_type,
         "severity": event.severity,
         "session_id": event.session_id,
@@ -200,6 +228,8 @@ def runtime_event_to_dict(event) -> dict[str, Any]:
 def audit_event_to_dict(event) -> dict[str, Any]:
     return {
         "id": str(event.id),
+        "trace_id": getattr(event, "trace_id", "") or "",
+        "request_id": getattr(event, "request_id", "") or "",
         "actor_id": str(event.actor_id) if event.actor_id else None,
         "action": event.action,
         "target_type": event.target_type,
@@ -249,10 +279,12 @@ def cron_job_to_dict(job) -> dict[str, Any]:
         "enabled": job.enabled,
         "last_run_at": dt(job.last_run_at),
         "next_run_at": dt(job.next_run_at),
+        "backoff_until": dt(getattr(job, "backoff_until", None)),
         "last_status": job.last_status,
         "last_result": job.last_result or {},
         "run_count": job.run_count,
         "failure_count": job.failure_count,
+        "last_enqueue_key": getattr(job, "last_enqueue_key", "") or "",
         "metadata": job.metadata_json or {},
         "created_at": dt(job.created_at),
         "updated_at": dt(job.updated_at),

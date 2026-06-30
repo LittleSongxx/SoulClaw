@@ -94,6 +94,13 @@ tags:
   - platform
 confidence: 0.9
 summary: A compact architecture page.
+source_refs:
+  - ref: raw/architecture.txt
+claims:
+  - id: c1
+    text: Architecture uses page-level evidence.
+    confidence: 0.8
+stale_after: 2999-01-01T00:00:00+00:00
 ---
 
 # Ignored Heading
@@ -111,6 +118,9 @@ This page links to [[Index|home]] and [[Missing Page]].
     assert parsed.aliases == ["Arch"]
     assert parsed.tags == ["platform"]
     assert parsed.confidence == 0.9
+    assert parsed.claims[0]["id"] == "c1"
+    assert parsed.source_refs[0]["ref"] == "raw/architecture.txt"
+    assert parsed.stale_after is not None
     assert parsed.links == [("index", "home"), ("missing-page", "Missing Page")]
 
 
@@ -306,6 +316,47 @@ def test_wiki_repair_auto_applies_low_risk_canonical_files(tmp_path: Path) -> No
     assert result["proposals_applied"] >= 1
     assert (root / "SCHEMA.md").exists()
     assert (root / "index.md").exists()
+
+
+def test_wiki_lint_detects_claim_quality_gaps(tmp_path: Path) -> None:
+    root = tmp_path / "wiki"
+    root.mkdir()
+    (root / "SCHEMA.md").write_text("# Schema", encoding="utf-8")
+    (root / "index.md").write_text("# Index\n\n- [[concepts/claims]] Claims", encoding="utf-8")
+    (root / "log.md").write_text("# Log", encoding="utf-8")
+    (root / "concepts").mkdir()
+    (root / "concepts" / "claims.md").write_text(
+        """---
+title: Claims
+page_key: concepts/claims
+confidence: 0.8
+claims:
+  - id: c1
+    text: SoulClaw has structured claim checks.
+    confidence: 0.2
+  - id: c2
+    text: SoulClaw has structured claim checks.
+    confidence: 0.9
+    polarity: contested
+stale_after: 2000-01-01T00:00:00+00:00
+---
+
+# Claims
+
+Claim page.
+""",
+        encoding="utf-8",
+    )
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    service = WikiService(settings=FakeSettings(root))
+
+    with Session(engine) as db:
+        result = service.lint(db)
+
+    error_types = {item["error_type"] for item in result["items"]}
+    assert {"claim_low_confidence", "claim_missing_evidence", "claim_contradiction", "stale_page"} <= error_types
+    assert result["quality"]["quality_errors"] >= 4
 
 
 def test_wiki_repair_keeps_high_risk_semantic_items_pending(tmp_path: Path) -> None:

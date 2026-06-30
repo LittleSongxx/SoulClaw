@@ -250,6 +250,14 @@ def health(
     return service.health(db)
 
 
+@router.get("/quality")
+def quality(
+    db: Session = Depends(get_db),
+    service: WikiService = Depends(get_wiki_service),
+) -> dict:
+    return service.quality_summary(db)
+
+
 @router.get("/errors")
 def errors(
     status: str | None = "open",

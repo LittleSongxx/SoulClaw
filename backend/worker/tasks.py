@@ -3,15 +3,25 @@
 from __future__ import annotations
 
 import asyncio
+import socket
 import uuid
 from typing import Any
 
 from backend.infra.db import session_scope
+from backend.infra.trace import bind_trace_context
 from backend.worker.bootstrap import build_worker_services
 from backend.worker.celery_app import celery_app
 
 
-def dispatch_task(task_name: str, job_id: str, payload: dict[str, Any], *, queue_id: str | None = None):
+def dispatch_task(
+    task_name: str,
+    job_id: str,
+    payload: dict[str, Any],
+    *,
+    queue_id: str | None = None,
+    trace_id: str = "",
+    request_id: str = "",
+):
     tasks = {
         "dream_review": dream_review_task,
         "wiki_compile": wiki_compile_task,
@@ -24,30 +34,55 @@ def dispatch_task(task_name: str, job_id: str, payload: dict[str, Any], *, queue
     task = tasks.get(task_name)
     if task is None:
         raise ValueError(f"unsupported background task: {task_name}")
+    task_payload = dict(payload or {})
+    if trace_id:
+        task_payload.setdefault("_trace_id", trace_id)
+    if request_id:
+        task_payload.setdefault("_request_id", request_id)
     if queue_id and hasattr(task, "apply_async"):
-        return task.apply_async(args=(job_id, payload), task_id=queue_id)
-    return task.delay(job_id, payload)
+        return task.apply_async(args=(job_id, task_payload), task_id=queue_id)
+    return task.delay(job_id, task_payload)
 
 
 def _run_job(job_id: str, fn):
     services = build_worker_services()
     parsed_id = uuid.UUID(str(job_id))
+    lock_owner = f"{socket.gethostname()}:{uuid.uuid4().hex[:8]}"
+    trace_id = ""
+    request_id = ""
     with session_scope() as db:
         with services.events.bind_session(db):
-            services.jobs.mark_started(db, parsed_id)
-    try:
+            job = services.jobs.get(db, parsed_id)
+            if job is None:
+                raise KeyError(f"background job not found: {parsed_id}")
+            trace_id = str(getattr(job, "trace_id", "") or "")
+            request_id = str(getattr(job, "request_id", "") or "")
+            if not services.jobs.should_run(job):
+                return {
+                    "status": "skipped",
+                    "job_status": job.status,
+                    "reason": "not runnable or waiting for retry window",
+                }
+            job = services.jobs.mark_started(db, parsed_id, lock_owner=lock_owner)
+            attempt = int(job.attempt_count or 0)
+            max_attempts = int(job.max_attempts or 3)
+    with bind_trace_context(trace_id=trace_id, request_id=request_id):
+        try:
+            with session_scope() as db:
+                with services.events.bind_session(db):
+                    result = fn(services, db)
+        except Exception as exc:  # noqa: BLE001
+            with session_scope() as db:
+                with services.events.bind_session(db):
+                    if attempt >= max_attempts:
+                        services.jobs.mark_dead_letter(db, parsed_id, str(exc))
+                    else:
+                        services.jobs.mark_retrying(db, parsed_id, str(exc))
+            raise
         with session_scope() as db:
             with services.events.bind_session(db):
-                result = fn(services, db)
-    except Exception as exc:  # noqa: BLE001
-        with session_scope() as db:
-            with services.events.bind_session(db):
-                services.jobs.mark_failed(db, parsed_id, str(exc))
-        raise
-    with session_scope() as db:
-        with services.events.bind_session(db):
-            services.jobs.mark_succeeded(db, parsed_id, result)
-    return result
+                services.jobs.mark_succeeded(db, parsed_id, result)
+        return result
 
 
 @celery_app.task(name="soulclaw.dream_review")

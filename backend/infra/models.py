@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import JSON, Boolean, DateTime, Float, Integer, String, Text, func, text
+from sqlalchemy import JSON, Boolean, DateTime, Float, Integer, String, Text, UniqueConstraint, func, text
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.types import Uuid
@@ -107,6 +107,8 @@ class AuditEvent(Base):
     __tablename__ = "audit_events"
 
     id: Mapped[uuid.UUID] = _uuid_pk()
+    trace_id: Mapped[str] = mapped_column(String(128), nullable=False, server_default="", index=True)
+    request_id: Mapped[str] = mapped_column(String(128), nullable=False, server_default="", index=True)
     actor_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True, index=True)
     action: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     target_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
@@ -119,6 +121,8 @@ class RuntimeEvent(Base):
     __tablename__ = "runtime_events"
 
     id: Mapped[uuid.UUID] = _uuid_pk()
+    trace_id: Mapped[str] = mapped_column(String(128), nullable=False, server_default="", index=True)
+    request_id: Mapped[str] = mapped_column(String(128), nullable=False, server_default="", index=True)
     event_type: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     severity: Mapped[str] = mapped_column(String(16), nullable=False, server_default="info")
     session_id: Mapped[str] = mapped_column(String(256), nullable=False, server_default="", index=True)
@@ -156,6 +160,9 @@ class WikiPage(Base, TimestampMixin):
     aliases: Mapped[list[str]] = _jsonb_list_default()
     tags: Mapped[list[str]] = _jsonb_list_default()
     confidence: Mapped[float] = mapped_column(Float, nullable=False, server_default="0.5")
+    claims: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
+    source_refs: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
+    stale_after: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     checksum: Mapped[str] = mapped_column(String(128), nullable=False, server_default="")
     metadata_json: Mapped[dict[str, Any]] = mapped_column(
         "metadata",
@@ -267,6 +274,18 @@ class MemoryProbe(Base):
     last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class MemoryHistory(Base):
+    __tablename__ = "memory_history"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    memory_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True, index=True)
+    action: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    before_snapshot: Mapped[dict[str, Any]] = _json_default()
+    after_snapshot: Mapped[dict[str, Any]] = _json_default()
+    actor: Mapped[str] = mapped_column(String(80), nullable=False, server_default="system", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
 class Skill(Base, TimestampMixin):
     __tablename__ = "skills"
 
@@ -333,6 +352,8 @@ class EvolutionProposal(Base, TimestampMixin):
     before_snapshot: Mapped[dict[str, Any]] = _json_default()
     after_snapshot: Mapped[dict[str, Any]] = _json_default()
     result: Mapped[dict[str, Any]] = _json_default()
+    target_checksum: Mapped[str] = mapped_column(String(128), nullable=False, server_default="", index=True)
+    stale_reason: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
     applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
@@ -377,10 +398,12 @@ class CronJob(Base, TimestampMixin):
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"), index=True)
     last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     next_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    backoff_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     last_status: Mapped[str] = mapped_column(String(32), nullable=False, server_default="never_run", index=True)
     last_result: Mapped[dict[str, Any]] = _json_default()
     run_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     failure_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    last_enqueue_key: Mapped[str] = mapped_column(String(256), nullable=False, server_default="", index=True)
     metadata_json: Mapped[dict[str, Any]] = mapped_column(
         "metadata",
         JSON,
@@ -393,17 +416,66 @@ class BackgroundJob(Base):
     __tablename__ = "background_jobs"
 
     id: Mapped[uuid.UUID] = _uuid_pk()
+    trace_id: Mapped[str] = mapped_column(String(128), nullable=False, server_default="", index=True)
+    request_id: Mapped[str] = mapped_column(String(128), nullable=False, server_default="", index=True)
     task_name: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     queue_id: Mapped[str] = mapped_column(String(256), nullable=False, server_default="", index=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, server_default="queued", index=True)
+    idempotency_key: Mapped[str] = mapped_column(String(256), nullable=False, server_default="", index=True)
     payload: Mapped[dict[str, Any]] = _json_default()
     result: Mapped[dict[str, Any]] = _json_default()
     error: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
     triggered_by: Mapped[str] = mapped_column(String(128), nullable=False, server_default="")
     cron_job_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True, index=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default="3")
+    next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    locked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lock_owner: Mapped[str] = mapped_column(String(128), nullable=False, server_default="")
+    dead_letter_reason: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class OutboxMessage(Base):
+    __tablename__ = "outbox_messages"
+    __table_args__ = (UniqueConstraint("idempotency_key", name="uq_outbox_messages_idempotency_key"),)
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    trace_id: Mapped[str] = mapped_column(String(128), nullable=False, server_default="", index=True)
+    request_id: Mapped[str] = mapped_column(String(128), nullable=False, server_default="", index=True)
+    topic: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    aggregate_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    aggregate_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    idempotency_key: Mapped[str] = mapped_column(String(256), nullable=False, server_default="", index=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, server_default="pending", index=True)
+    payload: Mapped[dict[str, Any]] = _json_default()
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default="5")
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    last_error: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    dispatched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class IdempotencyRecord(Base):
+    __tablename__ = "idempotency_records"
+    __table_args__ = (UniqueConstraint("scope", "idempotency_key", name="uq_idempotency_scope_key"),)
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    scope: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    idempotency_key: Mapped[str] = mapped_column(String(256), nullable=False, index=True)
+    request_hash: Mapped[str] = mapped_column(String(128), nullable=False, server_default="")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, server_default="processing", index=True)
+    response: Mapped[dict[str, Any]] = _json_default()
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
 
 
 class MCPServer(Base, TimestampMixin):

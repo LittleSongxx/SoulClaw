@@ -6,7 +6,7 @@ import uuid
 
 from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel
-from sqlalchemy import desc, select
+from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session
 
 from backend.api.admin.deps import (
@@ -33,7 +33,8 @@ from backend.infra.config import Settings, get_settings
 from backend.infra.db import database_backend, migration_status
 from backend.infra.events import RuntimeEventBus
 from backend.infra.health import readiness_summary
-from backend.infra.models import CronJob, ToolRun, User
+from backend.infra.models import AuditEvent, BackgroundJob, CronJob, IdempotencyRecord, OutboxMessage, RuntimeEvent, ToolRun, User
+from backend.infra.observability import reliability_alerts
 from backend.runtime.agent import AgentRuntime
 
 router = APIRouter(tags=["platform"], dependencies=[Depends(get_current_user)])
@@ -167,6 +168,69 @@ def cancel_job(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.get("/api/reliability")
+def reliability_status(request: Request, db: Session = Depends(get_db)) -> dict:
+    resilience = getattr(request.app.state, "resilience", None)
+    rate_limiter = getattr(request.app.state, "rate_limiter", None)
+    observability = getattr(request.app.state, "observability", None)
+    resilience_state = resilience.state() if resilience is not None and hasattr(resilience, "state") else {}
+    rate_limit_state = rate_limiter.state() if rate_limiter is not None and hasattr(rate_limiter, "state") else {}
+    counts = {
+        "jobs": _status_counts(db, BackgroundJob.status),
+        "outbox": _status_counts(db, OutboxMessage.status),
+        "idempotency": _status_counts(db, IdempotencyRecord.status),
+        "cron": {
+            "status": _status_counts(db, CronJob.last_status),
+            "backoff": int(db.scalar(select(func.count()).select_from(CronJob).where(CronJob.backoff_until.is_not(None))) or 0),
+        },
+    }
+    if observability is not None and hasattr(observability, "collect_reliability"):
+        observability.collect_reliability(db, resilience_state=resilience_state, rate_limit_state=rate_limit_state)
+    return {
+        **counts,
+        "resilience": resilience_state,
+        "rate_limit": rate_limit_state,
+        "observability": {
+            "metrics_enabled": bool(getattr(request.app.state.settings, "metrics_enabled", True)) if hasattr(request.app.state, "settings") else True,
+            "tracing": getattr(request.app.state, "otel", {}),
+        },
+    }
+
+
+@router.get("/api/reliability/alerts")
+def reliability_alerts_api(request: Request, db: Session = Depends(get_db), settings: Settings = Depends(get_settings)) -> dict:
+    resilience = getattr(request.app.state, "resilience", None)
+    items = reliability_alerts(
+        db,
+        settings=settings,
+        redis_client=getattr(request.app.state, "redis_client", None),
+        resilience_state=resilience.state() if resilience is not None and hasattr(resilience, "state") else {},
+    )
+    return {"ok": not any(item.get("severity") == "critical" for item in items), "items": items}
+
+
+@router.get("/api/reliability/limits")
+def reliability_limits(request: Request) -> dict:
+    rate_limiter = getattr(request.app.state, "rate_limiter", None)
+    return rate_limiter.state() if rate_limiter is not None and hasattr(rate_limiter, "state") else {"enabled": False}
+
+
+@router.get("/api/traces/{trace_id}")
+def trace_detail(trace_id: str, db: Session = Depends(get_db)) -> dict:
+    trace_id = trace_id.strip()[:128]
+    events_stmt = select(RuntimeEvent).where(RuntimeEvent.trace_id == trace_id).order_by(desc(RuntimeEvent.created_at)).limit(200)
+    audit_stmt = select(AuditEvent).where(AuditEvent.trace_id == trace_id).order_by(desc(AuditEvent.created_at)).limit(100)
+    jobs_stmt = select(BackgroundJob).where(BackgroundJob.trace_id == trace_id).order_by(desc(BackgroundJob.created_at)).limit(100)
+    outbox_stmt = select(OutboxMessage).where(OutboxMessage.trace_id == trace_id).order_by(desc(OutboxMessage.created_at)).limit(100)
+    return {
+        "trace_id": trace_id,
+        "events": [runtime_event_to_dict(item) for item in db.scalars(events_stmt).all()],
+        "audit": [audit_event_to_dict(item) for item in db.scalars(audit_stmt).all()],
+        "jobs": [background_job_to_dict(item) for item in db.scalars(jobs_stmt).all()],
+        "outbox": [_outbox_to_dict(item) for item in db.scalars(outbox_stmt).all()],
+    }
+
+
 @router.get("/api/settings")
 def settings(
     request: Request,
@@ -213,6 +277,12 @@ def settings(
         "cors_origins": settings.cors_origins,
         "require_production_secrets": settings.require_production_secrets,
         "login_rate_limit_enabled": settings.login_rate_limit_enabled,
+        "metrics_enabled": settings.metrics_enabled,
+        "metrics_path": settings.metrics_path,
+        "tracing_enabled": settings.tracing_enabled,
+        "otel_exporter_otlp_configured": bool(settings.otel_exporter_otlp_endpoint),
+        "rate_limit_enabled": settings.rate_limit_enabled,
+        "rate_limit_memory_fallback": settings.rate_limit_memory_fallback,
         "bootstrap_wiki_on_startup": settings.bootstrap_wiki_on_startup,
         "bootstrap_skills_on_startup": settings.bootstrap_skills_on_startup,
         "mcp_refresh_on_startup": settings.mcp_refresh_on_startup,
@@ -279,3 +349,30 @@ def update_workspace_file(
 
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return {"kind": item.kind, "path": item.path, "content": item.content, "updated_at": item.updated_at}
+
+
+def _status_counts(db: Session, column) -> dict[str, int]:
+    rows = db.execute(select(column, func.count()).group_by(column)).all()
+    return {str(status or "unknown"): int(count or 0) for status, count in rows}
+
+
+def _outbox_to_dict(item: OutboxMessage) -> dict:
+    from backend.api.admin.serializers import dt
+
+    return {
+        "id": str(item.id),
+        "trace_id": getattr(item, "trace_id", "") or "",
+        "request_id": getattr(item, "request_id", "") or "",
+        "topic": item.topic,
+        "aggregate_type": item.aggregate_type,
+        "aggregate_id": item.aggregate_id,
+        "idempotency_key": item.idempotency_key,
+        "status": item.status,
+        "attempt_count": item.attempt_count,
+        "max_attempts": item.max_attempts,
+        "next_attempt_at": dt(item.next_attempt_at),
+        "last_error": item.last_error,
+        "payload": item.payload or {},
+        "created_at": dt(item.created_at),
+        "dispatched_at": dt(item.dispatched_at),
+    }

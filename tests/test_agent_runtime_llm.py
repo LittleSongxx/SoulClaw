@@ -8,6 +8,7 @@ from backend.domain.conversation import SessionContext
 from backend.domain.tools import ToolApprovalRequired
 from backend.infra.models import Approval
 from backend.runtime.agent import AgentRuntime
+from backend.infra.rate_limit import RateLimitExceeded
 from backend.runtime.llm import LLMResponse, LLMToolCall, OpenAICompatibleClient
 
 
@@ -115,6 +116,14 @@ class ApprovalLLM:
         if self.calls == 1:
             return LLMResponse(content="", tool_calls=[LLMToolCall(name="gateway_send", arguments={"text": "hello"}, id="send_1")], raw={})
         return LLMResponse(content="sent after approval", tool_calls=[], raw={})
+
+
+class RateLimitedLLM:
+    configured = True
+
+    def complete(self, *, messages, tools=None, temperature=0.2):
+        del messages, tools, temperature
+        raise RateLimitExceeded(key="llm", policy="llm", limit=1, retry_after=30)
 
 
 class ApprovalToolExecutor:
@@ -248,6 +257,22 @@ def test_agent_runtime_tool_loop_uses_wiki_read_before_answer() -> None:
     assert result.answer == "Answer with [[index]]"
     assert result.context["llm"]["wiki_read_used"] is True
     assert [call["tool_name"] for call in tool_executor.calls] == ["wiki_search", "wiki_read"]
+
+
+def test_agent_runtime_reports_llm_rate_limit_as_degraded_state() -> None:
+    runtime = AgentRuntime(
+        wiki=DummyWiki(),
+        memory=DummyMemory(),
+        events=DummyEvents(),
+        tools=DummyToolExecutor(calls=[]),
+        registry=DummyRegistry(),
+        llm=RateLimitedLLM(),
+    )
+
+    result = runtime.run_turn(None, "hello")
+
+    assert result.context["llm"]["status"] == "rate_limited"
+    assert "rate limited" in result.answer
 
 
 def test_agent_runtime_interrupts_and_resumes_approval_checkpoint() -> None:

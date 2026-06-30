@@ -3,8 +3,11 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session
+
 from backend.domain.memory import MemoryService
-from backend.infra.models import EvolutionProposal, Memory
+from backend.infra.models import Base, EvolutionProposal, Memory, MemoryHistory
 
 
 class FakeDB:
@@ -112,3 +115,43 @@ def test_memory_file_sync_updates_marked_entries() -> None:
     assert result["updated"] == 1
     assert memory.content == "edited lesson"
     assert memory.confidence == 0.8
+
+
+def test_memory_sqlite_fts_scores_and_filters_expired(tmp_path) -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    workspace = FakeWorkspace()
+    service = MemoryService(events=None, workspace=workspace)
+
+    with Session(engine) as db:
+        service.create(db, kind="semantic", content="Orchid retrieval should use BM25 memory search.", source="test", importance=0.9)
+        service.create(
+            db,
+            kind="semantic",
+            content="Expired orchid fact should not be retrieved.",
+            source="test",
+            importance=1.0,
+            metadata={"valid_to": "2000-01-01T00:00:00+00:00"},
+        )
+        db.commit()
+        service.refresh_fts(db)
+        result = service.search(db, "orchid retrieval", limit=5)
+        governance = service.governance_status(db, budget_chars=10)
+
+    assert result
+    assert result[0]["source"] in {"memory_fts", "memory_index"}
+    assert "Expired orchid" not in " ".join(item["memory"].content for item in result)
+    assert governance["budget"]["over_budget"] is True
+
+
+def test_memory_restore_from_history() -> None:
+    db = FakeDB()
+    workspace = FakeWorkspace()
+    service = MemoryService(events=None, workspace=workspace)
+    memory = service.create(db, kind="agent_note", content="restore me", source="test")
+    history = next(item for item in db.objects if isinstance(item, MemoryHistory) and item.action == "create")
+    memory.content = "changed"
+
+    restored = service.restore(db, history.id)
+
+    assert restored.content == "restore me"

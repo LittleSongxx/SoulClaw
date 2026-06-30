@@ -38,6 +38,16 @@ class Settings(BaseSettings):
     cors_origins: Annotated[list[str], NoDecode] = ["*"]
     require_production_secrets: bool = True
     login_rate_limit_enabled: bool = True
+    metrics_enabled: bool = True
+    metrics_path: str = "/metrics"
+    tracing_enabled: bool = True
+    otel_exporter_otlp_endpoint: str = ""
+    rate_limit_enabled: bool = True
+    rate_limit_memory_fallback: bool = True
+    rate_limit_admin_per_minute: int = 120
+    rate_limit_turn_per_minute: int = 20
+    rate_limit_gateway_per_minute: int = 120
+    rate_limit_llm_per_minute: int = 60
 
     data_dir: Path = Path("data")
     config_dir: Path = Path("config")
