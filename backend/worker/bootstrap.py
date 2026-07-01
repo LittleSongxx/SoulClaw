@@ -19,6 +19,7 @@ from backend.runtime.dream import DreamRuntime
 from backend.runtime.heartbeat import HeartbeatRuntime
 from backend.runtime.llm import OpenAICompatibleClient
 from backend.runtime.mcp import MCPRuntimeManager
+from backend.worker.guards import ensure_background_database
 
 
 @dataclass(frozen=True)
@@ -38,6 +39,7 @@ class WorkerServices:
 
 def build_worker_services() -> WorkerServices:
     settings = get_settings()
+    ensure_background_database(settings, component="worker")
     events = RuntimeEventBus()
     resilience = ResilienceManager(events=events)
     workspace = WorkspaceService(settings=settings, events=events)

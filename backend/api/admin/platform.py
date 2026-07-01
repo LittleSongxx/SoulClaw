@@ -33,7 +33,16 @@ from backend.infra.config import Settings, get_settings
 from backend.infra.db import database_backend, migration_status
 from backend.infra.events import RuntimeEventBus
 from backend.infra.health import readiness_summary
-from backend.infra.models import AuditEvent, BackgroundJob, CronJob, IdempotencyRecord, OutboxMessage, RuntimeEvent, ToolRun, User
+from backend.infra.models import (
+    AuditEvent,
+    BackgroundJob,
+    CronJob,
+    IdempotencyRecord,
+    OutboxMessage,
+    RuntimeEvent,
+    ToolRun,
+    User,
+)
 from backend.infra.observability import reliability_alerts
 from backend.runtime.agent import AgentRuntime
 

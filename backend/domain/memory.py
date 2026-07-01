@@ -13,7 +13,13 @@ from sqlalchemy.orm import Session
 from backend.domain.workspace import WorkspaceService
 from backend.infra.config import Settings, get_settings
 from backend.infra.events import RuntimeEventBus
-from backend.infra.models import EvolutionProposal, Memory, MemoryConflict, MemoryHistory, MemoryProbe
+from backend.infra.models import (
+    EvolutionProposal,
+    Memory,
+    MemoryConflict,
+    MemoryHistory,
+    MemoryProbe,
+)
 
 L1_KINDS = {"control_axiom", "pinned_fact"}
 L2_KINDS = {"episodic", "user_fact", "agent_note", "error_signal"}

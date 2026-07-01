@@ -8,7 +8,14 @@ from typing import Any
 
 from fastapi import Request, Response
 from loguru import logger
-from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram, CONTENT_TYPE_LATEST, generate_latest
+from prometheus_client import (
+    CONTENT_TYPE_LATEST,
+    CollectorRegistry,
+    Counter,
+    Gauge,
+    Histogram,
+    generate_latest,
+)
 from sqlalchemy import func, select
 from starlette.middleware.base import BaseHTTPMiddleware
 

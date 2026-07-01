@@ -34,7 +34,7 @@ services:
       NPM_CONFIG_REGISTRY: ${NPM_CONFIG_REGISTRY:-}
       SOULCLAW_REDIS_URL: redis://redis:6379/0
       SOULCLAW_REDIS_REQUIRED: ${SOULCLAW_REDIS_REQUIRED:-false}
-      SOULCLAW_DATABASE_URL: sqlite:////app/data/soulclaw.sqlite3
+      SOULCLAW_DATABASE_URL: ${SOULCLAW_DATABASE_URL:-sqlite:////app/data/soulclaw.sqlite3}
       SOULCLAW_WORKSPACE_SEED_DIR: /app/workspace_seed
       SOULCLAW_BOOTSTRAP_WIKI_ON_STARTUP: ${SOULCLAW_BOOTSTRAP_WIKI_ON_STARTUP:-true}
       SOULCLAW_BOOTSTRAP_SKILLS_ON_STARTUP: ${SOULCLAW_BOOTSTRAP_SKILLS_ON_STARTUP:-true}
@@ -47,7 +47,11 @@ services:
       SOULCLAW_ADMIN_USERNAME: ${SOULCLAW_ADMIN_USERNAME:-admin}
       SOULCLAW_ADMIN_PASSWORD: ${SOULCLAW_ADMIN_PASSWORD:-soulclaw-admin}
       SOULCLAW_JWT_SECRET: ${SOULCLAW_JWT_SECRET:-change-me-for-production}
-      SOULCLAW_A2A_BOOTSTRAP_WEAVER_ENABLED: ${SOULCLAW_A2A_BOOTSTRAP_WEAVER_ENABLED:-false}
+      SOULCLAW_A2A_BOOTSTRAP_SOULSEARCHER_ENABLED: ${SOULCLAW_A2A_BOOTSTRAP_SOULSEARCHER_ENABLED:-false}
+      SOULCLAW_A2A_SOULSEARCHER_BASE_URL: ${SOULCLAW_A2A_SOULSEARCHER_BASE_URL:-http://127.0.0.1:8001}
+      SOULCLAW_A2A_SOULSEARCHER_INTERNAL_API_KEY: ${SOULCLAW_A2A_SOULSEARCHER_INTERNAL_API_KEY:-}
+      SOULCLAW_A2A_SOULSEARCHER_AUTH_USER_HEADER: ${SOULCLAW_A2A_SOULSEARCHER_AUTH_USER_HEADER:-X-SoulSearcher-User}
+      SOULCLAW_A2A_SOULSEARCHER_USER_ID: ${SOULCLAW_A2A_SOULSEARCHER_USER_ID:-soulclaw}
       SOULCLAW_A2A_REQUIRE_PUBLIC_AUTH: ${SOULCLAW_A2A_REQUIRE_PUBLIC_AUTH:-true}
       SOULCLAW_A2A_PUBLIC_API_KEY: ${SOULCLAW_A2A_PUBLIC_API_KEY:-}
       SOULCLAW_SEARXNG_URL: ${SOULCLAW_SEARXNG_URL:-}
@@ -70,11 +74,14 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+      postgres:
+        condition: service_healthy
     command: ["celery", "-A", "backend.worker.celery_app.celery_app", "worker", "--loglevel=INFO", "--concurrency=1"]
     environment:
       SOULCLAW_REDIS_URL: redis://redis:6379/0
       SOULCLAW_REDIS_REQUIRED: "true"
-      SOULCLAW_DATABASE_URL: sqlite:////app/data/soulclaw.sqlite3
+      SOULCLAW_DATABASE_URL: ${SOULCLAW_DATABASE_URL:-sqlite:////app/data/soulclaw.sqlite3}
+      SOULCLAW_AUTO_MIGRATE: "false"
       SOULCLAW_WORKSPACE_SEED_DIR: /app/workspace_seed
       SOULCLAW_MCP_CONFIG_FILE: /app/config/mcp_servers.yaml
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
@@ -98,11 +105,14 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+      postgres:
+        condition: service_healthy
     command: ["python", "-m", "backend.worker.scheduler"]
     environment:
       SOULCLAW_REDIS_URL: redis://redis:6379/0
       SOULCLAW_REDIS_REQUIRED: "true"
-      SOULCLAW_DATABASE_URL: sqlite:////app/data/soulclaw.sqlite3
+      SOULCLAW_DATABASE_URL: ${SOULCLAW_DATABASE_URL:-sqlite:////app/data/soulclaw.sqlite3}
+      SOULCLAW_AUTO_MIGRATE: "false"
       SOULCLAW_WORKSPACE_SEED_DIR: /app/workspace_seed
     env_file:
       - path: .env
@@ -137,7 +147,7 @@ services:
   postgres:
     image: pgvector/pgvector:pg16
     container_name: soulclaw-postgres
-    profiles: ["postgres"]
+    profiles: ["postgres", "background"]
     restart: unless-stopped
     environment:
       POSTGRES_DB: soulclaw

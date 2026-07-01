@@ -15,7 +15,6 @@ from backend.infra.events import RuntimeEventBus
 from backend.infra.models import BackgroundJob, IdempotencyRecord, OutboxMessage
 from backend.infra.trace import current_request_id, current_trace_id
 
-
 TERMINAL_JOB_STATUSES = {"succeeded", "failed", "dead_letter", "cancelled"}
 RETRYABLE_JOB_STATUSES = {"queued", "retrying"}
 

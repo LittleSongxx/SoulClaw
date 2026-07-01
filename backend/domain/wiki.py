@@ -1189,7 +1189,7 @@ class WikiService:
             pages = self.list_pages(db, limit=1000)
             total_claims = sum(len(getattr(page, "claims", []) or []) for page in pages)
             pages_with_evidence = sum(1 for page in pages if getattr(page, "source_refs", []) or (page.metadata_json or {}).get("sources"))
-            stale_pages = sum(1 for page in pages if getattr(page, "stale_after", None) and self._is_past(getattr(page, "stale_after")))
+            stale_pages = sum(1 for page in pages if getattr(page, "stale_after", None) and self._is_past(page.stale_after))
             low_confidence_pages = sum(1 for page in pages if _confidence(getattr(page, "confidence", 0.0)) < 0.35)
         else:
             total_claims = sum(len(page.claims) for page in parsed_pages)

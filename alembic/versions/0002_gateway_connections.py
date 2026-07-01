@@ -7,9 +7,10 @@ Create Date: 2026-06-25
 
 from __future__ import annotations
 
-from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
+
+from alembic import op
 
 revision = "0002_gateway_connections"
 down_revision = "0001_full_platform_schema"

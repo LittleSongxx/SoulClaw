@@ -7,9 +7,10 @@ Create Date: 2026-06-30
 
 from __future__ import annotations
 
-from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
+
+from alembic import op
 
 revision = "0013_reliability_governance"
 down_revision = "0012_memory_governance_skill_wiki_quality"

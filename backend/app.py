@@ -10,8 +10,8 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from starlette.middleware.base import BaseHTTPMiddleware
 from loguru import logger
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from . import __version__
 from .api.admin import a2a, auth, control, dream, memory, platform, skills, tools, wiki
@@ -31,8 +31,8 @@ from .infra.events import RuntimeEventBus
 from .infra.health import readiness_summary
 from .infra.observability import Observability, ObservabilityMiddleware, setup_opentelemetry
 from .infra.rate_limit import FixedWindowRateLimiter, RateLimitExceeded
-from .infra.resilience import ResilienceManager
 from .infra.redis_cache import build_redis_client
+from .infra.resilience import ResilienceManager
 from .infra.security import ensure_admin_user
 from .infra.trace import bind_trace_context, trace_id_from_traceparent, traceparent_from_trace_id
 from .runtime.a2a import A2ARuntimeManager

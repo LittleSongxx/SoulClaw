@@ -60,3 +60,27 @@ def test_project_copy_does_not_use_generation_labels() -> None:
                     continue
                 offenders.append(f"{path}:{line_no}:{line.strip()}")
     assert offenders == []
+
+
+def test_no_weaver_a2a_bootstrap_residue() -> None:
+    checked_roots = [
+        Path("README.md"),
+        Path("README.en.md"),
+        Path(".env.example"),
+        Path(".env.production.example"),
+        Path("docker-compose.yml"),
+        Path("docker-compose.prod.yml"),
+        Path("backend"),
+        Path("config"),
+        Path("tests"),
+    ]
+    forbidden = "A2A_BOOTSTRAP_" + "WEAVER"
+    offenders: list[str] = []
+    for root in checked_roots:
+        paths = [root] if root.is_file() else [path for path in root.rglob("*") if path.is_file()]
+        for path in paths:
+            if path.suffix in {".pyc", ".png", ".jpg", ".jpeg", ".lock"}:
+                continue
+            if forbidden in path.read_text(encoding="utf-8"):
+                offenders.append(str(path))
+    assert offenders == []

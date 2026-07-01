@@ -11,6 +11,7 @@ from backend.infra.config import get_settings
 from backend.infra.db import run_alembic_upgrade
 from backend.infra.events import RuntimeEventBus
 from backend.runtime.cron import CronScheduler
+from backend.worker.guards import ensure_background_database
 
 
 class NoopAgent:
@@ -20,6 +21,7 @@ class NoopAgent:
 
 def main() -> None:
     settings = get_settings()
+    ensure_background_database(settings, component="scheduler")
     if settings.auto_migrate:
         run_alembic_upgrade(settings)
     events = RuntimeEventBus()

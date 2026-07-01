@@ -82,6 +82,10 @@ SubscribeToTask
 GetExtendedAgentCard
 ```
 
+When `SOULCLAW_A2A_REQUIRE_PUBLIC_AUTH=true`, `POST /api/a2a` always requires
+`Authorization: Bearer <SOULCLAW_A2A_PUBLIC_API_KEY>` or `X-SoulClaw-A2A-Key`;
+an empty `SOULCLAW_PUBLIC_BASE_URL` does not bypass public auth. Set
+`SOULCLAW_A2A_REQUIRE_PUBLIC_AUTH=false` explicitly only for unauthenticated local JSON-RPC tests.
 
 Authenticated admin APIs:
 
@@ -210,10 +214,10 @@ Default lightweight services:
 |---|---|
 | `soulclaw` | FastAPI + frontend console; uses SQLite by default and does not require Redis locally |
 
-Enable the local background profile only when you want the queue stack:
+Enable the local background profile only when you want the queue stack, and point the database at Postgres:
 
 ```bash
-docker compose --profile background up -d --build
+SOULCLAW_DATABASE_URL=postgresql+psycopg://soulclaw:soulclaw@postgres:5432/soulclaw docker compose --profile background up -d --build
 ```
 
 | Optional service | Purpose |
@@ -221,14 +225,15 @@ docker compose --profile background up -d --build
 | `soulclaw-worker` | Celery worker |
 | `soulclaw-scheduler` | Scans `cron_jobs` and enqueues due tasks |
 | `soulclaw-redis` | Celery broker/result backend |
+| `soulclaw-postgres` | Postgres database used by background/worker/scheduler |
 
-To rehearse Postgres locally, enable the postgres profile separately and point `SOULCLAW_DATABASE_URL` at it:
+To start Postgres by itself, enable the postgres profile:
 
 ```bash
 docker compose --profile postgres up -d postgres
 ```
 
-SQLite data defaults to `data/soulclaw.sqlite3`. Redis is optional in lightweight mode as a hot cache/queue dependency, so readiness can pass without it. Postgres is available as an optional production/server backend via `SOULCLAW_DATABASE_URL`. The project directory is:
+SQLite data defaults to `data/soulclaw.sqlite3` and is intended only for the single-process lightweight local mode. Redis is optional in lightweight mode as a hot cache/queue dependency, so readiness can pass without it. The SQLite migration entrypoint is app startup / `run_alembic_upgrade()`; direct `alembic upgrade head` on SQLite also reconciles the schema and stamps head. Postgres keeps using the normal Alembic migration chain. The project directory is:
 
 ```text
 /home/song/code/Agent/assistant/SoulClaw

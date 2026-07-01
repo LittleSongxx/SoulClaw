@@ -600,15 +600,27 @@ def test_a2a_delegate_tool_runs_after_approval(monkeypatch: pytest.MonkeyPatch) 
     assert result["result"]["task_id"] == "approved-task"
 
 
-def test_a2a_public_auth_requires_key_when_public() -> None:
+def test_a2a_public_auth_requires_key_when_required_without_public_base_url() -> None:
     settings = type(
         "Settings",
         (),
-        {"a2a_require_public_auth": True, "public_base_url": "https://agent.example", "a2a_public_api_key": "secret"},
+        {"a2a_require_public_auth": True, "public_base_url": "", "a2a_public_api_key": "secret"},
     )()
 
+    assert _a2a_public_authorized(settings, authorization=None, api_key=None) is False
     assert _a2a_public_authorized(settings, authorization="Bearer secret", api_key=None) is True
+    assert _a2a_public_authorized(settings, authorization=None, api_key="secret") is True
     assert _a2a_public_authorized(settings, authorization=None, api_key="bad") is False
+
+
+def test_a2a_public_auth_allows_when_disabled() -> None:
+    settings = type(
+        "Settings",
+        (),
+        {"a2a_require_public_auth": False, "public_base_url": "", "a2a_public_api_key": ""},
+    )()
+
+    assert _a2a_public_authorized(settings, authorization=None, api_key=None) is True
 
 
 def test_public_jsonrpc_requires_a2a_version_header() -> None:
@@ -636,7 +648,7 @@ def test_public_jsonrpc_accepts_a2a_version_1_header() -> None:
         x_soulclaw_a2a_key=None,
         db=db,
         runtime=runtime,
-        settings=Settings(),
+        settings=Settings(a2a_require_public_auth=False),
     )
 
     assert response["result"] == {"tasks": []}

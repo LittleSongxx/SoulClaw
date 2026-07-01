@@ -82,6 +82,10 @@ SubscribeToTask
 GetExtendedAgentCard
 ```
 
+当 `SOULCLAW_A2A_REQUIRE_PUBLIC_AUTH=true` 时，`POST /api/a2a` 始终要求
+`Authorization: Bearer <SOULCLAW_A2A_PUBLIC_API_KEY>` 或 `X-SoulClaw-A2A-Key`；
+即使 `SOULCLAW_PUBLIC_BASE_URL` 为空也不会绕过。只在本地匿名 JSON-RPC 测试时显式设置
+`SOULCLAW_A2A_REQUIRE_PUBLIC_AUTH=false`。
 
 管理端接口需要登录：
 
@@ -210,10 +214,10 @@ docker compose up -d --build
 |---|---|
 | `soulclaw` | FastAPI + 前端控制台；默认使用 SQLite，本地不强制 Redis |
 
-本地需要后台队列时再显式启用 background profile：
+本地需要后台队列时再显式启用 background profile，并把数据库切到 Postgres：
 
 ```bash
-docker compose --profile background up -d --build
+SOULCLAW_DATABASE_URL=postgresql+psycopg://soulclaw:soulclaw@postgres:5432/soulclaw docker compose --profile background up -d --build
 ```
 
 | 可选服务 | 用途 |
@@ -221,14 +225,15 @@ docker compose --profile background up -d --build
 | `soulclaw-worker` | Celery worker |
 | `soulclaw-scheduler` | 扫描 `cron_jobs` 并 enqueue 到期任务 |
 | `soulclaw-redis` | Celery broker/result backend |
+| `soulclaw-postgres` | background/worker/scheduler 使用的 Postgres 数据库 |
 
-如果想在本地演练 Postgres，可单独启用 postgres profile 并把 `SOULCLAW_DATABASE_URL` 切到 Postgres：
+如果只想单独启动 Postgres，可启用 postgres profile：
 
 ```bash
 docker compose --profile postgres up -d postgres
 ```
 
-SQLite 数据默认在 `data/soulclaw.sqlite3`。Redis 在轻量模式下只是可选热缓存/队列依赖，未启动也不会让 readiness 失败。Postgres 可作为可选生产后端，通过 `SOULCLAW_DATABASE_URL` 切换。项目目录是：
+SQLite 数据默认在 `data/soulclaw.sqlite3`，只作为单进程轻量本地模式。Redis 在轻量模式下只是可选热缓存/队列依赖，未启动也不会让 readiness 失败。SQLite 的迁移入口是 app startup / `run_alembic_upgrade()`；在 SQLite 下直接执行 `alembic upgrade head` 也会执行 schema reconcile 后 stamp 到 head。Postgres 继续使用正常 Alembic migration 链。项目目录是：
 
 ```text
 /home/song/code/Agent/assistant/SoulClaw

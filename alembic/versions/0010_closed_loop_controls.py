@@ -7,9 +7,10 @@ Create Date: 2026-06-29
 
 from __future__ import annotations
 
-from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
+
+from alembic import op
 
 revision = "0010_closed_loop_controls"
 down_revision = "0009_a2a_runtime_state"

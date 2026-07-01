@@ -24,6 +24,7 @@ services:
       SOULCLAW_HOST: 0.0.0.0
       SOULCLAW_PORT: 8020
       SOULCLAW_LOG_LEVEL: ${SOULCLAW_LOG_LEVEL:-INFO}
+      SOULCLAW_AUTO_MIGRATE: ${SOULCLAW_AUTO_MIGRATE:-true}
       SOULCLAW_ADMIN_USERNAME: ${SOULCLAW_ADMIN_USERNAME:-admin}
       SOULCLAW_ADMIN_PASSWORD: ${SOULCLAW_ADMIN_PASSWORD:?set SOULCLAW_ADMIN_PASSWORD in your production env file}
       SOULCLAW_JWT_SECRET: ${SOULCLAW_JWT_SECRET:?set SOULCLAW_JWT_SECRET in your production env file}
@@ -79,7 +80,9 @@ services:
       redis:
         condition: service_healthy
     command: ["celery", "-A", "backend.worker.celery_app.celery_app", "worker", "--loglevel=INFO", "--concurrency=1"]
-    environment: *app-env
+    environment:
+      <<: *app-env
+      SOULCLAW_AUTO_MIGRATE: "false"
     volumes:
       - soulclaw_config:/app/config
       - soulclaw_workspace:/app/workspace
@@ -94,7 +97,9 @@ services:
       redis:
         condition: service_healthy
     command: ["python", "-m", "backend.worker.scheduler"]
-    environment: *app-env
+    environment:
+      <<: *app-env
+      SOULCLAW_AUTO_MIGRATE: "false"
     volumes:
       - soulclaw_config:/app/config
       - soulclaw_workspace:/app/workspace

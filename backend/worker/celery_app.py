@@ -55,3 +55,11 @@ else:
         task_eager_propagates=False,
         timezone="UTC",
     )
+    from celery.signals import worker_init
+
+    from backend.worker.guards import ensure_background_database
+
+    def _ensure_worker_database(**_kwargs) -> None:
+        ensure_background_database(settings, component="worker")
+
+    worker_init.connect(_ensure_worker_database, weak=False)

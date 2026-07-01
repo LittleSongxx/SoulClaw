@@ -6,8 +6,8 @@ import time
 import uuid
 from contextlib import contextmanager
 
-import pytest
 import httpx
+import pytest
 
 from backend.runtime.gateway import (
     GatewayRuntimeManager,

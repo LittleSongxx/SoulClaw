@@ -4,11 +4,10 @@ from __future__ import annotations
 
 import re
 import uuid
+from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Iterator
-
 
 _TRACE_ID: ContextVar[str] = ContextVar("soulclaw_trace_id", default="")
 _REQUEST_ID: ContextVar[str] = ContextVar("soulclaw_request_id", default="")

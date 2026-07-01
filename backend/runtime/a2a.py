@@ -143,9 +143,9 @@ class A2ARuntimeManager:
         last_error = ""
         for url in urls:
             try:
-                def get_card() -> httpx.Response:
+                def get_card(card_url: str = url) -> httpx.Response:
                     with httpx.Client(timeout=self.http_timeout_seconds) as client:
-                        response = client.get(url, headers=self._headers(connection))
+                        response = client.get(card_url, headers=self._headers(connection))
                         response.raise_for_status()
                         return response
 

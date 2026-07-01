@@ -198,8 +198,6 @@ def stream_a2a_task_events(
 def _a2a_public_authorized(settings: Settings, *, authorization: str | None, api_key: str | None) -> bool:
     if not settings.a2a_require_public_auth:
         return True
-    if not settings.public_base_url:
-        return True
     expected = settings.a2a_public_api_key
     if not expected:
         return False

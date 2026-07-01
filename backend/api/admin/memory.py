@@ -10,7 +10,12 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from backend.api.admin.deps import get_current_user, get_db, get_memory_service
-from backend.api.admin.serializers import conflict_to_dict, memory_history_to_dict, memory_to_dict, probe_to_dict
+from backend.api.admin.serializers import (
+    conflict_to_dict,
+    memory_history_to_dict,
+    memory_to_dict,
+    probe_to_dict,
+)
 from backend.domain.memory import MemoryService
 
 router = APIRouter(prefix="/api/memory", tags=["memory"], dependencies=[Depends(get_current_user)])

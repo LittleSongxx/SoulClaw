@@ -4,6 +4,7 @@ import pytest
 
 from backend.infra.config import Settings
 from backend.infra.security import hash_password, verify_password
+from backend.worker.guards import ensure_background_database
 
 
 def test_database_url_accepts_new_env_alias(monkeypatch) -> None:
@@ -72,3 +73,16 @@ def test_production_rejects_sqlite_even_with_secrets() -> None:
 
     with pytest.raises(RuntimeError, match="SQLite is only allowed"):
         settings.validate_runtime_secrets()
+
+
+def test_background_worker_rejects_sqlite_when_not_eager() -> None:
+    settings = Settings(database_url="sqlite:///data/soulclaw.sqlite3", queue_eager=False)
+
+    with pytest.raises(RuntimeError, match="requires Postgres"):
+        ensure_background_database(settings, component="worker")
+
+
+def test_background_worker_allows_sqlite_for_eager_queue_tests() -> None:
+    settings = Settings(database_url="sqlite:///data/soulclaw.sqlite3", queue_eager=True)
+
+    ensure_background_database(settings, component="worker")

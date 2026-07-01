@@ -13,10 +13,10 @@ from backend.domain.wiki import WikiService
 from backend.domain.workspace import WorkspaceService
 from backend.infra.events import RuntimeEventBus
 from backend.infra.models import Approval
-from backend.runtime.a2a import A2ADelegateRequest, A2ARuntimeManager
 from backend.infra.rate_limit import RateLimitExceeded
 from backend.infra.resilience import CircuitOpenError
 from backend.infra.trace import current_trace_id
+from backend.runtime.a2a import A2ADelegateRequest, A2ARuntimeManager
 from backend.runtime.llm import OpenAICompatibleClient
 
 
