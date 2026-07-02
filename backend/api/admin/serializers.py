@@ -66,7 +66,6 @@ def memory_to_dict(memory) -> dict[str, Any]:
         "supersedes_id": str(memory.supersedes_id) if memory.supersedes_id else None,
         "superseded_by": str(getattr(memory, "superseded_by", "") or "") or None,
         "source_turn_id": memory.source_turn_id,
-        "source_file_marker": getattr(memory, "source_file_marker", "") or "",
         "valid_from": dt(getattr(memory, "valid_from", None)),
         "valid_to": dt(getattr(memory, "valid_to", None)),
         "provenance": getattr(memory, "provenance", {}) or {},
@@ -74,6 +73,22 @@ def memory_to_dict(memory) -> dict[str, Any]:
         "created_at": dt(memory.created_at),
         "updated_at": dt(memory.updated_at),
         "last_verified_at": dt(memory.last_verified_at),
+    }
+
+
+def core_context_block_to_dict(block) -> dict[str, Any]:
+    return {
+        "id": str(block.id),
+        "block_key": block.block_key,
+        "title": block.title,
+        "content": block.content,
+        "status": block.status,
+        "version": block.version,
+        "confidence": block.confidence,
+        "source": block.source,
+        "metadata": block.metadata_json or {},
+        "created_at": dt(block.created_at),
+        "updated_at": dt(block.updated_at),
     }
 
 
@@ -266,6 +281,42 @@ def tool_run_to_dict(run) -> dict[str, Any]:
         "result": run.result or {},
         "started_at": dt(run.started_at),
         "finished_at": dt(run.finished_at),
+    }
+
+
+def agent_run_to_dict(run) -> dict[str, Any]:
+    return {
+        "id": str(run.id),
+        "run_id": run.run_id,
+        "thread_id": run.thread_id,
+        "session_id": run.session_id,
+        "turn_id": run.turn_id,
+        "engine": run.engine,
+        "status": run.status,
+        "route": run.route,
+        "input_preview": run.input_preview,
+        "answer_preview": run.answer_preview,
+        "error": run.error,
+        "state": run.state or {},
+        "metadata": run.metadata_json or {},
+        "started_at": dt(run.started_at),
+        "finished_at": dt(run.finished_at),
+    }
+
+
+def policy_rule_to_dict(rule) -> dict[str, Any]:
+    return {
+        "id": str(rule.id),
+        "rule_id": rule.rule_id,
+        "subject": rule.subject,
+        "scope": rule.scope,
+        "action": rule.action,
+        "risk_level": rule.risk_level,
+        "requires_approval": rule.requires_approval,
+        "enabled": rule.enabled,
+        "config": rule.config or {},
+        "created_at": dt(rule.created_at),
+        "updated_at": dt(rule.updated_at),
     }
 
 

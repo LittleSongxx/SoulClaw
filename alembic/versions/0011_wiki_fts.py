@@ -34,7 +34,7 @@ def upgrade() -> None:
         """
         CREATE INDEX IF NOT EXISTS ix_wiki_pages_fts
         ON wiki_pages
-        USING GIN (
+        USING GIN ((
             setweight(to_tsvector('simple', coalesce(title, '')), 'A') ||
             setweight(to_tsvector('simple', coalesce(summary, '')), 'B') ||
             setweight(
@@ -54,7 +54,7 @@ def upgrade() -> None:
                 'B'
             ) ||
             setweight(to_tsvector('simple', coalesce(body, '')), 'C')
-        )
+        ))
         """
     )
 

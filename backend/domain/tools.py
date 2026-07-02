@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 from sqlalchemy.orm import Session
 
+from backend.domain.evolution_proposals import EvolutionProposalService
 from backend.domain.memory import MemoryService
 from backend.domain.platform import PlatformService
 from backend.domain.skills import SkillService
@@ -19,6 +20,7 @@ from backend.infra.events import RuntimeEventBus
 from backend.infra.models import ToolRun
 
 if TYPE_CHECKING:
+    from backend.domain.policy import ToolPolicyEngine
     from backend.runtime.a2a import A2ARuntimeManager
     from backend.runtime.gateway import GatewayRuntimeManager
 
@@ -60,7 +62,7 @@ class ToolApprovalRequired(PermissionError):
 
 
 class ToolSafetyFloor:
-    """Hard safety floor inspired by hermes-agent/mateclaw approval patterns."""
+    """Non-negotiable deny-list for catastrophic tool arguments."""
 
     blocked_patterns = (
         re.compile(r"\brm\s+-rf\s+/", re.IGNORECASE),
@@ -70,15 +72,12 @@ class ToolSafetyFloor:
         re.compile(r"\bchmod\s+-R\s+777\s+/", re.IGNORECASE),
     )
 
-    mutating_scopes = {"memory.write", "skill.write", "wiki.write", "system.write", "external.write"}
-
     def validate(self, tool: ToolDefinition, arguments: dict[str, Any], *, approved: bool = False) -> None:
+        del tool, approved
         serialized = repr(arguments)
         for pattern in self.blocked_patterns:
             if pattern.search(serialized):
                 raise PermissionError(f"blocked by hard safety floor: {pattern.pattern}")
-        if tool.scope in self.mutating_scopes and tool.requires_approval and not approved:
-            raise PermissionError("tool requires approval before execution")
 
 
 class ToolRegistry:
@@ -88,6 +87,7 @@ class ToolRegistry:
         wiki: WikiService,
         memory: MemoryService,
         skills: SkillService,
+        proposals: EvolutionProposalService | None = None,
         events: RuntimeEventBus | None = None,
         gateway: GatewayRuntimeManager | None = None,
         a2a: A2ARuntimeManager | None = None,
@@ -96,6 +96,7 @@ class ToolRegistry:
         self.wiki = wiki
         self.memory = memory
         self.skills = skills
+        self.proposals = proposals
         self.events = events
         self.gateway = gateway
         self.a2a = a2a
@@ -302,7 +303,7 @@ class ToolRegistry:
                 name="memory_create",
                 description="Create an L2/L3 memory item.",
                 scope="memory.write",
-                requires_approval=False,
+                requires_approval=True,
                 handler=self._memory_create,
             )
         )
@@ -445,7 +446,7 @@ class ToolRegistry:
                     "Use for DeepResearch, document projects, scheduling, or coding agents."
                 ),
                 scope="external.write",
-                requires_approval=False,
+                requires_approval=True,
                 parameters={
                     "type": "object",
                     "required": ["capability", "query"],
@@ -574,6 +575,12 @@ class ToolRegistry:
                     "kind": item["memory"].kind,
                     "source": item["source"],
                     "score": item["score"],
+                    "hybrid_score": item.get("hybrid_score", item["score"]),
+                    "vector_score": item.get("vector_score", 0.0),
+                    "fts_score": item.get("fts_score", 0.0),
+                    "match_reasons": item.get("match_reasons", []),
+                    "confidence": item["memory"].confidence,
+                    "stability": item["memory"].stability,
                     "summary": item["memory"].content[:500],
                 }
                 for item in self.memory.search(db, query, limit=limit)
@@ -598,18 +605,26 @@ class ToolRegistry:
         }
 
     def _memory_create(self, db: Session, arguments: dict[str, Any]) -> dict[str, Any]:
-        memory = self.memory.create(
+        if self.proposals is None:
+            raise RuntimeError("evolution proposal service is not configured")
+        proposal = self.proposals.create(
             db,
-            kind=str(arguments.get("kind") or "agent_note"),
-            content=str(arguments["content"]),
-            source=str(arguments.get("source") or "tool"),
-            pinned=bool(arguments.get("pinned", False)),
-            importance=float(arguments.get("importance", 0.5)),
-            confidence=float(arguments.get("confidence", 0.5)),
-            stability=float(arguments.get("stability", 0.5)),
-            metadata=arguments.get("metadata") if isinstance(arguments.get("metadata"), dict) else {},
+            target_type="memory",
+            action="create",
+            payload={
+                "kind": str(arguments.get("kind") or "agent_note"),
+                "content": str(arguments["content"]),
+                "source": str(arguments.get("source") or "tool"),
+                "pinned": bool(arguments.get("pinned", False)),
+                "importance": float(arguments.get("importance", 0.5)),
+                "confidence": float(arguments.get("confidence", 0.5)),
+                "stability": float(arguments.get("stability", 0.5)),
+                "metadata": arguments.get("metadata") if isinstance(arguments.get("metadata"), dict) else {},
+            },
+            evidence={"source": "tool.memory_create"},
+            risk_level="medium",
         )
-        return {"id": str(memory.id), "kind": memory.kind, "content": memory.content}
+        return {"proposal_id": str(proposal.id), "target_type": proposal.target_type, "action": proposal.action, "status": proposal.status}
 
     def _skill_search(self, db: Session, arguments: dict[str, Any]) -> dict[str, Any]:
         query = str(arguments.get("query") or "")
@@ -652,23 +667,35 @@ class ToolRegistry:
         }
 
     def _skill_use_trace(self, db: Session, arguments: dict[str, Any]) -> dict[str, Any]:
-        skill_key = str(arguments.get("skill_key") or "")
-        outcome = str(arguments.get("outcome") or "")
-        notes = str(arguments.get("notes") or "")
+        skill_key = str(arguments.get("skill_key") or "").strip()
+        outcome = str(arguments.get("outcome") or "").strip()[:240]
+        notes = str(arguments.get("notes") or "").strip()[:1000]
+        if not skill_key:
+            raise ValueError("skill_use_trace requires skill_key")
+        if not outcome:
+            raise ValueError("skill_use_trace requires outcome")
         content = f"Skill `{skill_key}` outcome: {outcome}"
-        if notes.strip():
-            content += f" Notes: {notes.strip()}"
-        memory = self.memory.create(
+        if notes:
+            content += f" Notes: {notes}"
+        if self.proposals is None:
+            raise RuntimeError("evolution proposal service is not configured")
+        proposal = self.proposals.create(
             db,
-            kind="skill_trace",
-            content=content,
-            source="skill_use_trace",
-            importance=float(arguments.get("importance", 0.45)),
-            confidence=float(arguments.get("confidence", 0.65)),
-            stability=float(arguments.get("stability", 0.4)),
-            metadata={"skill_key": skill_key, "outcome": outcome, "notes": notes},
+            target_type="memory",
+            action="create",
+            payload={
+                "kind": "skill_trace",
+                "content": content,
+                "source": "skill_use_trace",
+                "importance": float(arguments.get("importance", 0.45)),
+                "confidence": float(arguments.get("confidence", 0.65)),
+                "stability": float(arguments.get("stability", 0.4)),
+                "metadata": {"skill_key": skill_key, "outcome": outcome, "notes": notes},
+            },
+            evidence={"source": "tool.skill_use_trace", "skill_key": skill_key, "outcome": outcome},
+            risk_level="low",
         )
-        return {"memory_id": str(memory.id), "skill_key": skill_key, "outcome": outcome}
+        return {"proposal_id": str(proposal.id), "skill_key": skill_key, "outcome": outcome}
 
     def _skills_scan(self, db: Session, arguments: dict[str, Any]) -> dict[str, Any]:
         return self.skills.scan(db)
@@ -722,7 +749,7 @@ class ToolRegistry:
         if not tool.available:
             raise RuntimeError(f"tool unavailable: {tool_name}")
         call_arguments = arguments.get("arguments") if isinstance(arguments.get("arguments"), dict) else {}
-        if (tool.requires_approval or tool.scope in ToolSafetyFloor.mutating_scopes) and not bool(arguments.get("_approved")):
+        if tool.requires_approval and not bool(arguments.get("_approved")):
             raise PermissionError(f"tool requires approval: {tool_name}")
         if bool(arguments.get("_approved")):
             call_arguments = {**call_arguments, "_approved": True}
@@ -751,8 +778,6 @@ class ToolRegistry:
 
         capability = str(arguments.get("capability") or "")
         options = arguments.get("options") if isinstance(arguments.get("options"), dict) else {}
-        if self.a2a.requires_approval(capability, options) and not bool(arguments.get("_approved")):
-            raise PermissionError("A2A delegation requires approval for high-risk capability")
         return self.a2a.delegate(
             db,
             A2ADelegateRequest(
@@ -774,11 +799,13 @@ class ToolExecutor:
         events: RuntimeEventBus | None = None,
         safety: ToolSafetyFloor | None = None,
         platform: PlatformService | None = None,
+        policy: ToolPolicyEngine | None = None,
     ) -> None:
         self.registry = registry
         self.events = events
         self.safety = safety or ToolSafetyFloor()
         self.platform = platform
+        self.policy = policy
 
     def execute(
         self,
@@ -795,16 +822,42 @@ class ToolExecutor:
             raise KeyError(f"tool not found: {tool_name}")
         if not definition.available:
             raise RuntimeError(f"tool unavailable: {tool_name}")
-        if definition.requires_approval and not approved:
+        decision = None
+        if self.policy is not None:
+            decision = self.policy.decide(
+                db,
+                tool_name=tool_name,
+                scope=definition.scope,
+                arguments=arguments,
+                declared_requires_approval=definition.requires_approval,
+            )
+            if not decision.allowed:
+                if self.events:
+                    self.events.emit(
+                        "tool.denied",
+                        {"tool_name": tool_name, "policy": decision.to_dict()},
+                        severity="warning",
+                        turn_id=turn_id,
+                    )
+                raise PermissionError(f"tool denied by policy: {tool_name}")
+        requires_approval = bool(decision.requires_approval if decision is not None else definition.requires_approval)
+        if requires_approval and not approved:
             approval = None
             if self.platform is not None:
-                approval = self._create_tool_approval(db, tool_name=tool_name, arguments=arguments, turn_id=turn_id)
+                approval = self._create_tool_approval(
+                    db,
+                    tool_name=tool_name,
+                    arguments=arguments,
+                    turn_id=turn_id,
+                    policy_decision=decision.to_dict() if decision is not None else {},
+                )
             if self.events:
                 self.events.emit(
                     "tool.approval_required",
                     {
                         "tool_name": tool_name,
                         "approval_id": str(approval.id) if approval is not None else None,
+                        "policy": decision.to_dict() if decision is not None else {},
                     },
                     severity="warning",
                     turn_id=turn_id,
@@ -859,6 +912,7 @@ class ToolExecutor:
                     arguments=arguments,
                     turn_id=turn_id,
                     dynamic_approval=True,
+                    policy_decision=decision.to_dict() if decision is not None else {},
                 )
             run.status = "approval_required"
             run.result = {"error": str(exc), "approval_id": str(approval.id) if approval is not None else None}
@@ -907,10 +961,11 @@ class ToolExecutor:
         arguments: dict[str, Any],
         turn_id: str,
         dynamic_approval: bool = False,
+        policy_decision: dict[str, Any] | None = None,
     ):
         if self.platform is None:
             return None
-        payload = {"tool_name": tool_name, "arguments": arguments, "turn_id": turn_id}
+        payload = {"tool_name": tool_name, "arguments": arguments, "turn_id": turn_id, "policy": policy_decision or {}}
         if dynamic_approval:
             payload["dynamic_approval"] = True
         try:
@@ -920,9 +975,9 @@ class ToolExecutor:
                 subject_id=tool_name,
                 payload=payload,
                 original_tool_call={"tool_name": tool_name, "arguments": arguments},
-                turn_checkpoint={"turn_id": turn_id, "tool_name": tool_name},
+                turn_checkpoint={"turn_id": turn_id, "tool_name": tool_name, "pending_tool_call": {"name": tool_name, "arguments": arguments}},
                 allowed_decisions=["approve", "edit", "reject", "respond"],
-                resume_state={"mode": "rerun_tool"},
+                resume_state={"mode": "tool_rerun", "pending_tool_call": {"name": tool_name, "arguments": arguments}},
             )
         except TypeError:
             return self.platform.create_approval(

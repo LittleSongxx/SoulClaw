@@ -1,0 +1,25 @@
+export type ConsoleRecord = Record<string, unknown>;
+
+export type ViewKey =
+  | "dashboard"
+  | "wiki"
+  | "context"
+  | "memory"
+  | "skills"
+  | "tools"
+  | "cron"
+  | "mcp"
+  | "gateways"
+  | "a2a"
+  | "heartbeat"
+  | "reliability"
+  | "sessions"
+  | "jobs"
+  | "proposals"
+  | "approvals"
+  | "runs"
+  | "runGraph"
+  | "vector"
+  | "policy"
+  | "audit"
+  | "settings";

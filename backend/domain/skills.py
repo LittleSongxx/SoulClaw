@@ -14,6 +14,7 @@ import yaml
 from sqlalchemy import delete, desc, or_, select
 from sqlalchemy.orm import Session
 
+from backend.domain.vector import KnowledgeVectorService
 from backend.infra.config import Settings, get_settings
 from backend.infra.events import RuntimeEventBus
 from backend.infra.models import EvolutionProposal, Skill, SkillFile, SkillHistory, SkillTest
@@ -88,9 +89,11 @@ class SkillService:
         self,
         settings: Settings | None = None,
         events: RuntimeEventBus | None = None,
+        vector: KnowledgeVectorService | None = None,
     ) -> None:
         self.settings = settings or get_settings()
         self.events = events
+        self.vector = vector
 
     @property
     def root(self) -> Path:
@@ -133,9 +136,20 @@ class SkillService:
             self._sync_declared_tests(db, skill_key, metadata)
             count += 1
 
+        vector_result: dict[str, Any] = {"enabled": self.vector is not None, "embedded": 0, "failed": 0, "skipped": 0}
+        if self.vector is not None:
+            try:
+                files = list(db.scalars(select(SkillFile).order_by(SkillFile.skill_key, SkillFile.file_path)).all())
+                vector_result = self.vector.upsert_skill_files(db, files, strict=False)
+                source_ids = {f"{file.skill_key}:{file.file_path}" for file in files}
+                self.vector.purge_source(db, source_type="skill", source_ids=source_ids)
+            except Exception as exc:  # noqa: BLE001
+                vector_result = {"enabled": True, "embedded": 0, "failed": 0, "skipped": 0, "error": str(exc)}
+                if self.events:
+                    self.events.emit("skills.vector.refresh_failed", vector_result, severity="warning")
         if self.events:
-            self.events.emit("skills.scan", {"skills": count, "index": "file_mirror"})
-        return {"skills": count, "index": "file_mirror"}
+            self.events.emit("skills.scan", {"skills": count, "index": "file_mirror", "vector": vector_result})
+        return {"skills": count, "index": "file_mirror", "vector": vector_result}
 
     def list(self, db: Session, *, status: str | None = None, limit: int = 200) -> list[Skill]:
         stmt = select(Skill).order_by(Skill.skill_key).limit(max(1, min(limit, 1000)))
@@ -277,59 +291,11 @@ class SkillService:
         db.add(test_record)
         return payload
 
-    def create_proposal(
-        self,
-        db: Session,
-        *,
-        target_type: str,
-        action: str,
-        payload: dict[str, Any],
-        evidence: dict[str, Any] | None = None,
-        risk_level: str = "medium",
-    ) -> EvolutionProposal:
-        payload = dict(payload)
-        target_checksum = ""
-        before_snapshot: dict[str, Any] = {}
-        if target_type == "skill":
-            skill_key = normalize_skill_key(str(payload.get("skill_key") or ""))
-            files = payload.get("files")
-            if skill_key and isinstance(files, dict):
-                current = self._snapshot(self._safe_skill_dir(skill_key))
-                proposed = {str(path): str(content) for path, content in files.items()}
-                target_checksum = snapshot_checksum(current)
-                before_snapshot = {"files": current, "checksum": target_checksum}
-                payload.setdefault("base_checksum", target_checksum)
-                payload.setdefault("diff", self._diff_summary(current, proposed))
-        proposal = EvolutionProposal(
-            target_type=target_type,
-            action=action,
-            status="pending",
-            risk_level=risk_level,
-            payload=payload,
-            evidence=evidence or {},
-            before_snapshot=before_snapshot,
-            target_checksum=target_checksum,
-        )
-        db.add(proposal)
-        db.flush()
-        if self.events:
-            self.events.emit(
-                "skill.proposal.created",
-                {"proposal_id": str(proposal.id), "target_type": target_type, "action": action},
-            )
-            self.events.audit(
-                "evolution.proposal.create",
-                "evolution_proposal",
-                target_id=str(proposal.id),
-                payload={"target_type": target_type, "action": action},
-            )
-        return proposal
+    def snapshot_for_proposal(self, skill_key: str) -> dict[str, str]:
+        return self._snapshot(self._safe_skill_dir(normalize_skill_key(skill_key)))
 
-    def list_proposals(self, db: Session, *, status: str | None = None, limit: int = 100) -> list[EvolutionProposal]:
-        stmt = select(EvolutionProposal).order_by(desc(EvolutionProposal.created_at)).limit(max(1, min(limit, 500)))
-        if status:
-            stmt = stmt.where(EvolutionProposal.status == status)
-        return list(db.scalars(stmt).all())
+    def diff_summary_for_proposal(self, current: dict[str, str], proposed: dict[str, str]) -> dict[str, Any]:
+        return self._diff_summary(current, proposed)
 
     def apply_proposal(self, db: Session, proposal_id: uuid.UUID, *, actor: str = "admin") -> EvolutionProposal:
         proposal = db.get(EvolutionProposal, proposal_id)

@@ -11,7 +11,7 @@ summary: Default writing and structure rules for the SoulClaw LLM-Wiki.
 
 # Wiki Schema
 
-This Wiki is the Markdown source of truth for durable, inspectable knowledge.
+This Wiki is the Markdown source of truth for durable, inspectable LLM-Wiki knowledge. It is separate from personal long-term state, which is governed by structured database state and reviewable proposals.
 
 ## Page Types
 

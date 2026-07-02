@@ -14,15 +14,21 @@ from loguru import logger
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from . import __version__
-from .api.admin import a2a, auth, control, dream, memory, platform, skills, tools, wiki
+from .api.admin import a2a, auth, context, control, dream, memory, platform, skills, tools, wiki
 from .domain.a2a import A2AService
 from .domain.conversation import ConversationService
+from .domain.core_context import CoreContextService
 from .domain.evolution import EvolutionService
+from .domain.evolution_proposals import EvolutionProposalService
 from .domain.jobs import BackgroundJobService
 from .domain.memory import MemoryService
+from .domain.memory_curator import MemoryCuratorService
+from .domain.policy import ToolPolicyEngine
 from .domain.platform import PlatformService
+from .domain.runs import AgentRunService
 from .domain.skills import SkillService
 from .domain.tools import ToolExecutor, ToolRegistry
+from .domain.vector import KnowledgeVectorService
 from .domain.wiki import WikiService
 from .domain.workspace import WorkspaceService
 from .infra.config import get_settings
@@ -37,8 +43,10 @@ from .infra.security import ensure_admin_user
 from .infra.trace import bind_trace_context, trace_id_from_traceparent, traceparent_from_trace_id
 from .runtime.a2a import A2ARuntimeManager
 from .runtime.agent import AgentRuntime
+from .runtime.checkpoint import AgentCheckpointStore
 from .runtime.cron import CronScheduler
 from .runtime.dream import DreamRuntime
+from .runtime.embedding import OpenAICompatibleEmbeddingClient
 from .runtime.gateway import GatewayRuntimeManager
 from .runtime.heartbeat import HeartbeatRuntime
 from .runtime.llm import OpenAICompatibleClient
@@ -53,14 +61,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     logger.remove()
     logger.add(lambda msg: print(msg, end=""), level=settings.log_level.upper())
     logger.info("starting {} v{} ({})", settings.app_name, __version__, settings.environment)
-    if (
-        settings.database_url.startswith("sqlite")
-        and (settings.redis_required or settings.api_scheduler_enabled)
-        and not settings.queue_eager
-    ):
-        logger.warning(
-            "SQLite is intended for single-process local development; use the Postgres profile for API + worker + scheduler deployments."
-        )
+    if settings.vector_required and settings.database_url.startswith("sqlite"):
+        raise RuntimeError("SOULCLAW_VECTOR_MODE=required needs Postgres + pgvector; set SOULCLAW_DATABASE_URL to Postgres or disable vectors for tests")
 
     if settings.auto_migrate:
         run_alembic_upgrade(settings)
@@ -77,9 +79,22 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     workspace_service = WorkspaceService(settings=settings, events=events)
     workspace_service.ensure_files()
-    wiki_service = WikiService(settings=settings, events=events)
-    memory_service = MemoryService(settings=settings, events=events, workspace=workspace_service)
-    skill_service = SkillService(settings=settings, events=events)
+    embedding_client = OpenAICompatibleEmbeddingClient(settings, events=events, resilience=resilience, rate_limiter=rate_limiter)
+    vector_service = KnowledgeVectorService(embeddings=embedding_client, settings=settings, events=events)
+    policy_engine = ToolPolicyEngine(events=events)
+    run_service = AgentRunService(settings=settings, events=events)
+    checkpoint_store = AgentCheckpointStore(settings=settings, events=events)
+    wiki_service = WikiService(settings=settings, events=events, vector=vector_service)
+    core_context_service = CoreContextService(workspace=workspace_service, events=events)
+    memory_service = MemoryService(settings=settings, events=events, vector=vector_service)
+    skill_service = SkillService(settings=settings, events=events, vector=vector_service)
+    evolution_proposal_service = EvolutionProposalService(skills=skill_service, events=events)
+    memory_curator_service = MemoryCuratorService(
+        memory=memory_service,
+        core_context=core_context_service,
+        proposals=evolution_proposal_service,
+        events=events,
+    )
     conversation_service = ConversationService(events=events)
     a2a_service = A2AService(events=events)
     platform_service = PlatformService(events=events)
@@ -88,13 +103,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         skills=skill_service,
         memory=memory_service,
         wiki=wiki_service,
-        workspace=workspace_service,
-        events=events,
+        core_context=core_context_service,
     )
+    with session_scope() as db:
+        with events.bind_session(db):
+            policy_engine.ensure_defaults(db)
     tool_registry = ToolRegistry(
         wiki=wiki_service,
         memory=memory_service,
         skills=skill_service,
+        proposals=evolution_proposal_service,
         events=events,
         max_direct_tool_schemas=settings.tool_schema_direct_limit,
     )
@@ -126,9 +144,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         settings=settings,
         http_timeout_seconds=settings.a2a_http_timeout_seconds,
         resilience=resilience,
+        platform=platform_service,
     )
     tool_registry.install_a2a(a2a_runtime)
-    tool_executor = ToolExecutor(tool_registry, events=events, platform=platform_service)
+    tool_executor = ToolExecutor(tool_registry, events=events, platform=platform_service, policy=policy_engine)
     llm_client = OpenAICompatibleClient(settings, events=events, resilience=resilience, rate_limiter=rate_limiter)
     agent_runtime = AgentRuntime(
         wiki=wiki_service,
@@ -138,8 +157,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         registry=tool_registry,
         llm=llm_client,
         conversation=conversation_service,
-        workspace=workspace_service,
+        core_context=core_context_service,
+        memory_curator=memory_curator_service,
         a2a=a2a_runtime,
+        runs=run_service,
+        checkpoints=checkpoint_store,
     )
     gateway_runtime = GatewayRuntimeManager(
         agent=agent_runtime,
@@ -149,8 +171,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         resilience=resilience,
     )
     tool_registry.install_gateway(gateway_runtime)
-    dream_runtime = DreamRuntime(skills=skill_service, events=events)
-    heartbeat_runtime = HeartbeatRuntime(workspace=workspace_service, skills=skill_service, events=events)
+    dream_runtime = DreamRuntime(proposals=evolution_proposal_service, events=events)
+    heartbeat_runtime = HeartbeatRuntime(core_context=core_context_service, proposals=evolution_proposal_service, events=events)
     cron_scheduler = CronScheduler(agent=agent_runtime, dream=dream_runtime, jobs=job_service, events=events)
 
     app.state.settings = settings
@@ -159,6 +181,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.rate_limiter = rate_limiter
     app.state.redis_client = redis_client
     app.state.workspace_service = workspace_service
+    app.state.embedding_client = embedding_client
+    app.state.vector_service = vector_service
+    app.state.policy_engine = policy_engine
+    app.state.run_service = run_service
+    app.state.checkpoint_store = checkpoint_store
+    app.state.core_context_service = core_context_service
+    app.state.memory_curator_service = memory_curator_service
+    app.state.evolution_proposal_service = evolution_proposal_service
     app.state.wiki_service = wiki_service
     app.state.memory_service = memory_service
     app.state.skill_service = skill_service
@@ -195,6 +225,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("[skills] startup scan failed: {}", exc)
                     events.emit("skills.bootstrap.failed", {"error": str(exc)}, severity="warning")
+            try:
+                core_context_service.ensure_defaults(db)
+                core_context_service.refresh_projections(db)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[context] startup projection refresh failed: {}", exc)
+                events.emit("core_context.bootstrap.failed", {"error": str(exc)}, severity="warning")
             if settings.dream_review_enabled:
                 try:
                     platform_service.ensure_system_cron_job(
@@ -222,7 +258,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                         name="system-heartbeat",
                         cron_expr=settings.heartbeat_cron,
                         timezone=settings.heartbeat_timezone,
-                        instruction="Review HEARTBEAT.md active tasks and create pending proposals.",
+                        instruction="Review structured heartbeat tasks and create pending proposals.",
                         metadata={"system_task": "heartbeat", "managed_by": "soulclaw", "task_name": "heartbeat_check"},
                         enabled=True,
                     )
@@ -242,6 +278,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                             "auth_user_header": settings.a2a_soulsearcher_auth_user_header,
                             "user_id": settings.a2a_soulsearcher_user_id,
                             "accepted_output_modes": ["text/markdown", "text/html", "application/json"],
+                            "callback_url": settings.a2a_callback_public_url,
+                            "callback_token": settings.a2a_callback_secret,
                         },
                         enabled=True,
                         status="pending",
@@ -311,6 +349,7 @@ def create_app() -> FastAPI:
             return app.state.observability.metrics_response()
 
     app.include_router(auth.router)
+    app.include_router(context.router)
     app.include_router(wiki.router)
     app.include_router(memory.router)
     app.include_router(skills.router)

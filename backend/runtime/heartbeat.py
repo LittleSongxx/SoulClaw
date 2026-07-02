@@ -6,8 +6,8 @@ from dataclasses import dataclass
 
 from sqlalchemy.orm import Session
 
-from backend.domain.skills import SkillService
-from backend.domain.workspace import WorkspaceService
+from backend.domain.core_context import CoreContextService
+from backend.domain.evolution_proposals import EvolutionProposalService
 from backend.infra.events import RuntimeEventBus
 
 
@@ -20,37 +20,33 @@ class HeartbeatResult:
 
 
 class HeartbeatRuntime:
-    def __init__(self, *, workspace: WorkspaceService, skills: SkillService, events: RuntimeEventBus) -> None:
-        self.workspace = workspace
-        self.skills = skills
+    def __init__(self, *, core_context: CoreContextService, proposals: EvolutionProposalService, events: RuntimeEventBus) -> None:
+        self.core_context = core_context
+        self.proposals = proposals
         self.events = events
 
     def run_check(self, db: Session) -> HeartbeatResult:
-        tasks = self.workspace.active_heartbeat_tasks()
+        tasks = self.core_context.heartbeat_tasks(db)
         if not tasks:
             result = HeartbeatResult(status="skipped", active_tasks=0, proposals_created=0, proposal_ids=[])
-            self.workspace.append_history({"type": "heartbeat", "status": "skipped", "reason": "no active tasks"})
-            self.events.emit("heartbeat.skipped", {"reason": "no active tasks"})
+            self.events.emit("heartbeat.skipped", {"reason": "no active structured tasks"})
             return result
 
         proposal_ids: list[str] = []
         for index, task in enumerate(tasks, start=1):
-            proposal = self.skills.create_proposal(
+            proposal = self.proposals.create(
                 db,
-                target_type="heartbeat",
-                action="append_file",
+                target_type="core_context",
+                action="update",
                 risk_level="low",
                 payload={
-                    "kind": "heartbeat",
-                    "content": f"- Reviewed active task {index}: {task}\n  - Status: pending human review.",
+                    "block_key": "heartbeat",
+                    "content": f"Reviewed active task {index}: {task}\nStatus: pending human review.",
                     "heartbeat_task": task,
                 },
-                evidence={"heartbeat_task": task, "source": "HEARTBEAT.md"},
+                evidence={"heartbeat_task": task, "source": "core_context"},
             )
             proposal_ids.append(str(proposal.id))
-        self.workspace.append_history(
-            {"type": "heartbeat", "status": "proposed", "active_tasks": tasks, "proposal_ids": proposal_ids}
-        )
         result = HeartbeatResult(
             status="proposed",
             active_tasks=len(tasks),

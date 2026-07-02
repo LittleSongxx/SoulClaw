@@ -10,17 +10,21 @@ from datetime import UTC, datetime
 from typing import Any
 
 import httpx
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from backend.domain.a2a import A2AService
+from backend.domain.platform import PlatformService
 from backend.infra.config import Settings
 from backend.infra.events import RuntimeEventBus
-from backend.infra.models import A2AAgentConnection, A2ATask
+from backend.infra.models import A2AAgentConnection, A2ATask, Approval
 from backend.infra.resilience import ResilienceManager, ResiliencePolicy
 
 A2A_VERSION = "1.0"
 TERMINAL_TASK_STATES = {"completed", "failed", "canceled", "rejected"}
-PAUSED_TASK_STATES = {"input-required"}
+PAUSED_TASK_STATES = {"input-required", "auth-required"}
+ACTIVE_REMOTE_TASK_STATES = {"submitted", "working", "input-required", "auth-required", "stalled"}
+REMOTE_APPROVAL_STATES = {"input-required", "auth-required"}
 A2A_STATE_BY_LOCAL_STATUS = {
     "submitted": "TASK_STATE_SUBMITTED",
     "working": "TASK_STATE_WORKING",
@@ -31,6 +35,7 @@ A2A_STATE_BY_LOCAL_STATUS = {
     "cancelled": "TASK_STATE_CANCELED",
     "rejected": "TASK_STATE_REJECTED",
     "auth-required": "TASK_STATE_AUTH_REQUIRED",
+    "stalled": "TASK_STATE_WORKING",
 }
 A2A_LOCAL_STATUS_BY_STATE = {
     "TASK_STATE_SUBMITTED": "submitted",
@@ -42,20 +47,8 @@ A2A_LOCAL_STATUS_BY_STATE = {
     "TASK_STATE_CANCELLED": "canceled",
     "TASK_STATE_REJECTED": "rejected",
     "TASK_STATE_AUTH_REQUIRED": "auth-required",
+    "TASK_STATE_STALLED": "stalled",
 }
-HIGH_RISK_CAPABILITIES = {
-    "code",
-    "code-writing",
-    "coding",
-    "schedule",
-    "calendar",
-    "document-write",
-    "write",
-    "send",
-    "external-write",
-}
-
-
 @dataclass(frozen=True)
 class A2ADelegateRequest:
     capability: str
@@ -75,12 +68,14 @@ class A2ARuntimeManager:
         settings: Settings,
         http_timeout_seconds: float = 60.0,
         resilience: ResilienceManager | None = None,
+        platform: PlatformService | None = None,
     ) -> None:
         self.service = service
         self.events = events
         self.settings = settings
         self.http_timeout_seconds = http_timeout_seconds
         self.resilience = resilience or ResilienceManager(events=events)
+        self.platform = platform
         self.http_policy = ResiliencePolicy(
             name="a2a.http_jsonrpc",
             max_attempts=3,
@@ -167,7 +162,12 @@ class A2ARuntimeManager:
             capability=request.capability,
             input_text=request.query,
             context_id=str(request.context.get("context_id") or request.options.get("context_id") or ""),
-            metadata={"context": request.context, "files": request.files, "options": request.options},
+            metadata={
+                "context": request.context,
+                "files": request.files,
+                "options": request.options,
+                "client_request_id": str(request.options.get("client_request_id") or request.context.get("client_request_id") or ""),
+            },
         )
         self.service.mark_task(db, task, status="working")
         try:
@@ -188,6 +188,150 @@ class A2ARuntimeManager:
             self._call_jsonrpc(connection, "CancelTask", {"id": task.remote_task_id})
         self.service.mark_task(db, task, status="canceled")
         return {"ok": True, "task": self.task_to_a2a(db, task)}
+
+    def resume_remote_approval(
+        self,
+        db: Session,
+        approval_id: str | uuid.UUID,
+        *,
+        decision: str = "approve",
+        edited_payload: dict[str, Any] | None = None,
+        response: str = "",
+    ) -> dict[str, Any]:
+        approval = db.get(Approval, uuid.UUID(str(approval_id)))
+        if approval is None:
+            raise KeyError(f"approval not found: {approval_id}")
+        if approval.subject_type != "a2a_remote_hitl":
+            raise ValueError("approval is not for a remote A2A HITL request")
+        task = self.service.get_task_by_any_id(db, approval.subject_id)
+        if task is None:
+            raise KeyError(f"A2A task not found: {approval.subject_id}")
+        connection = self.service.get_connection(db, task.connection_name)
+        if connection is None:
+            raise KeyError(f"A2A connection not found: {task.connection_name}")
+        normalized_decision = str(decision or "approve").strip().lower()
+        resume_payload = edited_payload or self._resume_payload_from_approval(
+            approval,
+            decision=normalized_decision,
+            response=response,
+        )
+        result = self._send_a2a_followup_message(db, connection, task, resume_payload, decision=normalized_decision)
+        approval.status = "rejected" if normalized_decision == "reject" else "approved"
+        approval.resolved_at = datetime.now(UTC)
+        approval.resume_state = {
+            **(approval.resume_state or {}),
+            "resumed": True,
+            "decision": normalized_decision,
+            "resume_payload": resume_payload,
+            "result": result,
+        }
+        self.service.add_event(
+            db,
+            task.task_id,
+            "a2a.remote_hitl_resumed",
+            {"approval_id": str(approval.id), "decision": normalized_decision, "result": result},
+        )
+        return {"ok": True, "approval_id": str(approval.id), "task_id": task.task_id, "result": result}
+
+    def sync_remote_task(self, db: Session, task_id: str) -> dict[str, Any]:
+        task = self.service.get_task_by_any_id(db, task_id)
+        if task is None:
+            raise KeyError(f"A2A task not found: {task_id}")
+        connection = self.service.get_connection(db, task.connection_name)
+        if connection is None:
+            raise KeyError(f"A2A connection not found: {task.connection_name}")
+        remote_id = task.remote_task_id or task.task_id
+        response = self._call_jsonrpc(connection, "GetTask", {"id": remote_id})
+        result = response.get("result") if isinstance(response, dict) else response
+        if isinstance(result, dict) and "task" in result and isinstance(result.get("task"), dict):
+            result = result["task"]
+        if not isinstance(result, dict):
+            raise RuntimeError("remote GetTask returned a non-object result")
+        self._apply_remote_task_snapshot(db, connection=connection, task=task, remote=result, event_type="a2a.remote_sync")
+        return {"ok": True, "task": self.task_to_a2a(db, task), "remote": result}
+
+    def sync_active_remote_tasks(
+        self,
+        db: Session,
+        *,
+        statuses: list[str] | None = None,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        target_statuses = {str(item).strip() for item in (statuses or []) if str(item).strip()} or ACTIVE_REMOTE_TASK_STATES
+        limit = max(1, min(int(limit or 50), 200))
+        candidates: list[A2ATask] = []
+        seen: set[str] = set()
+        for status in sorted(target_statuses):
+            for task in self.service.list_tasks(db, status=status, limit=limit):
+                if task.task_id in seen:
+                    continue
+                seen.add(task.task_id)
+                if task.status not in target_statuses or not task.remote_task_id:
+                    continue
+                candidates.append(task)
+                if len(candidates) >= limit:
+                    break
+            if len(candidates) >= limit:
+                break
+        synced: list[dict[str, Any]] = []
+        errors: list[dict[str, Any]] = []
+        for task in candidates:
+            try:
+                result = self.sync_remote_task(db, task.task_id)
+                synced.append({"task_id": task.task_id, "status": result.get("task", {}).get("status")})
+            except Exception as exc:  # noqa: BLE001
+                errors.append({"task_id": task.task_id, "error": str(exc)})
+                self.service.add_event(db, task.task_id, "a2a.remote_sync_failed", {"error": str(exc)})
+        return {
+            "ok": not errors,
+            "candidate_count": len(candidates),
+            "synced": len(synced),
+            "errors": errors,
+            "items": synced,
+        }
+
+    def handle_callback(self, db: Session, payload: dict[str, Any]) -> dict[str, Any]:
+        metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+        task_id = str(metadata.get("soulclaw_task_id") or payload.get("soulclaw_task_id") or "")
+        remote_task_id = str(payload.get("task_id") or payload.get("taskId") or "")
+        task = self.service.get_task_by_any_id(db, task_id or remote_task_id)
+        if task is None:
+            raise KeyError(f"A2A task not found for callback: {task_id or remote_task_id}")
+        connection = self.service.get_connection(db, task.connection_name)
+        if connection is None:
+            raise KeyError(f"A2A connection not found: {task.connection_name}")
+        event = str(payload.get("event") or "task.status_update")
+        self.service.add_event(db, task.task_id, "a2a.callback", payload)
+        artifact = payload.get("artifact") if isinstance(payload.get("artifact"), dict) else {}
+        if artifact:
+            self._persist_a2a_artifact(
+                db,
+                task,
+                {
+                    "artifactId": artifact.get("artifact_id") or artifact.get("artifactId") or artifact.get("id") or "",
+                    "name": artifact.get("name") or "A2A Artifact",
+                    "parts": artifact.get("parts") if isinstance(artifact.get("parts"), list) else [],
+                    "metadata": artifact,
+                },
+            )
+        status = _status_from_callback_event(event, payload)
+        result = {**(task.result or {}), "callback": payload}
+        error = ""
+        if status == "failed":
+            error_payload = payload.get("error") if isinstance(payload.get("error"), dict) else {}
+            error = str(error_payload.get("message") or payload.get("message") or "remote task failed")
+            result["error"] = error_payload
+        self.service.mark_task(
+            db,
+            task,
+            status=status,
+            result=result,
+            error=error,
+            remote_task_id=remote_task_id,
+            remote_context_id=str(payload.get("context_id") or payload.get("contextId") or ""),
+        )
+        self._ensure_remote_hitl_approval(db, connection=connection, task=task, remote=payload, status=status)
+        return {"ok": True, "task_id": task.task_id, "status": task.status}
 
     def handle_jsonrpc(self, db: Session, payload: dict[str, Any]) -> dict[str, Any]:
         request_id = payload.get("id")
@@ -302,12 +446,7 @@ class A2ARuntimeManager:
                 "user",
                 request.query,
                 context_id=task.context_id,
-                metadata={
-                    "capability": request.capability,
-                    "context": request.context,
-                    "files": request.files,
-                    "options": request.options,
-                },
+                metadata=self._delegate_metadata(task, request),
             ),
             "configuration": {
                 "acceptedOutputModes": self._accepted_output_modes(connection),
@@ -358,11 +497,19 @@ class A2ARuntimeManager:
             remote_task_id=remote_task_id,
             remote_context_id=remote_context_id,
         )
+        approval_id = self._ensure_remote_hitl_approval(
+            db,
+            connection=connection,
+            task=task,
+            remote=result,
+            status=final_status,
+        )
         return {
             "task_id": task.task_id,
             "remote_task_id": remote_task_id,
             "status": final_status,
             "answer": answer,
+            "approval_id": approval_id,
             "remote": result,
             "artifacts": [self._artifact_summary(item) for item in self.service.list_artifacts(db, task.task_id)],
         }
@@ -466,15 +613,265 @@ class A2ARuntimeManager:
             remote_task_id=remote_task_id,
             remote_context_id=remote_context_id,
         )
+        approval_id = self._ensure_remote_hitl_approval(
+            db,
+            connection=connection,
+            task=task,
+            remote=last_remote,
+            status=final_status,
+        )
         return {
             "task_id": task.task_id,
             "remote_task_id": remote_task_id,
             "status": final_status,
             "answer": answer,
             "events": event_count,
+            "approval_id": approval_id,
             "remote": last_remote,
             "artifacts": [self._artifact_summary(item) for item in self.service.list_artifacts(db, task.task_id)],
         }
+
+    def _send_a2a_followup_message(
+        self,
+        db: Session,
+        connection: A2AAgentConnection,
+        task: A2ATask,
+        resume_payload: dict[str, Any],
+        *,
+        decision: str,
+    ) -> dict[str, Any]:
+        text = json.dumps(resume_payload, ensure_ascii=False, default=str)
+        params = {
+            "message": self._message(
+                "user",
+                text,
+                context_id=task.remote_context_id or task.context_id,
+                task_id=task.remote_task_id or task.task_id,
+                metadata={
+                    "resume_payload": resume_payload,
+                    "decision": decision,
+                    "soulclaw_task_id": task.task_id,
+                    "client_request_id": f"{task.task_id}:resume:{uuid.uuid4().hex}",
+                    "context": (task.metadata_json or {}).get("context", {}),
+                },
+            ),
+            "configuration": {"acceptedOutputModes": self._accepted_output_modes(connection)},
+        }
+        if self._supports_streaming(connection):
+            try:
+                return self._send_a2a_streaming_message(db, connection, task, params)
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code not in {400, 404, 405, 501}:
+                    raise
+                self.service.add_event(db, task.task_id, "a2a.resume_streaming_fallback", {"error": str(exc)})
+        response = self._call_jsonrpc(connection, "SendMessage", params)
+        result = response.get("result") if isinstance(response, dict) else response
+        if isinstance(result, dict) and "task" in result and isinstance(result.get("task"), dict):
+            result = result["task"]
+        if not isinstance(result, dict):
+            result = {"raw": result}
+        self._apply_remote_task_snapshot(db, connection=connection, task=task, remote=result, event_type="a2a.resume_task")
+        return {
+            "task_id": task.task_id,
+            "remote_task_id": task.remote_task_id,
+            "status": task.status,
+            "answer": self._answer_from_a2a_result(result),
+            "remote": result,
+            "artifacts": [self._artifact_summary(item) for item in self.service.list_artifacts(db, task.task_id)],
+        }
+
+    def _apply_remote_task_snapshot(
+        self,
+        db: Session,
+        *,
+        connection: A2AAgentConnection,
+        task: A2ATask,
+        remote: dict[str, Any],
+        event_type: str,
+    ) -> None:
+        remote_task_id, remote_context_id = self._remote_ids_from_result(
+            remote,
+            remote_task_id=task.remote_task_id,
+            remote_context_id=task.remote_context_id,
+        )
+        status = self._status_from_a2a_task(remote)
+        answer = self._answer_from_a2a_result(remote)
+        self._persist_task_artifacts(db, task, remote)
+        error_payload = self._remote_error(remote)
+        error = str(error_payload.get("message") or "") if error_payload else ""
+        result = {"remote": remote, "answer": answer}
+        if error_payload:
+            result["error"] = error_payload
+        final_status = status if status in TERMINAL_TASK_STATES | PAUSED_TASK_STATES else "working"
+        self.service.add_event(db, task.task_id, event_type, {"remote": remote})
+        self.service.mark_task(
+            db,
+            task,
+            status=final_status,
+            result=result,
+            error=error if final_status == "failed" else "",
+            remote_task_id=remote_task_id,
+            remote_context_id=remote_context_id,
+        )
+        self._ensure_remote_hitl_approval(db, connection=connection, task=task, remote=remote, status=final_status)
+
+    def _ensure_remote_hitl_approval(
+        self,
+        db: Session,
+        *,
+        connection: A2AAgentConnection,
+        task: A2ATask,
+        remote: dict[str, Any],
+        status: str,
+    ) -> str:
+        if status not in REMOTE_APPROVAL_STATES or self.platform is None:
+            return ""
+        existing = db.scalar(
+            select(Approval).where(
+                Approval.subject_type == "a2a_remote_hitl",
+                Approval.subject_id == task.task_id,
+                Approval.status == "pending",
+            )
+        )
+        if existing is not None:
+            return str(existing.id)
+        hitl = self._remote_hitl(remote)
+        allowed = hitl.get("allowed_decisions") if isinstance(hitl.get("allowed_decisions"), list) else []
+        allowed_decisions = [str(item) for item in allowed if str(item).strip()] or ["approve", "edit", "reject", "respond"]
+        payload = {
+            "kind": "a2a_remote_hitl",
+            "connection_name": connection.name,
+            "local_task_id": task.task_id,
+            "remote_task_id": task.remote_task_id,
+            "remote_context_id": task.remote_context_id,
+            "status": status,
+            "hitl": hitl,
+            "remote": remote,
+        }
+        approval = self.platform.create_approval(
+            db,
+            subject_type="a2a_remote_hitl",
+            subject_id=task.task_id,
+            payload=payload,
+            original_tool_call={"tool_name": "a2a_delegate", "arguments": task.metadata_json or {}},
+            allowed_decisions=allowed_decisions,
+            resume_state={
+                "mode": "a2a_remote_hitl",
+                "connection_name": connection.name,
+                "local_task_id": task.task_id,
+                "remote_task_id": task.remote_task_id,
+                "remote_context_id": task.remote_context_id,
+                "hitl": hitl,
+            },
+        )
+        task.metadata_json = {**(task.metadata_json or {}), "remote_approval_id": str(approval.id)}
+        self.service.add_event(
+            db,
+            task.task_id,
+            "a2a.remote_hitl_required",
+            {"approval_id": str(approval.id), "hitl": hitl},
+        )
+        return str(approval.id)
+
+    def _resume_payload_from_approval(
+        self,
+        approval: Approval,
+        *,
+        decision: str,
+        response: str,
+    ) -> dict[str, Any]:
+        if decision == "reject":
+            return {"action": "reject", "message": response or "User rejected remote A2A continuation."}
+        if decision == "respond":
+            return {"action": "respond", "content": response or (approval.resume_state or {}).get("response", "")}
+        edited = approval.edited_arguments if isinstance(approval.edited_arguments, dict) else {}
+        if decision == "edit" and edited:
+            return edited
+        hitl = (approval.resume_state or {}).get("hitl") if isinstance(approval.resume_state, dict) else {}
+        action_requests = hitl.get("action_requests") if isinstance(hitl, dict) and isinstance(hitl.get("action_requests"), list) else []
+        tool_calls = []
+        for item in action_requests:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or item.get("tool") or item.get("tool_name") or "")
+            args = item.get("args") if isinstance(item.get("args"), dict) else item.get("arguments")
+            tool_calls.append({"name": name, "args": args if isinstance(args, dict) else {}})
+        if tool_calls:
+            return {"tool_approved": True, "tool_calls": tool_calls}
+        return {"action": "approve"}
+
+    def _delegate_metadata(self, task: A2ATask, request: A2ADelegateRequest) -> dict[str, Any]:
+        context = dict(request.context or {})
+        options = dict(request.options or {})
+        client_request_id = str(options.get("client_request_id") or context.get("client_request_id") or task.task_id)
+        callback_url = str(options.get("callback_url") or self._callback_url()).strip()
+        callback_token = str(options.get("callback_token") or getattr(self.settings, "a2a_callback_secret", "") or "").strip()
+        return {
+            "capability": request.capability,
+            "context": context,
+            "files": request.files,
+            "options": options,
+            "soulclaw_task_id": task.task_id,
+            "client_request_id": client_request_id,
+            "idempotency_key": client_request_id,
+            "user_id": str(options.get("user_id") or context.get("user_id") or getattr(self.settings, "a2a_soulsearcher_user_id", "soulclaw")),
+            "session_id": str(context.get("session_id") or ""),
+            "turn_id": str(context.get("turn_id") or ""),
+            "callback_url": callback_url,
+            "callback_token": callback_token,
+            "callback_token_id": "soulclaw-a2a-callback" if callback_token else "",
+        }
+
+    def _callback_url(self) -> str:
+        configured = str(getattr(self.settings, "a2a_callback_public_url", "") or "").strip()
+        if configured:
+            return configured
+        base_url = str(getattr(self.settings, "public_base_url", "") or "").rstrip("/")
+        return f"{base_url}/api/a2a/callbacks/soulsearcher" if base_url else ""
+
+    @staticmethod
+    def _remote_metadata(remote: dict[str, Any]) -> dict[str, Any]:
+        candidates: list[Any] = [remote.get("metadata")]
+        status = remote.get("status") if isinstance(remote.get("status"), dict) else {}
+        candidates.append(status.get("metadata"))
+        message = status.get("message") if isinstance(status.get("message"), dict) else {}
+        candidates.append(message.get("metadata"))
+        if isinstance(remote.get("statusUpdate"), dict):
+            candidates.append(remote["statusUpdate"].get("metadata"))
+            nested_status = remote["statusUpdate"].get("status") if isinstance(remote["statusUpdate"].get("status"), dict) else {}
+            candidates.append(nested_status.get("metadata"))
+            nested_message = nested_status.get("message") if isinstance(nested_status.get("message"), dict) else {}
+            candidates.append(nested_message.get("metadata"))
+        merged: dict[str, Any] = {}
+        for item in candidates:
+            if isinstance(item, dict):
+                merged.update(item)
+        return merged
+
+    def _remote_hitl(self, remote: dict[str, Any]) -> dict[str, Any]:
+        direct = remote.get("hitl")
+        if isinstance(direct, dict):
+            return direct
+        metadata = self._remote_metadata(remote)
+        hitl = metadata.get("hitl")
+        if isinstance(hitl, dict):
+            return hitl
+        return {
+            "kind": "a2a_remote_hitl",
+            "message": self._answer_from_a2a_result(remote) or "Remote A2A task requires input.",
+            "allowed_decisions": ["approve", "edit", "reject", "respond"],
+            "prompts": [],
+            "action_requests": [],
+            "review_configs": [],
+        }
+
+    def _remote_error(self, remote: dict[str, Any]) -> dict[str, Any]:
+        direct = remote.get("error")
+        if isinstance(direct, dict):
+            return direct
+        metadata = self._remote_metadata(remote)
+        error = metadata.get("error")
+        return error if isinstance(error, dict) else {}
 
     def _call_jsonrpc(self, connection: A2AAgentConnection, method: str, params: dict[str, Any]) -> dict[str, Any]:
         url = self._rpc_url(connection)
@@ -543,13 +940,6 @@ class A2ARuntimeManager:
             if capability and any(capability in token or token in capability for token in tokens if token):
                 return connection
         raise KeyError(f"no enabled A2A connection matches capability: {request.capability}")
-
-    @staticmethod
-    def requires_approval(capability: str, options: dict[str, Any] | None = None) -> bool:
-        text = str(capability or "").strip().lower()
-        options = options or {}
-        risk = str(options.get("risk") or options.get("risk_level") or "").strip().lower()
-        return risk in {"high", "critical"} or any(token in text for token in HIGH_RISK_CAPABILITIES)
 
     @staticmethod
     def _message(role: str, text: str, *, context_id: str = "", task_id: str = "", metadata: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -789,6 +1179,26 @@ class A2ARuntimeManager:
 
 def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _status_from_callback_event(event: str, payload: dict[str, Any]) -> str:
+    explicit = str(payload.get("status") or "").strip().lower().replace("_", "-")
+    if explicit.startswith("task-state-"):
+        explicit = explicit.removeprefix("task-state-")
+    if explicit in TERMINAL_TASK_STATES | PAUSED_TASK_STATES | {"working", "submitted"}:
+        return explicit
+    normalized = str(event or "").strip().lower()
+    if normalized.endswith("completed"):
+        return "completed"
+    if normalized.endswith("failed"):
+        return "failed"
+    if normalized.endswith("canceled") or normalized.endswith("cancelled"):
+        return "canceled"
+    if normalized.endswith("input_required") or normalized.endswith("input-required"):
+        return "input-required"
+    if normalized.endswith("auth_required") or normalized.endswith("auth-required"):
+        return "auth-required"
+    return "working"
 
 
 def _iter_sse_events(response: httpx.Response) -> Iterator[dict[str, Any]]:

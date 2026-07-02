@@ -12,23 +12,34 @@ from sqlalchemy.orm import Session
 from backend.api.admin.deps import (
     get_agent_runtime,
     get_conversation_service,
+    get_core_context_service,
     get_current_user,
     get_db,
     get_event_bus,
+    get_evolution_proposal_service,
     get_job_service,
-    get_workspace_service,
+    get_policy_engine,
+    get_run_service,
+    get_vector_service,
 )
 from backend.api.admin.serializers import (
+    agent_run_to_dict,
     audit_event_to_dict,
     background_job_to_dict,
+    policy_rule_to_dict,
+    proposal_to_dict,
     runtime_event_to_dict,
     session_message_to_dict,
     session_summary_to_dict,
     tool_run_to_dict,
 )
 from backend.domain.conversation import ConversationService
-from backend.domain.jobs import BackgroundJobService
-from backend.domain.workspace import WorkspaceService
+from backend.domain.core_context import CoreContextService
+from backend.domain.evolution_proposals import EvolutionProposalService
+from backend.domain.jobs import BackgroundJobService, enqueue_background_job
+from backend.domain.policy import ToolPolicyEngine
+from backend.domain.runs import AgentRunService
+from backend.domain.vector import KnowledgeVectorService
 from backend.infra.config import Settings, get_settings
 from backend.infra.db import database_backend, migration_status
 from backend.infra.events import RuntimeEventBus
@@ -55,8 +66,22 @@ class TurnRequest(BaseModel):
     tool_calls: list[dict] | None = None
 
 
-class WorkspaceFileUpdateRequest(BaseModel):
+class WorkspaceDraftImportRequest(BaseModel):
     content: str
+
+
+class VectorRebuildRequest(BaseModel):
+    source_type: str = ""
+    async_job: bool = True
+    strict: bool | None = None
+
+
+class PolicyRuleUpdateRequest(BaseModel):
+    action: str | None = None
+    risk_level: str | None = None
+    requires_approval: bool | None = None
+    enabled: bool | None = None
+    config: dict | None = None
 
 
 @router.get("/api/events")
@@ -80,6 +105,29 @@ def runs(limit: int = 100, db: Session = Depends(get_db)) -> dict:
     return {"items": [tool_run_to_dict(item) for item in db.scalars(stmt).all()]}
 
 
+@router.get("/api/agent-runs")
+def agent_runs(
+    limit: int = 100,
+    db: Session = Depends(get_db),
+    runs: AgentRunService = Depends(get_run_service),
+) -> dict:
+    return {"items": [agent_run_to_dict(item) for item in runs.list_runs(db, limit=limit)]}
+
+
+@router.get("/api/runs/{run_id}/graph")
+def run_graph(
+    run_id: str,
+    db: Session = Depends(get_db),
+    runs: AgentRunService = Depends(get_run_service),
+) -> dict:
+    from fastapi import HTTPException
+
+    try:
+        return runs.graph(db, run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @router.post("/api/runs/turn")
 def run_turn(
     payload: TurnRequest,
@@ -98,6 +146,70 @@ def run_turn(
         "pending_tool_call": result.pending_tool_call or {},
         "resume_available": result.resume_available,
     }
+
+
+@router.get("/api/vector/status")
+def vector_status(
+    db: Session = Depends(get_db),
+    vector: KnowledgeVectorService = Depends(get_vector_service),
+) -> dict:
+    return vector.status(db)
+
+
+@router.post("/api/vector/rebuild")
+def vector_rebuild(
+    payload: VectorRebuildRequest,
+    db: Session = Depends(get_db),
+    vector: KnowledgeVectorService = Depends(get_vector_service),
+    jobs: BackgroundJobService = Depends(get_job_service),
+    user: User = Depends(get_current_user),
+    settings: Settings = Depends(get_settings),
+) -> dict:
+    strict = settings.vector_required if payload.strict is None else bool(payload.strict)
+    source_type = payload.source_type.strip()
+    if payload.async_job:
+        job = enqueue_background_job(
+            db,
+            task_name="embedding_rebuild",
+            payload={"source_type": source_type, "strict": strict},
+            triggered_by=user.username,
+            service=jobs,
+        )
+        return {"ok": True, "mode": "job", "job": background_job_to_dict(job)}
+    return {"ok": True, "mode": "sync", "result": vector.rebuild_all(db, source_type=source_type, strict=strict)}
+
+
+@router.get("/api/policy/status")
+def policy_status(
+    db: Session = Depends(get_db),
+    policy: ToolPolicyEngine = Depends(get_policy_engine),
+) -> dict:
+    return policy.status(db)
+
+
+@router.get("/api/policy/rules")
+def policy_rules(
+    db: Session = Depends(get_db),
+    policy: ToolPolicyEngine = Depends(get_policy_engine),
+) -> dict:
+    return {"items": [policy_rule_to_dict(item) for item in policy.list_rules(db)]}
+
+
+@router.put("/api/policy/rules/{rule_id}")
+def update_policy_rule(
+    rule_id: str,
+    payload: PolicyRuleUpdateRequest,
+    db: Session = Depends(get_db),
+    policy: ToolPolicyEngine = Depends(get_policy_engine),
+) -> dict:
+    from fastapi import HTTPException
+
+    update = {key: value for key, value in payload.model_dump().items() if value is not None}
+    try:
+        rule = policy.update_rule(db, rule_id, update)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return policy_rule_to_dict(rule)
 
 
 @router.get("/api/sessions")
@@ -283,6 +395,12 @@ def settings(
         "openai_configured": bool(settings.openai_api_key),
         "llm_provider": settings.llm_provider,
         "llm_context_window_tokens": settings.llm_context_window_tokens,
+        "agent_engine": settings.agent_engine,
+        "vector_mode": settings.vector_mode,
+        "embedding_model": settings.embedding_model,
+        "embedding_dimensions": settings.embedding_dimensions,
+        "embedding_batch_size": settings.embedding_batch_size,
+        "embedding_pass_dimensions": settings.embedding_pass_dimensions,
         "cors_origins": settings.cors_origins,
         "require_production_secrets": settings.require_production_secrets,
         "login_rate_limit_enabled": settings.login_rate_limit_enabled,
@@ -318,46 +436,89 @@ def settings(
 
 
 @router.get("/api/workspace/files")
-def workspace_files(service: WorkspaceService = Depends(get_workspace_service)) -> dict:
+def workspace_files(
+    db: Session = Depends(get_db),
+    service: CoreContextService = Depends(get_core_context_service),
+) -> dict:
+    projections = service.projections(db)
     return {
         "items": [
             {
                 "kind": item.kind,
                 "path": item.path,
                 "content": item.content,
-                "updated_at": item.updated_at,
+                "updated_at": "",
+                "authority": "projection",
             }
-            for item in service.read_all().values()
+            for item in projections
         ],
-        "history": service.read_history(limit=20),
+        "history": [],
+        "authority": "postgres",
     }
 
 
 @router.get("/api/workspace/files/{kind}")
-def workspace_file(kind: str, service: WorkspaceService = Depends(get_workspace_service)) -> dict:
-    try:
-        item = service.read(kind)
-    except KeyError as exc:
-        from fastapi import HTTPException
-
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return {"kind": item.kind, "path": item.path, "content": item.content, "updated_at": item.updated_at}
-
-
-@router.put("/api/workspace/files/{kind}")
-def update_workspace_file(
+def workspace_file(
     kind: str,
-    payload: WorkspaceFileUpdateRequest,
-    service: WorkspaceService = Depends(get_workspace_service),
+    db: Session = Depends(get_db),
+    service: CoreContextService = Depends(get_core_context_service),
+) -> dict:
+    normalized = kind.strip().lower()
+    for item in service.projections(db):
+        if item.kind == normalized:
+            return {"kind": item.kind, "path": item.path, "content": item.content, "updated_at": "", "authority": "projection"}
+    from fastapi import HTTPException
+
+    raise HTTPException(status_code=404, detail=f"projection not found: {kind}")
+
+
+@router.post("/api/workspace/files/{kind}/import-draft")
+def import_workspace_file_draft(
+    kind: str,
+    payload: WorkspaceDraftImportRequest,
+    db: Session = Depends(get_db),
+    service: CoreContextService = Depends(get_core_context_service),
+    proposals: EvolutionProposalService = Depends(get_evolution_proposal_service),
     user: User = Depends(get_current_user),
 ) -> dict:
-    try:
-        item = service.write(kind, payload.content, actor=user.username)
-    except KeyError as exc:
-        from fastapi import HTTPException
-
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return {"kind": item.kind, "path": item.path, "content": item.content, "updated_at": item.updated_at}
+    normalized = kind.strip().lower()
+    evidence = {"source": "workspace.projection_draft", "actor": user.username, "draft_kind": normalized}
+    if normalized in {"soul", "user", "heartbeat"}:
+        current = service.get(db, normalized)
+        proposal = proposals.create(
+            db,
+            target_type="core_context",
+            action="update",
+            payload={
+                "block_key": normalized,
+                "title": current.title if current is not None else None,
+                "content": payload.content,
+                "metadata": {},
+                "source": "workspace_draft",
+            },
+            evidence=evidence,
+            risk_level="medium",
+        )
+    else:
+        proposal = proposals.create(
+            db,
+            target_type="memory",
+            action="create",
+            payload={
+                "kind": "agent_note",
+                "content": payload.content,
+                "source": "workspace_draft",
+                "metadata": {"draft_kind": normalized, "actor": user.username},
+            },
+            evidence=evidence,
+            risk_level="medium",
+        )
+    return {
+        "authority": "postgres",
+        "mode": "draft_import",
+        "message": "Workspace files are generated projections; this draft was imported as a reviewable proposal.",
+        "proposal": proposal_to_dict(proposal),
+    }
 
 
 def _status_counts(db: Session, column) -> dict[str, int]:

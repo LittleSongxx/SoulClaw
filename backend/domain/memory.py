@@ -10,7 +10,7 @@ from typing import Any
 from sqlalchemy import desc, or_, select, text
 from sqlalchemy.orm import Session
 
-from backend.domain.workspace import WorkspaceService
+from backend.domain.vector import KnowledgeVectorService
 from backend.infra.config import Settings, get_settings
 from backend.infra.events import RuntimeEventBus
 from backend.infra.models import (
@@ -24,8 +24,6 @@ from backend.infra.models import (
 L1_KINDS = {"control_axiom", "pinned_fact"}
 L2_KINDS = {"episodic", "user_fact", "agent_note", "error_signal"}
 L3_KINDS = {"semantic", "skill_trace", "project_knowledge"}
-MEMORY_MARKER_RE = re.compile(r"<!--\s*soulclaw:memory\s+id=([0-9a-fA-F-]+)\s*-->")
-MEMORY_LINE_RE = re.compile(r"^-\s+\((?P<meta>[^)]*)\)\s+(?P<content>.*)$", re.DOTALL)
 MEMORY_DEFAULT_BUDGET_CHARS = 12000
 MEMORY_EXPIRED_STATUSES = {"archived", "superseded"}
 
@@ -35,13 +33,13 @@ class MemoryService:
         self,
         settings: Settings | None = None,
         events: RuntimeEventBus | None = None,
-        workspace: WorkspaceService | None = None,
+        vector: KnowledgeVectorService | None = None,
     ) -> None:
         self.settings = settings or get_settings()
         self.events = events
-        self.workspace = workspace or WorkspaceService(settings=self.settings, events=events)
+        self.vector = vector
 
-    def create(
+    def _create_applied_memory(
         self,
         db: Session,
         *,
@@ -90,11 +88,15 @@ class MemoryService:
                 previous.archived = True
                 previous.status = "superseded"
         db.flush()
-        memory.source_file_marker = self._marker(memory)
         self._detect_conflicts(db, memory)
-        self._append_to_memory_file(memory)
         self._record_history(db, memory, action="create", after=self._snapshot(memory), actor=source)
         self.refresh_fts(db)
+        if self.vector is not None:
+            try:
+                self.vector.upsert_memories(db, [memory], strict=False)
+            except Exception as exc:  # noqa: BLE001
+                if self.events:
+                    self.events.emit("memory.vector.refresh_failed", {"memory_id": str(memory.id), "error": str(exc)}, severity="warning")
         if self.events:
             self.events.emit("memory.create", {"memory_id": str(memory.id), "kind": kind, "source": source})
             self.events.audit("memory.create", "memory", target_id=str(memory.id), payload={"kind": kind, "source": source})
@@ -123,6 +125,21 @@ class MemoryService:
                 pass
         for memory in self._structured_candidates(db, query=query, limit=max(limit * 4, 20)):
             candidates[str(memory.id)] = memory
+        vector_hits: dict[str, dict[str, Any]] = {}
+        if self.vector is not None and query:
+            try:
+                for hit in self.vector.search(db, query=query, source_type="memory", limit=max(limit * 4, 20)):
+                    memory_id = str(hit.get("source_id") or "")
+                    if not memory_id:
+                        continue
+                    vector_hits[memory_id] = hit
+                if vector_hits:
+                    ids = [uuid.UUID(item) for item in vector_hits]
+                    for memory in db.scalars(select(Memory).where(Memory.id.in_(ids))).all():
+                        candidates[str(memory.id)] = memory
+            except Exception as exc:  # noqa: BLE001
+                if self.events:
+                    self.events.emit("memory.vector.search_failed", {"query": query, "error": str(exc)}, severity="warning")
 
         now = datetime.now(UTC)
         ranked: list[dict[str, Any]] = []
@@ -132,24 +149,33 @@ class MemoryService:
             fts_hit = fts_hits.get(memory_id, {})
             score, reasons = self._score_memory(memory, query=query, fts_hit=fts_hit, now=now)
             if query and score <= 0.0:
-                continue
+                if memory_id not in vector_hits:
+                    continue
+            vector_hit = vector_hits.get(memory_id, {})
+            vector_score = float(vector_hit.get("vector_score") or 0.0)
+            hybrid_score = vector_score * 0.7 + score * 0.3 if vector_hit else score
             ranked.append(
                 {
-                    "score": round(score, 4),
-                    "source": "memory_fts" if fts_hit else "memory_index",
+                    "score": round(hybrid_score, 4),
+                    "hybrid_score": round(hybrid_score, 4),
+                    "vector_score": round(vector_score, 4),
+                    "fts_score": round(score, 4),
+                    "chunk_key": vector_hit.get("chunk_key") or "",
+                    "source": "memory_hybrid" if vector_hit and fts_hit else ("memory_vector" if vector_hit else ("memory_fts" if fts_hit else "memory_index")),
                     "memory": memory,
-                    "match_reasons": reasons,
+                    "match_reasons": [*reasons, *(["vector"] if vector_hit else [])],
                     "snippet": str(fts_hit.get("snippet") or self._snippet(memory.content, query)),
                 }
             )
-        ranked.sort(key=lambda item: item["score"], reverse=True)
+        ranked.sort(key=lambda item: item["hybrid_score"], reverse=True)
         return self._mmr_dedup(ranked, limit=limit)
 
     def get(self, db: Session, memory_id: uuid.UUID) -> Memory | None:
         return db.get(Memory, memory_id)
 
     def file_context(self, *, limit_chars: int = 6000) -> str:
-        return self.workspace.read("memory").content[: max(1, limit_chars)]
+        del limit_chars
+        return ""
 
     def resident_context(self, db: Session, query: str, *, dynamic_limit: int = 8) -> dict[str, list[Memory]]:
         now = datetime.now(UTC)
@@ -176,7 +202,7 @@ class MemoryService:
         before = self._snapshot(previous)
         previous.archived = True
         previous.status = "superseded"
-        memory = self.create(
+        memory = self._create_applied_memory(
             db,
             kind=replacement.get("kind") or previous.kind,
             content=replacement["content"],
@@ -189,8 +215,13 @@ class MemoryService:
             metadata=replacement.get("metadata") or {"supersedes": str(memory_id)},
         )
         previous.superseded_by = memory.id
-        self._rewrite_memory_file_entry(previous)
-        self._rewrite_memory_file_entry(memory)
+        if self.vector is not None:
+            try:
+                self.vector.mark_stale(db, source_type="memory", source_id=str(memory_id))
+                self.vector.upsert_memories(db, [memory], strict=False)
+            except Exception as exc:  # noqa: BLE001
+                if self.events:
+                    self.events.emit("memory.vector.supersede_failed", {"memory_id": str(memory_id), "error": str(exc)}, severity="warning")
         self._record_history(db, previous, action="supersede", before=before, after=self._snapshot(previous), actor=str(replacement.get("source") or "supersede"))
         self.refresh_fts(db)
         return memory
@@ -221,7 +252,6 @@ class MemoryService:
         memory.last_verified_at = datetime.now(UTC)
         memory.confidence = self._clamp(memory.confidence + confidence_delta)
         memory.stability = self._clamp(memory.stability + confidence_delta / 2)
-        self._rewrite_memory_file_entry(memory)
         self._record_history(db, memory, action="verify", before=before, after=self._snapshot(memory), actor="memory-service")
         if self.events:
             self.events.audit("memory.verify", "memory", target_id=str(memory_id), payload={"confidence_delta": confidence_delta})
@@ -234,66 +264,18 @@ class MemoryService:
         before = self._snapshot(memory)
         memory.archived = True
         memory.status = "archived"
-        self._rewrite_memory_file_entry(memory)
         self._record_history(db, memory, action="archive", before=before, after=self._snapshot(memory), actor="memory-service")
         self.refresh_fts(db)
+        if self.vector is not None:
+            try:
+                self.vector.mark_stale(db, source_type="memory", source_id=str(memory_id))
+            except Exception as exc:  # noqa: BLE001
+                if self.events:
+                    self.events.emit("memory.vector.archive_failed", {"memory_id": str(memory_id), "error": str(exc)}, severity="warning")
         if self.events:
             self.events.emit("memory.archive", {"memory_id": str(memory_id)})
             self.events.audit("memory.archive", "memory", target_id=str(memory_id))
         return memory
-
-    def sync_from_memory_file(self, db: Session) -> dict[str, Any]:
-        item = self.workspace.read("memory")
-        lines = item.content.splitlines()
-        updated = 0
-        missing = 0
-        for index, line in enumerate(lines):
-            marker = MEMORY_MARKER_RE.match(line.strip())
-            if marker is None:
-                continue
-            try:
-                memory_id = uuid.UUID(marker.group(1))
-            except ValueError:
-                continue
-            memory = db.get(Memory, memory_id)
-            if memory is None:
-                missing += 1
-                continue
-            if index + 1 >= len(lines):
-                continue
-            parsed = self._parse_memory_line(lines[index + 1])
-            if parsed is None:
-                continue
-            metadata, content = parsed
-            memory.kind = metadata.get("kind") or memory.kind
-            memory.content = content or memory.content
-            memory.source = metadata.get("source") or memory.source
-            memory.status = metadata.get("status") or memory.status or "active"
-            memory.archived = memory.status in {"archived", "superseded"}
-            for key in ("importance", "confidence", "stability"):
-                if key in metadata:
-                    try:
-                        setattr(memory, key, self._clamp(float(metadata[key])))
-                    except ValueError:
-                        continue
-            memory.source_file_marker = self._marker(memory)
-            memory.provenance = {
-                **(memory.provenance or {}),
-                "synced_from": item.path,
-                "synced_at": datetime.now(UTC).isoformat(),
-            }
-            updated += 1
-        if self.events:
-            self.events.emit("memory.file_sync", {"updated": updated, "missing": missing, "path": item.path})
-            self.events.audit(
-                "memory.file_sync",
-                "workspace_file",
-                target_id="memory",
-                payload={"updated": updated, "missing": missing, "path": item.path},
-            )
-        if updated:
-            self.refresh_fts(db)
-        return {"updated": updated, "missing": missing, "path": item.path}
 
     def restore(self, db: Session, history_id: uuid.UUID, *, actor: str = "admin") -> Memory:
         history = db.get(MemoryHistory, history_id)
@@ -309,7 +291,6 @@ class MemoryService:
             db.add(memory)
         before = self._snapshot(memory)
         self._apply_snapshot(memory, snapshot)
-        self._rewrite_memory_file_entry(memory)
         self._record_history(db, memory, action="restore", before=before, after=self._snapshot(memory), actor=actor)
         self.refresh_fts(db)
         return memory
@@ -348,7 +329,7 @@ class MemoryService:
             "expired_memories": len(expired),
             "missing_access_policy": len(missing_access),
             "fts": self.fts_status(db),
-            "embedding": {"status": "reserved", "provider": None},
+            "embedding": self.vector.status(db) if self.vector is not None else {"status": "disabled", "provider": None},
         }
 
     def refresh_fts(self, db: Session) -> dict[str, Any]:
@@ -397,7 +378,7 @@ class MemoryService:
         before: dict[str, Any] = {}
         result: dict[str, Any]
         if action == "create":
-            memory = self.create(
+            memory = self._create_applied_memory(
                 db,
                 kind=str(payload.get("kind") or "agent_note"),
                 content=str(payload["content"]),
@@ -406,6 +387,8 @@ class MemoryService:
                 importance=float(payload.get("importance", 0.5)),
                 confidence=float(payload.get("confidence", 0.5)),
                 stability=float(payload.get("stability", 0.5)),
+                supersedes_id=uuid.UUID(str(payload["supersedes_id"])) if payload.get("supersedes_id") else None,
+                source_turn_id=str(payload.get("source_turn_id") or ""),
                 metadata=payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {},
             )
             result = {"ok": True, "memory_id": str(memory.id), "action": action}
@@ -443,8 +426,16 @@ class MemoryService:
             before = {"memory": self._snapshot(previous)}
             memory = self.mark_verified(db, memory_id, confidence_delta=float(payload.get("confidence_delta", 0.05)))
             result = {"ok": True, "memory_id": str(memory.id), "action": action}
+        elif action == "restore":
+            history_id = uuid.UUID(str(payload["history_id"]))
+            history = db.get(MemoryHistory, history_id)
+            if history is None:
+                raise KeyError(f"memory history not found: {history_id}")
+            before = {"history": str(history_id)}
+            memory = self.restore(db, history_id, actor=actor)
+            result = {"ok": True, "memory_id": str(memory.id), "history_id": str(history_id), "action": action}
         else:
-            raise ValueError("memory proposal action must be create, supersede, archive, or verify")
+            raise ValueError("memory proposal action must be create, supersede, archive, verify, or restore")
         proposal.status = "applied"
         proposal.before_snapshot = before
         proposal.after_snapshot = result
@@ -463,45 +454,6 @@ class MemoryService:
     @staticmethod
     def _clamp(value: float) -> float:
         return max(0.0, min(1.0, float(value)))
-
-    def _append_to_memory_file(self, memory: Memory) -> None:
-        try:
-            item = self.workspace.read("memory")
-            marker = self._marker(memory)
-            if marker in item.content:
-                self._rewrite_memory_file_entry(memory)
-                return
-            line = f"\n\n{marker}\n{self._memory_file_line(memory)}\n"
-            self.workspace.write("memory", item.content.rstrip() + line, actor="memory-service")
-        except Exception as exc:  # noqa: BLE001
-            if self.events:
-                self.events.emit(
-                    "memory.file_append.failed",
-                    {"memory_id": str(memory.id), "error": str(exc)},
-                    severity="warning",
-                )
-
-    def _rewrite_memory_file_entry(self, memory: Memory) -> None:
-        try:
-            item = self.workspace.read("memory")
-            marker = self._marker(memory)
-            lines = item.content.splitlines()
-            for index, line in enumerate(lines):
-                if line.strip() != marker:
-                    continue
-                if index + 1 < len(lines):
-                    lines[index + 1] = self._memory_file_line(memory)
-                else:
-                    lines.append(self._memory_file_line(memory))
-                self.workspace.write("memory", "\n".join(lines).rstrip() + "\n", actor="memory-service")
-                return
-        except Exception as exc:  # noqa: BLE001
-            if self.events:
-                self.events.emit(
-                    "memory.file_rewrite.failed",
-                    {"memory_id": str(memory.id), "error": str(exc)},
-                    severity="warning",
-                )
 
     def _structured_candidates(self, db: Session, *, query: str, limit: int) -> list[Memory]:
         now = datetime.now(UTC)
@@ -839,39 +791,8 @@ class MemoryService:
         memory.importance = MemoryService._clamp(float(snapshot.get("importance", 0.5)))
         memory.confidence = MemoryService._clamp(float(snapshot.get("confidence", 0.5)))
         memory.stability = MemoryService._clamp(float(snapshot.get("stability", 0.5)))
-        memory.source_file_marker = str(snapshot.get("source_file_marker") or MemoryService._marker(memory))
         memory.provenance = snapshot.get("provenance") if isinstance(snapshot.get("provenance"), dict) else {}
         memory.metadata_json = snapshot.get("metadata") if isinstance(snapshot.get("metadata"), dict) else {}
-
-    @staticmethod
-    def _marker(memory: Memory) -> str:
-        return f"<!-- soulclaw:memory id={memory.id} -->"
-
-    @staticmethod
-    def _memory_file_line(memory: Memory) -> str:
-        status = getattr(memory, "status", "") or ("archived" if memory.archived else "active")
-        return (
-            f"- ({memory.kind}, source={memory.source}, status={status}, "
-            f"importance={memory.importance:.2f}, confidence={memory.confidence:.2f}, "
-            f"stability={memory.stability:.2f}) {memory.content.strip()}"
-        )
-
-    @staticmethod
-    def _parse_memory_line(line: str) -> tuple[dict[str, str], str] | None:
-        match = MEMORY_LINE_RE.match(line.strip())
-        if match is None:
-            return None
-        metadata: dict[str, str] = {}
-        for part in match.group("meta").split(","):
-            part = part.strip()
-            if not part:
-                continue
-            if "=" in part:
-                key, value = part.split("=", 1)
-                metadata[key.strip()] = value.strip()
-            elif "kind" not in metadata:
-                metadata["kind"] = part
-        return metadata, match.group("content").strip()
 
     def _detect_conflicts(self, db: Session, memory: Memory) -> None:
         tokens = self._tokens(memory.content)
@@ -935,7 +856,6 @@ class MemoryService:
             "importance": memory.importance,
             "confidence": memory.confidence,
             "stability": memory.stability,
-            "source_file_marker": getattr(memory, "source_file_marker", "") or "",
             "provenance": getattr(memory, "provenance", {}) or {},
             "metadata": memory.metadata_json or {},
         }

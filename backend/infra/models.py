@@ -142,6 +142,41 @@ class RuntimeEvent(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
 
 
+class AgentRun(Base):
+    __tablename__ = "agent_runs"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    run_id: Mapped[str] = mapped_column(String(128), nullable=False, unique=True, index=True)
+    thread_id: Mapped[str] = mapped_column(String(256), nullable=False, index=True)
+    session_id: Mapped[str] = mapped_column(String(256), nullable=False, index=True)
+    turn_id: Mapped[str] = mapped_column(String(256), nullable=False, index=True)
+    engine: Mapped[str] = mapped_column(String(64), nullable=False, server_default="langgraph", index=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, server_default="running", index=True)
+    route: Mapped[str] = mapped_column(String(64), nullable=False, server_default="", index=True)
+    input_preview: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    answer_preview: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    error: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    state: Mapped[dict[str, Any]] = _json_default()
+    metadata_json: Mapped[dict[str, Any]] = mapped_column("metadata", JSON, nullable=False, default=dict)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class AgentRunStep(Base):
+    __tablename__ = "agent_run_steps"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    run_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    step_name: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0", index=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, server_default="running", index=True)
+    input: Mapped[dict[str, Any]] = _json_default()
+    output: Mapped[dict[str, Any]] = _json_default()
+    error: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class WikiSource(Base, TimestampMixin):
     __tablename__ = "wiki_sources"
 
@@ -232,6 +267,43 @@ class WikiCompileRun(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class KnowledgeEmbedding(Base, TimestampMixin):
+    __tablename__ = "knowledge_embeddings"
+    __table_args__ = (
+        UniqueConstraint("source_type", "source_id", "chunk_key", name="uq_knowledge_embedding_source_chunk"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    source_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    source_id: Mapped[str] = mapped_column(String(512), nullable=False, index=True)
+    chunk_key: Mapped[str] = mapped_column(String(512), nullable=False, server_default="", index=True)
+    title: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    content: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    content_hash: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    embedding: Mapped[list[float]] = mapped_column(JSON, nullable=False, default=list)
+    vector_status: Mapped[str] = mapped_column(String(32), nullable=False, server_default="pending", index=True)
+    model: Mapped[str] = mapped_column(String(128), nullable=False, server_default="", index=True)
+    dimensions: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0", index=True)
+    stale: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"), index=True)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column("metadata", JSON, nullable=False, default=dict)
+    last_embedded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    error: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+
+
+class CoreContextBlock(Base, TimestampMixin):
+    __tablename__ = "core_context_blocks"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    block_key: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+    title: Mapped[str] = mapped_column(String(256), nullable=False, server_default="")
+    content: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, server_default="active", index=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, server_default="1")
+    confidence: Mapped[float] = mapped_column(Float, nullable=False, server_default="0.5")
+    source: Mapped[str] = mapped_column(String(64), nullable=False, server_default="system", index=True)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column("metadata", JSON, nullable=False, default=dict)
+
+
 class Memory(Base, TimestampMixin):
     __tablename__ = "memories"
 
@@ -248,7 +320,6 @@ class Memory(Base, TimestampMixin):
     supersedes_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True, index=True)
     superseded_by: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True, index=True)
     source_turn_id: Mapped[str] = mapped_column(String(256), nullable=False, server_default="", index=True)
-    source_file_marker: Mapped[str] = mapped_column(String(256), nullable=False, server_default="", index=True)
     valid_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     valid_to: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     provenance: Mapped[dict[str, Any]] = _json_default()
@@ -396,6 +467,20 @@ class Approval(Base):
     resume_state: Mapped[dict[str, Any]] = _json_default()
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class PolicyRule(Base, TimestampMixin):
+    __tablename__ = "policy_rules"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    rule_id: Mapped[str] = mapped_column(String(128), nullable=False, unique=True, index=True)
+    subject: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    scope: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    action: Mapped[str] = mapped_column(String(32), nullable=False, server_default="allow", index=True)
+    risk_level: Mapped[str] = mapped_column(String(32), nullable=False, server_default="low", index=True)
+    requires_approval: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"), index=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"), index=True)
+    config: Mapped[dict[str, Any]] = _json_default()
 
 
 class CronJob(Base, TimestampMixin):

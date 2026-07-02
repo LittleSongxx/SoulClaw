@@ -1,4 +1,4 @@
-"""Minimal agent turn pipeline."""
+"""Agent turn runtime with graph/run/checkpoint integration."""
 
 import json
 import uuid
@@ -7,16 +7,20 @@ from datetime import UTC, datetime
 from typing import Any
 
 from backend.domain.conversation import ConversationService, SessionContext
+from backend.domain.core_context import CoreContextService
 from backend.domain.memory import MemoryService
+from backend.domain.memory_curator import MemoryCuratorService
+from backend.domain.runs import AgentRunService
 from backend.domain.tools import ToolApprovalRequired, ToolExecutor, ToolRegistry
 from backend.domain.wiki import WikiService
-from backend.domain.workspace import WorkspaceService
 from backend.infra.events import RuntimeEventBus
 from backend.infra.models import Approval
 from backend.infra.rate_limit import RateLimitExceeded
 from backend.infra.resilience import CircuitOpenError
 from backend.infra.trace import current_trace_id
 from backend.runtime.a2a import A2ADelegateRequest, A2ARuntimeManager
+from backend.runtime.checkpoint import AgentCheckpointStore
+from backend.runtime.langgraph_runtime import AgentTurnGraphShell
 from backend.runtime.llm import OpenAICompatibleClient
 
 
@@ -29,6 +33,28 @@ class AgentTurnResult:
     approval_id: str = ""
     pending_tool_call: dict[str, Any] | None = None
     resume_available: bool = False
+
+
+@dataclass(frozen=True)
+class AgentTaskPlan:
+    """Compact routing contract for the local-first assistant turn."""
+
+    route: str
+    reason: str
+    memory_policy: str
+    wiki_policy: str
+    skill_policy: str
+    delegation: dict[str, Any] | None = None
+
+    def to_context(self) -> dict[str, Any]:
+        return {
+            "route": self.route,
+            "reason": self.reason,
+            "memory_policy": self.memory_policy,
+            "wiki_policy": self.wiki_policy,
+            "skill_policy": self.skill_policy,
+            "delegation": self.delegation or {},
+        }
 
 
 class AgentApprovalInterrupt(Exception):
@@ -55,12 +81,7 @@ class AgentApprovalInterrupt(Exception):
 
 
 class AgentRuntime:
-    """Prepare -> retrieve context -> respond -> post-turn event.
-
-    This is a deliberately small first pipeline. It gives the platform a clean
-    place to attach LLM/tool-loop/approval behavior while already exercising
-    wiki, memory, and event contracts.
-    """
+    """Run one assistant turn while preserving the public run/resume contract."""
 
     def __init__(
         self,
@@ -71,8 +92,11 @@ class AgentRuntime:
         registry: ToolRegistry | None = None,
         llm: OpenAICompatibleClient | None = None,
         conversation: ConversationService | None = None,
-        workspace: WorkspaceService | None = None,
+        core_context: CoreContextService | None = None,
+        memory_curator: MemoryCuratorService | None = None,
         a2a: A2ARuntimeManager | None = None,
+        runs: AgentRunService | None = None,
+        checkpoints: AgentCheckpointStore | None = None,
     ) -> None:
         self.wiki = wiki
         self.memory = memory
@@ -81,8 +105,12 @@ class AgentRuntime:
         self.registry = registry
         self.llm = llm
         self.conversation = conversation
-        self.workspace = workspace
+        self.core_context = core_context
+        self.memory_curator = memory_curator
         self.a2a = a2a
+        self.runs = runs
+        self.graph_shell = AgentTurnGraphShell()
+        self.checkpoints = checkpoints
 
     def run_turn(
         self,
@@ -93,6 +121,22 @@ class AgentRuntime:
         tool_calls: list[dict[str, Any]] | None = None,
     ) -> AgentTurnResult:
         turn_id = str(uuid.uuid4())
+        agent_run_id = ""
+        if self.runs is not None:
+            agent_run = self.runs.create_run(
+                db,
+                session_id=session_id,
+                turn_id=turn_id,
+                input_text=message,
+                state={"graph": self.graph_shell.state()},
+            )
+            agent_run_id = agent_run.run_id
+        self._save_graph_checkpoint(
+            thread_id=session_id,
+            run_id=agent_run_id,
+            checkpoint_id=f"{turn_id}:start",
+            state={"node": "record_user", "turn_id": turn_id, "message": message[:1000]},
+        )
         self.events.emit("turn.started", {"message_preview": message[:200]}, session_id=session_id, turn_id=turn_id)
         session_context = (
             self.conversation.recent_context(db, session_id, limit=12)
@@ -101,41 +145,175 @@ class AgentRuntime:
         )
         if self.conversation is not None:
             self.conversation.record_user_message(db, session_id=session_id, turn_id=turn_id, content=message)
+        self._record_run_step(
+            db,
+            agent_run_id,
+            "record_user",
+            output={"session_id": session_id, "conversation_messages": session_context.total_messages},
+        )
+        task_plan = self._plan_turn(message, tool_calls=tool_calls)
+        self.events.emit(
+            "agent.node.turn_planned",
+            task_plan.to_context(),
+            session_id=session_id,
+            turn_id=turn_id,
+        )
+        self._record_run_step(db, agent_run_id, "plan", output=task_plan.to_context())
         delegated_result: dict[str, Any] | None = None
-        if tool_calls is None and self.a2a is not None and self._should_delegate_to_deep_research(message):
+        a2a_delegate_error: dict[str, Any] | None = None
+        if tool_calls is None and self.tools is not None and task_plan.route == "deep_research":
             try:
-                delegated_result = self.a2a.delegate(
+                delegation = task_plan.delegation or {}
+                delegated_result = self.tools.execute(
                     db,
-                    A2ADelegateRequest(
-                        capability="deep-research",
-                        query=message,
-                        context={"session_id": session_id, "turn_id": turn_id},
-                    ),
+                    tool_name="a2a_delegate",
+                    arguments={
+                        "capability": str(delegation.get("capability") or "deep-research"),
+                        "query": message,
+                        "context": {
+                            "session_id": session_id,
+                            "turn_id": turn_id,
+                            "task_plan": task_plan.to_context(),
+                        },
+                        "options": delegation.get("options") if isinstance(delegation.get("options"), dict) else {},
+                        "connection_name": str(delegation.get("connection_name") or ""),
+                    },
+                    turn_id=turn_id,
+                )
+                delegated_payload = delegated_result.get("result") if isinstance(delegated_result.get("result"), dict) else delegated_result
+                if delegated_payload.get("status") in {"failed", "canceled", "cancelled", "rejected"}:
+                    a2a_delegate_error = delegated_payload
+                    delegated_result = None
+                    self.events.emit(
+                        "a2a.delegate.failed",
+                        {
+                            "status": a2a_delegate_error.get("status"),
+                            "error": a2a_delegate_error.get("error") or a2a_delegate_error.get("answer") or "",
+                            "message_preview": message[:200],
+                            "fallback": "local_llm",
+                        },
+                        severity="warning",
+                        session_id=session_id,
+                        turn_id=turn_id,
+                    )
+                else:
+                    delegated_result = delegated_payload
+            except ToolApprovalRequired as exc:
+                checkpoint = {
+                    "mode": "agent_turn",
+                    "session_id": session_id,
+                    "turn_id": turn_id,
+                    "message": message,
+                    "messages": [],
+                    "tool_calls": [],
+                    "tool_results": [],
+                    "round_tool_calls": [],
+                    "round_completed_results": [],
+                    "pending_tool_call": {
+                        "name": "a2a_delegate",
+                        "arguments": {
+                            "capability": str((task_plan.delegation or {}).get("capability") or "deep-research"),
+                            "query": message,
+                            "context": {
+                                "session_id": session_id,
+                                "turn_id": turn_id,
+                                "task_plan": task_plan.to_context(),
+                            },
+                            "options": (task_plan.delegation or {}).get("options")
+                            if isinstance((task_plan.delegation or {}).get("options"), dict)
+                            else {},
+                            "connection_name": str((task_plan.delegation or {}).get("connection_name") or ""),
+                        },
+                    },
+                    "pending_index": 0,
+                    "round_index": 0,
+                    "run_id": agent_run_id,
+                    "thread_id": session_id,
+                }
+                self._save_approval_checkpoint(db, exc.approval_id, checkpoint)
+                self._save_graph_checkpoint(
+                    thread_id=session_id,
+                    run_id=agent_run_id,
+                    checkpoint_id=f"{turn_id}:approval:{exc.approval_id}",
+                    state=checkpoint,
+                )
+                self._record_run_step(
+                    db,
+                    agent_run_id,
+                    "approval_or_continue",
+                    status="approval_required",
+                    output={"approval_id": exc.approval_id, "pending_tool_call": checkpoint["pending_tool_call"]},
+                )
+                answer = "Approval is required before I can delegate this turn."
+                context = self._approval_context(
+                    session_id=session_id,
+                    agent_run_id=agent_run_id,
+                    task_plan=task_plan,
+                    approval_id=exc.approval_id,
+                    pending_tool_call=checkpoint["pending_tool_call"],
+                )
+                self._finish_run(db, agent_run_id, status="approval_required", answer=answer, state={"context": context})
+                return AgentTurnResult(
+                    turn_id=turn_id,
+                    answer=answer,
+                    context=context,
+                    status="approval_required",
+                    approval_id=exc.approval_id,
+                    pending_tool_call=checkpoint["pending_tool_call"],
+                    resume_available=True,
                 )
             except Exception as exc:  # noqa: BLE001
+                a2a_delegate_error = {"status": "failed", "error": str(exc)}
                 self.events.emit(
                     "a2a.delegate.failed",
-                    {"error": str(exc), "message_preview": message[:200]},
+                    {
+                        "error": str(exc),
+                        "message_preview": message[:200],
+                        "fallback": "local_llm",
+                    },
                     severity="warning",
                     session_id=session_id,
                     turn_id=turn_id,
                 )
-                delegated_result = {"status": "failed", "error": str(exc)}
+        self._record_run_step(
+            db,
+            agent_run_id,
+            "delegate_or_context",
+            output={
+                "delegated": delegated_result is not None,
+                "a2a_error": bool(a2a_delegate_error),
+                "route": task_plan.route,
+            },
+        )
         wiki_orientation = self.wiki.orientation(db) if hasattr(self.wiki, "orientation") else {"pages": [], "index": "", "schema": "", "recent_log": ""}
         wiki_hits = self.wiki.search(db, message, limit=5) if self.llm is None or not self.llm.configured else []
         memory_context = self.memory.resident_context(db, message, dynamic_limit=5)
         skill_index = self._skill_index(db, message)
-        workspace_context = self.workspace.read_all() if self.workspace is not None else {}
+        core_context = self.core_context.prompt_context(db) if self.core_context is not None else {}
         self.events.emit(
             "agent.node.context_assembled",
             {
                 "wiki_pages": wiki_orientation.get("page_count", 0),
                 "resident_memory": len(memory_context.get("resident", [])),
                 "dynamic_memory": len(memory_context.get("dynamic", [])),
+                "core_blocks": len([item for item in core_context.values() if item is not None]),
                 "skills": len(skill_index),
             },
             session_id=session_id,
             turn_id=turn_id,
+        )
+        self._record_run_step(
+            db,
+            agent_run_id,
+            "retrieve",
+            output={
+                "wiki_pages": wiki_orientation.get("page_count", 0),
+                "wiki_hits": len(wiki_hits),
+                "resident_memory": len(memory_context.get("resident", [])),
+                "dynamic_memory": len(memory_context.get("dynamic", [])),
+                "core_blocks": len([item for item in core_context.values() if item is not None]),
+                "skills": len(skill_index),
+            },
         )
         tool_results: list[dict[str, Any]] = []
         inferred_tool_calls: list[dict[str, Any]] = []
@@ -159,11 +337,12 @@ class AgentRuntime:
                     memory_context,
                     skill_index,
                     session_context,
-                    workspace_context,
+                    core_context,
+                    task_plan,
                 )
             except AgentApprovalInterrupt as interrupt:
                 checkpoint = {
-                    "mode": "agent_tool_loop",
+                    "mode": "agent_turn",
                     "session_id": session_id,
                     "turn_id": turn_id,
                     "message": message,
@@ -175,8 +354,16 @@ class AgentRuntime:
                     "pending_tool_call": interrupt.pending_tool_call,
                     "pending_index": interrupt.pending_index,
                     "round_index": interrupt.round_index,
+                    "run_id": agent_run_id,
+                    "thread_id": session_id,
                 }
                 self._save_approval_checkpoint(db, interrupt.approval_id, checkpoint)
+                self._save_graph_checkpoint(
+                    thread_id=session_id,
+                    run_id=agent_run_id,
+                    checkpoint_id=f"{turn_id}:approval:{interrupt.approval_id}",
+                    state=checkpoint,
+                )
                 inferred_tool_calls = interrupt.tool_calls
                 tool_results = interrupt.tool_results
                 llm_status = "approval_required"
@@ -191,6 +378,13 @@ class AgentRuntime:
                     severity="warning",
                     session_id=session_id,
                     turn_id=turn_id,
+                )
+                self._record_run_step(
+                    db,
+                    agent_run_id,
+                    "approval_or_continue",
+                    status="approval_required",
+                    output={"approval_id": approval_id, "pending_tool_call": pending_tool_call or {}},
                 )
         if self.tools is not None and tool_calls is not None:
             for call in tool_calls if tool_calls is not None else inferred_tool_calls:
@@ -228,12 +422,35 @@ class AgentRuntime:
                         content=json.dumps(tool_results[-1], ensure_ascii=False, default=str)[:4000],
                         metadata={"tool_name": call.get("name") or call.get("tool_name")},
                     )
+        self._record_run_step(
+            db,
+            agent_run_id,
+            "llm",
+            status="approval_required" if llm_status == "approval_required" else "succeeded",
+            output={"status": llm_status, "tool_calls": len(inferred_tool_calls), "delegated": delegated_result is not None},
+        )
+        self._record_run_step(
+            db,
+            agent_run_id,
+            "tools",
+            status="approval_required" if turn_status == "approval_required" else "succeeded",
+            output={"results": len(tool_results), "pending_tool_call": pending_tool_call or {}},
+        )
+        if turn_status != "approval_required":
+            self._record_run_step(db, agent_run_id, "approval_or_continue", output={"status": "continued"})
         answer = llm_answer or self._degraded_answer(llm_status) or self._fallback_answer(wiki_hits, memory_context, tool_results)
         self.events.emit(
             "agent.node.final_answer",
             {"llm_status": llm_status, "tool_results": len(tool_results), "answer_preview": answer[:200]},
             session_id=session_id,
             turn_id=turn_id,
+        )
+        self._record_run_step(
+            db,
+            agent_run_id,
+            "finalize",
+            status="approval_required" if turn_status == "approval_required" else "succeeded",
+            output={"answer_preview": answer[:200], "llm_status": llm_status},
         )
         wiki_read_used = any(item.get("tool_name") == "wiki_read" and item.get("status") == "succeeded" for item in tool_results)
         wiki_search_used = any(item.get("tool_name") in {"wiki_search", "wiki_orient", "wiki_follow_links"} for item in tool_results)
@@ -254,6 +471,17 @@ class AgentRuntime:
                 metadata={"llm_status": llm_status},
             )
             self.conversation.update_summary_if_needed(db, session_id=session_id, llm=self.llm)
+        curator_summary = {"created": 0, "proposal_ids": []}
+        if turn_status != "approval_required":
+            curator_summary = self._curate_turn(
+                db,
+                session_id=session_id,
+                turn_id=turn_id,
+                message=message,
+                answer=answer,
+                tool_results=tool_results,
+                a2a_result=delegated_result or a2a_delegate_error or {},
+            )
         context = {
             "wiki": [
                 {
@@ -279,13 +507,25 @@ class AgentRuntime:
                 "page_count": wiki_orientation.get("page_count", 0),
                 "canonical_files": wiki_orientation.get("root") and bool(wiki_orientation.get("index")),
             },
-            "workspace": {kind: {"path": item.path, "updated_at": item.updated_at} for kind, item in workspace_context.items()},
+            "core_context": {
+                kind: {
+                    "id": str(item.id),
+                    "title": item.title,
+                    "version": item.version,
+                    "confidence": item.confidence,
+                    "status": item.status,
+                }
+                for kind, item in core_context.items()
+                if item is not None
+            },
             "skills": {
                 "indexed": len(skill_index),
                 "items": [{"skill_key": item.get("skill_key"), "name": item.get("name")} for item in skill_index[:8]],
             },
             "tools": tool_results,
-            "a2a": delegated_result or {},
+            "a2a": delegated_result or a2a_delegate_error or {},
+            "memory_curator": curator_summary,
+            "task_plan": task_plan.to_context(),
             "llm": {"status": llm_status, "tool_calls": inferred_tool_calls, "wiki_read_used": wiki_read_used},
             "trace": {"trace_id": current_trace_id()},
             "turn": {
@@ -294,10 +534,28 @@ class AgentRuntime:
                 "pending_tool_call": pending_tool_call or {},
                 "resume_available": resume_available,
             },
+            "run": {
+                "run_id": agent_run_id,
+                "thread_id": session_id,
+                "graph": self.graph_shell.state(),
+            },
         }
         event_type = "turn.approval_required" if turn_status == "approval_required" else "turn.completed"
         self.events.emit(event_type, {"context": context}, session_id=session_id, turn_id=turn_id)
-        self.events.emit("agent.node.post_turn", {"summary_checked": self.conversation is not None}, session_id=session_id, turn_id=turn_id)
+        self.events.emit(
+            "agent.node.post_turn",
+            {"summary_checked": self.conversation is not None, "curator_proposals": curator_summary.get("created", 0)},
+            session_id=session_id,
+            turn_id=turn_id,
+        )
+        self._record_run_step(db, agent_run_id, "post_turn", output={"event_type": event_type, "curator": curator_summary})
+        self._finish_run(
+            db,
+            agent_run_id,
+            status=turn_status,
+            answer=answer,
+            state={"context": {"approval_id": approval_id, "pending_tool_call": pending_tool_call or {}}},
+        )
         return AgentTurnResult(
             turn_id=turn_id,
             answer=answer,
@@ -321,13 +579,26 @@ class AgentRuntime:
         if approval is None:
             raise KeyError(f"approval not found: {approval_id}")
         checkpoint = approval.turn_checkpoint or {}
-        if checkpoint.get("mode") != "agent_tool_loop":
+        if checkpoint.get("mode") != "agent_turn":
             raise ValueError("approval does not have an agent turn checkpoint")
         session_id = str(checkpoint.get("session_id") or "local")
         turn_id = str(checkpoint.get("turn_id") or "")
+        agent_run_id = str(checkpoint.get("run_id") or (approval.resume_state or {}).get("run_id") or "")
         pending_tool_call = checkpoint.get("pending_tool_call") if isinstance(checkpoint.get("pending_tool_call"), dict) else {}
         if not turn_id or not pending_tool_call:
             raise ValueError("approval checkpoint is missing turn_id or pending_tool_call")
+        self._record_run_step(
+            db,
+            agent_run_id,
+            "approval_resume",
+            output={"approval_id": str(approval.id), "decision": decision},
+        )
+        self._save_graph_checkpoint(
+            thread_id=session_id,
+            run_id=agent_run_id,
+            checkpoint_id=f"{turn_id}:resume:{approval.id}",
+            state={"checkpoint": checkpoint, "decision": decision},
+        )
 
         normalized_decision = decision.strip().lower() or "approve"
         if normalized_decision not in {"approve", "edit", "reject", "respond"}:
@@ -339,6 +610,8 @@ class AgentRuntime:
             approval.status = "cancelled"
             approval.resolved_at = datetime.now(UTC)
             approval.resume_state = {**(approval.resume_state or {}), "response": answer, "resumed": True, "decision": "respond"}
+            self._record_run_step(db, agent_run_id, "finalize", status="responded", output={"answer_preview": answer[:200]})
+            self._finish_run(db, agent_run_id, status="responded", answer=answer, state={"approval_id": str(approval.id), "decision": "respond"})
             result = self._finish_resumed_turn(
                 db=db,
                 session_id=session_id,
@@ -354,6 +627,8 @@ class AgentRuntime:
             approval.status = "rejected"
             approval.resolved_at = datetime.now(UTC)
             approval.resume_state = {**(approval.resume_state or {}), "resumed": True, "decision": "reject"}
+            self._record_run_step(db, agent_run_id, "finalize", status="rejected", output={"answer_preview": answer[:200]})
+            self._finish_run(db, agent_run_id, status="rejected", answer=answer, state={"approval_id": str(approval.id), "decision": "reject"})
             result = self._finish_resumed_turn(
                 db=db,
                 session_id=session_id,
@@ -405,8 +680,23 @@ class AgentRuntime:
                     "round_completed_results": round_results,
                     "pending_tool_call": dict(active_call),
                     "pending_index": index,
+                    "run_id": agent_run_id,
+                    "thread_id": session_id,
                 }
                 self._save_approval_checkpoint(db, exc.approval_id, nested_checkpoint)
+                self._save_graph_checkpoint(
+                    thread_id=session_id,
+                    run_id=agent_run_id,
+                    checkpoint_id=f"{turn_id}:approval:{exc.approval_id}",
+                    state=nested_checkpoint,
+                )
+                self._record_run_step(
+                    db,
+                    agent_run_id,
+                    "approval_or_continue",
+                    status="approval_required",
+                    output={"approval_id": exc.approval_id, "pending_tool_call": dict(active_call)},
+                )
                 return AgentTurnResult(
                     turn_id=turn_id,
                     answer="Approval is required before I can continue this turn.",
@@ -469,8 +759,23 @@ class AgentRuntime:
                     "pending_tool_call": interrupt.pending_tool_call,
                     "pending_index": interrupt.pending_index,
                     "round_index": interrupt.round_index,
+                    "run_id": agent_run_id,
+                    "thread_id": session_id,
                 }
                 self._save_approval_checkpoint(db, interrupt.approval_id, nested_checkpoint)
+                self._save_graph_checkpoint(
+                    thread_id=session_id,
+                    run_id=agent_run_id,
+                    checkpoint_id=f"{turn_id}:approval:{interrupt.approval_id}",
+                    state=nested_checkpoint,
+                )
+                self._record_run_step(
+                    db,
+                    agent_run_id,
+                    "approval_or_continue",
+                    status="approval_required",
+                    output={"approval_id": interrupt.approval_id, "pending_tool_call": interrupt.pending_tool_call},
+                )
                 return AgentTurnResult(
                     turn_id=turn_id,
                     answer="Approval is required before I can continue this turn.",
@@ -496,13 +801,36 @@ class AgentRuntime:
             answer = self._fallback_answer([], {"resident": [], "dynamic": []}, tool_results)
             llm_status = "not_configured"
         approval.resume_state = {**(approval.resume_state or {}), "resumed": True, "decision": normalized_decision}
+        curator_summary = self._curate_turn(
+            db,
+            session_id=session_id,
+            turn_id=turn_id,
+            message=str(checkpoint.get("message") or ""),
+            answer=answer,
+            tool_results=tool_results,
+            a2a_result={},
+        )
         context = {
             "tools": tool_results,
             "llm": {"status": llm_status, "tool_calls": all_calls},
+            "memory_curator": curator_summary,
             "turn": {"status": "completed", "approval_id": str(approval.id), "resume_available": False},
+            "run": {"run_id": agent_run_id, "thread_id": session_id},
         }
         self.events.emit("turn.resumed", {"approval_id": str(approval.id), "tool_name": tool_name}, session_id=session_id, turn_id=turn_id)
         self.events.emit("agent.node.final_answer", {"llm_status": llm_status, "tool_results": len(tool_results)}, session_id=session_id, turn_id=turn_id)
+        self._record_run_step(
+            db,
+            agent_run_id,
+            "tools",
+            output={"resumed": True, "results": len(tool_results)},
+        )
+        self._record_run_step(
+            db,
+            agent_run_id,
+            "finalize",
+            output={"answer_preview": answer[:200], "llm_status": llm_status},
+        )
         if self.conversation is not None:
             self.conversation.record_assistant_message(
                 db,
@@ -512,6 +840,8 @@ class AgentRuntime:
                 metadata={"llm_status": llm_status, "resumed_from_approval": str(approval.id)},
             )
             self.conversation.update_summary_if_needed(db, session_id=session_id, llm=self.llm)
+        self._record_run_step(db, agent_run_id, "post_turn", output={"event_type": "turn.resumed", "curator": curator_summary})
+        self._finish_run(db, agent_run_id, status="completed", answer=answer, state={"approval_id": str(approval.id), "decision": normalized_decision})
         return AgentTurnResult(turn_id=turn_id, answer=answer, context=context, status="completed")
 
     def _finish_resumed_turn(
@@ -564,9 +894,49 @@ class AgentRuntime:
         approval.turn_checkpoint = checkpoint
         approval.original_tool_call = pending_tool_call
         approval.allowed_decisions = ["approve", "edit", "reject", "respond"]
-        approval.resume_state = {**(approval.resume_state or {}), "mode": "resume_turn"}
+        approval.resume_state = {
+            **(approval.resume_state or {}),
+            "mode": "resume_turn",
+            "run_id": checkpoint.get("run_id") or (approval.resume_state or {}).get("run_id") or "",
+            "thread_id": checkpoint.get("thread_id") or checkpoint.get("session_id") or "",
+            "pending_tool_call": pending_tool_call,
+        }
         if approval.payload:
-            approval.payload = {**approval.payload, "resume_mode": "agent_tool_loop"}
+            approval.payload = {**approval.payload, "resume_mode": "agent_turn"}
+
+    def _curate_turn(
+        self,
+        db,
+        *,
+        session_id: str,
+        turn_id: str,
+        message: str,
+        answer: str,
+        tool_results: list[dict[str, Any]],
+        a2a_result: dict[str, Any],
+    ) -> dict[str, Any]:
+        if self.memory_curator is None:
+            return {"created": 0, "proposal_ids": []}
+        try:
+            result = self.memory_curator.curate_turn(
+                db,
+                session_id=session_id,
+                turn_id=turn_id,
+                user_message=message,
+                assistant_answer=answer,
+                tool_results=tool_results,
+                a2a_result=a2a_result,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.events.emit(
+                "memory.curator.failed",
+                {"error": str(exc), "tool_results": len(tool_results)},
+                severity="warning",
+                session_id=session_id,
+                turn_id=turn_id,
+            )
+            return {"created": 0, "proposal_ids": [], "error": str(exc)}
+        return {"created": result.created, "proposal_ids": [str(item.id) for item in result.proposals]}
 
     def _run_llm(
         self,
@@ -578,7 +948,8 @@ class AgentRuntime:
         memory_context: dict[str, Any],
         skill_index: list[dict[str, Any]],
         session_context: SessionContext,
-        workspace_context: dict[str, Any] | None = None,
+        core_context: dict[str, Any] | None = None,
+        task_plan: AgentTaskPlan | None = None,
     ) -> tuple[str, list[dict[str, Any]], str, list[dict[str, Any]], list[dict[str, Any]]]:
         if self.llm is None or not self.llm.configured:
             return "", [], "not_configured", [], []
@@ -589,17 +960,28 @@ class AgentRuntime:
                 "content": (
                     "You are SoulClaw. Memory stores durable facts and preferences; "
                     "Skills store procedural know-how; LLM-Wiki stores traceable evidence. "
+                    "Follow the compact turn plan in context; keep the local assistant path as the default. "
+                    "Use DeepResearch/A2A only when the plan says the task is research-grade or the user explicitly asks for it. "
                     "Use skill_search before reading a full skill, and skill_read only when the skill is relevant. "
                     "For Wiki-backed facts, first call wiki_route. If it recommends browse_first, use wiki_browse; "
                     "if search_first, use wiki_search; if bridge, combine wiki_search/wiki_browse with wiki_follow_links. "
                     "Always call wiki_read before relying on a page body, and use wiki_sufficiency_check for complex or constrained claims. "
                     "For durable memory facts, use memory_search and memory_get before relying on them. "
-                    "Cite Wiki pages as [[page_key]] when using Wiki evidence, and record useful skill outcomes with skill_use_trace."
+                    "memory_create and skill_use_trace create reviewable proposals; do not assume a proposal is active memory until applied. "
+                    "Cite Wiki pages as [[page_key]] when using Wiki evidence. "
+                    "Propose memory only for durable, user-useful lessons with evidence."
                 ),
             },
             {
                 "role": "system",
-                "content": self._context_text(wiki_orientation, memory_context, skill_index, session_context, workspace_context),
+                "content": self._context_text(
+                    wiki_orientation,
+                    memory_context,
+                    skill_index,
+                    session_context,
+                    core_context,
+                    task_plan,
+                ),
             },
             {"role": "user", "content": message},
         ]
@@ -815,9 +1197,11 @@ class AgentRuntime:
         memory_context: dict[str, Any],
         skill_index: list[dict[str, Any]] | None = None,
         session_context: SessionContext | None = None,
-        workspace_context: dict[str, Any] | None = None,
+        core_context: dict[str, Any] | None = None,
+        task_plan: AgentTaskPlan | None = None,
     ) -> str:
         session_context = session_context or SessionContext(summary="", messages=[], total_messages=0)
+        task_plan = task_plan or AgentRuntime._plan_turn("")
         conversation_lines = [f"- {item.role}: {item.content[:800]}" for item in session_context.messages]
         wiki_lines = [
             f"- {item.get('page_key')}: {item.get('title')} :: {item.get('summary')}"
@@ -825,25 +1209,24 @@ class AgentRuntime:
         ]
         resident = memory_context.get("resident", [])
         dynamic = memory_context.get("dynamic", [])
-        memory_lines = [f"- {item.kind}: {item.content}" for item in [*resident, *dynamic]]
+        memory_lines = [AgentRuntime._memory_context_line(item) for item in [*resident, *dynamic]]
         skill_lines = [
             f"- {item.get('skill_key')}: {item.get('name')} :: {item.get('description', '')}"
             for item in (skill_index or [])[:20]
         ]
-        workspace_context = workspace_context or {}
-        soul = workspace_context.get("soul")
-        user = workspace_context.get("user")
-        memory_file = workspace_context.get("memory")
+        core_context = core_context or {}
+        soul = core_context.get("soul")
+        user = core_context.get("user")
         soul_text = getattr(soul, "content", "")[:2500] if soul is not None else ""
         user_text = getattr(user, "content", "")[:2500] if user is not None else ""
-        memory_text = getattr(memory_file, "content", "")[:3000] if memory_file is not None else ""
         return (
-            "SOUL.md:\n"
+            "Turn plan:\n"
+            + json.dumps(task_plan.to_context(), ensure_ascii=False)
+            + "\n\n"
+            "Soul core block (authoritative structured state):\n"
             + (soul_text or "(none)")
-            + "\n\nUSER.md:\n"
+            + "\n\nUser core block (authoritative structured state):\n"
             + (user_text or "(none)")
-            + "\n\nMEMORY.md excerpt:\n"
-            + (memory_text or "(none)")
             + "\n\n"
             "Conversation summary:\n"
             + (session_context.summary or "(none)")
@@ -864,6 +1247,17 @@ class AgentRuntime:
             + "\n".join(wiki_lines)
         )
 
+    @staticmethod
+    def _memory_context_line(item: Any) -> str:
+        confidence = float(getattr(item, "confidence", 0.0) or 0.0)
+        stability = float(getattr(item, "stability", 0.0) or 0.0)
+        source = str(getattr(item, "source", "") or "")
+        content = str(getattr(item, "content", "") or "")
+        return (
+            f"- id={getattr(item, 'id', '')} kind={getattr(item, 'kind', '')} source={source} "
+            f"confidence={confidence:.2f} stability={stability:.2f}: {content}"
+        )
+
     def _skill_index(self, db, message: str) -> list[dict[str, Any]]:
         if self.registry is None or not hasattr(self.registry, "skills"):
             return []
@@ -882,9 +1276,141 @@ class AgentRuntime:
             for item in hits
         ]
 
+    def _record_run_step(
+        self,
+        db,
+        run_id: str,
+        step_name: str,
+        *,
+        status: str = "succeeded",
+        input: dict[str, Any] | None = None,
+        output: dict[str, Any] | None = None,
+        error: str = "",
+    ) -> None:
+        if self.runs is None or not run_id:
+            return
+        try:
+            self.runs.add_step(db, run_id, step_name, status=status, input=input, output=output, error=error)
+        except Exception as exc:  # noqa: BLE001
+            self.events.emit("agent.run.step_record_failed", {"run_id": run_id, "step": step_name, "error": str(exc)}, severity="warning")
+
+    def _finish_run(
+        self,
+        db,
+        run_id: str,
+        *,
+        status: str,
+        answer: str = "",
+        error: str = "",
+        state: dict[str, Any] | None = None,
+    ) -> None:
+        if self.runs is None or not run_id:
+            return
+        try:
+            self.runs.finish_run(db, run_id, status=status, answer=answer, error=error, state=state)
+        except Exception as exc:  # noqa: BLE001
+            self.events.emit("agent.run.finish_failed", {"run_id": run_id, "error": str(exc)}, severity="warning")
+
+    def _save_graph_checkpoint(self, *, thread_id: str, run_id: str, checkpoint_id: str, state: dict[str, Any]) -> None:
+        if self.checkpoints is None or not run_id:
+            return
+        self.checkpoints.save(thread_id=thread_id, run_id=run_id, checkpoint_id=checkpoint_id, state=state)
+
+    def _approval_context(
+        self,
+        *,
+        session_id: str,
+        agent_run_id: str,
+        task_plan: AgentTaskPlan,
+        approval_id: str,
+        pending_tool_call: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "wiki": [],
+            "memory": {"resident": [], "dynamic": []},
+            "conversation": {"summary": False, "recent_messages": 0, "total_messages": 0},
+            "wiki_orientation": {"page_count": 0, "canonical_files": False},
+            "workspace": {},
+            "skills": {"indexed": 0, "items": []},
+            "tools": [
+                {
+                    "status": "approval_required",
+                    "tool_name": pending_tool_call.get("name") or pending_tool_call.get("tool_name") or "",
+                    "approval_id": approval_id,
+                }
+            ],
+            "a2a": {},
+            "task_plan": task_plan.to_context(),
+            "llm": {"status": "approval_required", "tool_calls": [pending_tool_call], "wiki_read_used": False},
+            "trace": {"trace_id": current_trace_id()},
+            "turn": {
+                "status": "approval_required",
+                "approval_id": approval_id,
+                "pending_tool_call": pending_tool_call,
+                "resume_available": True,
+            },
+            "run": {
+                "run_id": agent_run_id,
+                "thread_id": session_id,
+                "graph": self.graph_shell.state(),
+            },
+        }
+
+    @staticmethod
+    def _plan_turn(message: str, *, tool_calls: list[dict[str, Any]] | None = None) -> AgentTaskPlan:
+        if tool_calls is not None:
+            return AgentTaskPlan(
+                route="tool_execution",
+                reason="Explicit tool calls were supplied by the caller.",
+                memory_policy="Do not infer new long-term memory from raw tool execution alone.",
+                wiki_policy="Use Wiki only if the supplied tools request it.",
+                skill_policy="Use existing skills only as explicit procedural guidance.",
+            )
+        if AgentRuntime._should_delegate_to_deep_research(message):
+            return AgentTaskPlan(
+                route="deep_research",
+                reason="The user explicitly asked for broad, current, or evidence-heavy research.",
+                memory_policy=(
+                    "After delegated research completes, save only durable user preferences, repeated procedures, "
+                    "or evidence-backed lessons as proposals."
+                ),
+                wiki_policy="Treat external research findings as Wiki candidates with citations, not as raw memory.",
+                skill_policy="Promote a research procedure to Skill only after repeated successful runs.",
+                delegation={
+                    "capability": "deep-research",
+                    "options": {
+                        "retrieval_policy": {
+                            "require_current_sources": True,
+                            "return_artifacts": True,
+                            "preserve_evidence": True,
+                        }
+                    },
+                },
+            )
+        return AgentTaskPlan(
+            route="local_answer",
+            reason="Default local-first turn: answer with resident memory, Wiki evidence, and tools only as needed.",
+            memory_policy="Use resident and dynamic memory as personalization; create memory only for durable facts or preferences.",
+            wiki_policy="Use Wiki for traceable facts; read page bodies before relying on page evidence.",
+            skill_policy="Search/read skills only when a procedural pattern is clearly relevant.",
+        )
+
     @staticmethod
     def _should_delegate_to_deep_research(message: str) -> bool:
         text = str(message or "").lower()
+        suppressors = (
+            "local only",
+            "no deep research",
+            "do not delegate",
+            "don't delegate",
+            "不要委托",
+            "不要调用",
+            "不要联网",
+            "本地回答",
+            "不需要联网",
+        )
+        if any(item in text for item in suppressors):
+            return False
         triggers = (
             "deepresearch",
             "deep research",
@@ -893,7 +1419,12 @@ class AgentRuntime:
             "深入调研",
             "全面调研",
             "广泛调研",
+            "联网调研",
+            "研究报告",
+            "调研报告",
+            "竞品调研",
             "research report",
+            "evidence report",
         )
         return any(trigger in text for trigger in triggers)
 

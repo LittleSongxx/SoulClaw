@@ -1,7 +1,7 @@
 [project]
 name = "soulclaw"
 version = "2.0.0"
-description = "A local-first personal AI agent with SQLite, Markdown-authoritative memory, LLM-Wiki, and skill evolution."
+description = "A LangGraph-oriented personal AI agent platform with pgvector retrieval, policy governance, LLM-Wiki, and skill evolution."
 requires-python = ">=3.11,<3.14"
 dependencies = [
     "fastapi>=0.115.0",
@@ -28,6 +28,10 @@ dependencies = [
     "opentelemetry-exporter-otlp>=1.29.0",
     "mcp>=1.0.0",
     "a2a-sdk[fastapi]>=1.1.0,<2.0.0",
+    "langgraph>=0.2.70",
+    "langgraph-checkpoint-postgres>=2.0.0",
+    "pgvector>=0.3.6",
+    "psycopg-pool>=3.2.3",
 ]
 
 [project.optional-dependencies]

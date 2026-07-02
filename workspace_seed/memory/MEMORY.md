@@ -1,3 +1,5 @@
 # MEMORY
 
-Durable lessons, user facts, project knowledge, and recurring patterns live here. Use readable Markdown; the database is only a searchable mirror.
+> Generated projection template. Postgres structured memories are authoritative; edit drafts through proposals.
+
+No approved long-term memories have been projected yet.

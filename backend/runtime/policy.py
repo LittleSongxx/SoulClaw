@@ -49,6 +49,10 @@ class SandboxPolicy:
     # caller can pre-flight against this).
     allowed_tools: tuple[str, ...] = ()
     denied_tools: tuple[str, ...] = ()
+    # Host runtime opt-ins. Defaults avoid implicit shell execution and broad
+    # host environment leakage.
+    allow_shell_scripts: bool = False
+    inherit_env: bool = False
     # Free-form labels for audit log lines.
     labels: dict[str, str] = field(default_factory=dict)
 
@@ -82,6 +86,8 @@ class SandboxPolicy:
             "writable_paths": list(self.writable_paths),
             "allowed_tools": list(self.allowed_tools),
             "denied_tools": list(self.denied_tools),
+            "allow_shell_scripts": self.allow_shell_scripts,
+            "inherit_env": self.inherit_env,
             "labels": dict(self.labels),
         }
 

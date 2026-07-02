@@ -12,6 +12,9 @@ services:
     image: soulclaw:local
     container_name: soulclaw
     restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
     security_opt:
       - no-new-privileges:true
     deploy:
@@ -34,7 +37,13 @@ services:
       NPM_CONFIG_REGISTRY: ${NPM_CONFIG_REGISTRY:-}
       SOULCLAW_REDIS_URL: redis://redis:6379/0
       SOULCLAW_REDIS_REQUIRED: ${SOULCLAW_REDIS_REQUIRED:-false}
-      SOULCLAW_DATABASE_URL: ${SOULCLAW_DATABASE_URL:-sqlite:////app/data/soulclaw.sqlite3}
+      SOULCLAW_DATABASE_URL: ${SOULCLAW_DATABASE_URL:-postgresql+psycopg://soulclaw:soulclaw@postgres:5432/soulclaw}
+      SOULCLAW_AGENT_ENGINE: ${SOULCLAW_AGENT_ENGINE:-langgraph}
+      SOULCLAW_VECTOR_MODE: ${SOULCLAW_VECTOR_MODE:-required}
+      SOULCLAW_EMBEDDING_MODEL: ${SOULCLAW_EMBEDDING_MODEL:-text-embedding-3-small}
+      SOULCLAW_EMBEDDING_DIMENSIONS: ${SOULCLAW_EMBEDDING_DIMENSIONS:-1536}
+      SOULCLAW_EMBEDDING_BATCH_SIZE: ${SOULCLAW_EMBEDDING_BATCH_SIZE:-32}
+      SOULCLAW_EMBEDDING_PASS_DIMENSIONS: ${SOULCLAW_EMBEDDING_PASS_DIMENSIONS:-true}
       SOULCLAW_WORKSPACE_SEED_DIR: /app/workspace_seed
       SOULCLAW_BOOTSTRAP_WIKI_ON_STARTUP: ${SOULCLAW_BOOTSTRAP_WIKI_ON_STARTUP:-true}
       SOULCLAW_BOOTSTRAP_SKILLS_ON_STARTUP: ${SOULCLAW_BOOTSTRAP_SKILLS_ON_STARTUP:-true}
@@ -80,7 +89,13 @@ services:
     environment:
       SOULCLAW_REDIS_URL: redis://redis:6379/0
       SOULCLAW_REDIS_REQUIRED: "true"
-      SOULCLAW_DATABASE_URL: ${SOULCLAW_DATABASE_URL:-sqlite:////app/data/soulclaw.sqlite3}
+      SOULCLAW_DATABASE_URL: ${SOULCLAW_DATABASE_URL:-postgresql+psycopg://soulclaw:soulclaw@postgres:5432/soulclaw}
+      SOULCLAW_AGENT_ENGINE: ${SOULCLAW_AGENT_ENGINE:-langgraph}
+      SOULCLAW_VECTOR_MODE: ${SOULCLAW_VECTOR_MODE:-required}
+      SOULCLAW_EMBEDDING_MODEL: ${SOULCLAW_EMBEDDING_MODEL:-text-embedding-3-small}
+      SOULCLAW_EMBEDDING_DIMENSIONS: ${SOULCLAW_EMBEDDING_DIMENSIONS:-1536}
+      SOULCLAW_EMBEDDING_BATCH_SIZE: ${SOULCLAW_EMBEDDING_BATCH_SIZE:-32}
+      SOULCLAW_EMBEDDING_PASS_DIMENSIONS: ${SOULCLAW_EMBEDDING_PASS_DIMENSIONS:-true}
       SOULCLAW_AUTO_MIGRATE: "false"
       SOULCLAW_WORKSPACE_SEED_DIR: /app/workspace_seed
       SOULCLAW_MCP_CONFIG_FILE: /app/config/mcp_servers.yaml
@@ -111,7 +126,9 @@ services:
     environment:
       SOULCLAW_REDIS_URL: redis://redis:6379/0
       SOULCLAW_REDIS_REQUIRED: "true"
-      SOULCLAW_DATABASE_URL: ${SOULCLAW_DATABASE_URL:-sqlite:////app/data/soulclaw.sqlite3}
+      SOULCLAW_DATABASE_URL: ${SOULCLAW_DATABASE_URL:-postgresql+psycopg://soulclaw:soulclaw@postgres:5432/soulclaw}
+      SOULCLAW_AGENT_ENGINE: ${SOULCLAW_AGENT_ENGINE:-langgraph}
+      SOULCLAW_VECTOR_MODE: ${SOULCLAW_VECTOR_MODE:-required}
       SOULCLAW_AUTO_MIGRATE: "false"
       SOULCLAW_WORKSPACE_SEED_DIR: /app/workspace_seed
     env_file:
@@ -147,7 +164,6 @@ services:
   postgres:
     image: pgvector/pgvector:pg16
     container_name: soulclaw-postgres
-    profiles: ["postgres", "background"]
     restart: unless-stopped
     environment:
       POSTGRES_DB: soulclaw

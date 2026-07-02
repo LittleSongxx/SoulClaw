@@ -1,3 +1,5 @@
 # SOUL
 
-SoulClaw is a local-first long-term personal assistant. It should be careful, useful, transparent about uncertainty, and respectful of the user's preferences.
+> Generated projection template. Postgres core context is authoritative; propose edits through the console/API.
+
+No approved SOUL core context has been projected yet.

@@ -207,7 +207,6 @@ def _ensure_sqlite_additive_schema(engine: Engine) -> None:
         "memories": [
             ("status", "VARCHAR(32) NOT NULL DEFAULT 'active'"),
             ("superseded_by", "CHAR(32)"),
-            ("source_file_marker", "VARCHAR(256) NOT NULL DEFAULT ''"),
             ("valid_from", "DATETIME"),
             ("valid_to", "DATETIME"),
             ("provenance", "JSON NOT NULL DEFAULT '{}'"),
@@ -352,7 +351,6 @@ def _sqlite_additive_indexes() -> list[tuple[str, str, tuple[str, ...], bool]]:
         ("wiki_pages", "ix_wiki_pages_stale_after", ("stale_after",), False),
         ("memories", "ix_memories_status", ("status",), False),
         ("memories", "ix_memories_superseded_by", ("superseded_by",), False),
-        ("memories", "ix_memories_source_file_marker", ("source_file_marker",), False),
         ("evolution_proposals", "ix_evolution_proposals_target_checksum", ("target_checksum",), False),
         ("background_jobs", "ix_background_jobs_trace_id", ("trace_id",), False),
         ("background_jobs", "ix_background_jobs_request_id", ("request_id",), False),

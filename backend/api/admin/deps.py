@@ -64,6 +64,14 @@ def get_memory_service(request: Request):
     return request.app.state.memory_service
 
 
+def get_core_context_service(request: Request):
+    return request.app.state.core_context_service
+
+
+def get_memory_curator_service(request: Request):
+    return request.app.state.memory_curator_service
+
+
 def get_skill_service(request: Request):
     return request.app.state.skill_service
 
@@ -78,6 +86,10 @@ def get_job_service(request: Request):
 
 def get_evolution_service(request: Request):
     return request.app.state.evolution_service
+
+
+def get_evolution_proposal_service(request: Request):
+    return request.app.state.evolution_proposal_service
 
 
 def get_platform_service(request: Request):
@@ -100,8 +112,20 @@ def get_agent_runtime(request: Request):
     return request.app.state.agent_runtime
 
 
+def get_run_service(request: Request):
+    return request.app.state.run_service
+
+
 def get_llm_client(request: Request):
     return request.app.state.llm_client
+
+
+def get_vector_service(request: Request):
+    return request.app.state.vector_service
+
+
+def get_policy_engine(request: Request):
+    return request.app.state.policy_engine
 
 
 def get_a2a_service(request: Request):

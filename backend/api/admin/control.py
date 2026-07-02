@@ -12,8 +12,11 @@ from sqlalchemy.orm import Session
 
 from backend.api.admin.deps import (
     get_agent_runtime,
+    get_a2a_runtime,
+    get_core_context_service,
     get_current_user,
     get_db,
+    get_evolution_proposal_service,
     get_evolution_service,
     get_gateway_runtime,
     get_heartbeat_runtime,
@@ -22,7 +25,6 @@ from backend.api.admin.deps import (
     get_platform_service,
     get_tool_executor,
     get_tool_registry,
-    get_workspace_service,
 )
 from backend.api.admin.serializers import (
     approval_to_dict,
@@ -32,13 +34,15 @@ from backend.api.admin.serializers import (
     proposal_to_dict,
 )
 from backend.domain.evolution import EvolutionService
+from backend.domain.evolution_proposals import EvolutionProposalService
+from backend.domain.core_context import CoreContextService
 from backend.domain.jobs import BackgroundJobService, enqueue_background_job
 from backend.domain.platform import PlatformService
 from backend.domain.tools import ToolExecutor, ToolRegistry
-from backend.domain.workspace import WorkspaceService
 from backend.infra.config import Settings, get_settings
 from backend.infra.models import Approval, BackgroundJob, GatewayConnection, User
 from backend.runtime.agent import AgentRuntime
+from backend.runtime.a2a import A2ARuntimeManager
 from backend.runtime.gateway import (
     GatewayRuntimeManager,
     InboundGatewayMessage,
@@ -79,6 +83,19 @@ class ApprovalResumeTurnRequest(BaseModel):
 
 class EvolutionApplyRequest(BaseModel):
     actor: str | None = None
+
+
+class EvolutionProposalCreateRequest(BaseModel):
+    target_type: str
+    action: str
+    risk_level: str = "medium"
+    payload: dict[str, Any]
+    evidence: dict[str, Any] = Field(default_factory=dict)
+
+
+class EvolutionProposalRejectRequest(BaseModel):
+    actor: str | None = None
+    reason: str = ""
 
 
 class CronJobRequest(BaseModel):
@@ -191,16 +208,27 @@ def approve_and_run(
     service: PlatformService = Depends(get_platform_service),
     executor: ToolExecutor = Depends(get_tool_executor),
     runtime: AgentRuntime = Depends(get_agent_runtime),
+    a2a_runtime: A2ARuntimeManager = Depends(get_a2a_runtime),
 ) -> dict:
     approval = db.get(Approval, approval_id)
     if approval is None:
         raise HTTPException(status_code=404, detail=f"approval not found: {approval_id}")
     payload = approval.payload or {}
+    if approval.subject_type == "a2a_remote_hitl":
+        try:
+            result = a2a_runtime.resume_remote_approval(db, approval_id, decision="approve")
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (PermissionError, RuntimeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"ok": True, "approval": approval_to_dict(approval), "a2a": result}
     if approval.subject_type != "tool_run":
         raise HTTPException(status_code=400, detail="approval is not for a tool run")
     if approval.status not in {"pending", "approved"}:
         raise HTTPException(status_code=400, detail="approval is not runnable")
-    if (approval.turn_checkpoint or {}).get("mode") == "agent_tool_loop" or (approval.resume_state or {}).get("mode") == "resume_turn":
+    checkpoint_mode = (approval.turn_checkpoint or {}).get("mode")
+    resume_mode = (approval.resume_state or {}).get("mode")
+    if checkpoint_mode == "agent_turn" or resume_mode == "resume_turn":
         try:
             result = runtime.resume_turn(db, approval_id, decision="approve")
         except KeyError as exc:
@@ -250,7 +278,23 @@ def resume_turn(
     payload: ApprovalResumeTurnRequest,
     db: Session = Depends(get_db),
     runtime: AgentRuntime = Depends(get_agent_runtime),
+    a2a_runtime: A2ARuntimeManager = Depends(get_a2a_runtime),
 ) -> dict:
+    approval = db.get(Approval, approval_id)
+    if approval is not None and approval.subject_type == "a2a_remote_hitl":
+        try:
+            result = a2a_runtime.resume_remote_approval(
+                db,
+                approval_id,
+                decision=payload.decision,
+                edited_payload=payload.edited_arguments or None,
+                response=payload.response,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (PermissionError, RuntimeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"ok": True, "approval": approval_to_dict(db.get(Approval, approval_id)), "a2a": result}
     try:
         result = runtime.resume_turn(
             db,
@@ -285,7 +329,18 @@ def reject_approval(
     payload: ApprovalRejectRequest,
     db: Session = Depends(get_db),
     service: PlatformService = Depends(get_platform_service),
+    a2a_runtime: A2ARuntimeManager = Depends(get_a2a_runtime),
 ) -> dict:
+    approval = db.get(Approval, approval_id)
+    if approval is not None and approval.subject_type == "a2a_remote_hitl":
+        try:
+            result = a2a_runtime.resume_remote_approval(db, approval_id, decision="reject", response=payload.reason)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (PermissionError, RuntimeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        approval = db.get(Approval, approval_id)
+        return {"ok": True, "approval": approval_to_dict(approval) if approval is not None else None, "a2a": result}
     try:
         approval = service.resolve_approval(db, approval_id, status="rejected")
     except KeyError as exc:
@@ -294,6 +349,42 @@ def reject_approval(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     approval.payload = {**(approval.payload or {}), "reject_reason": payload.reason}
     return {"ok": True, "approval": approval_to_dict(approval)}
+
+
+@router.get("/api/evolution/proposals")
+def list_evolution_proposals(
+    status: str | None = None,
+    target_type: str | None = None,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+    service: EvolutionProposalService = Depends(get_evolution_proposal_service),
+) -> dict:
+    try:
+        items = service.list(db, status=status, target_type=target_type, limit=limit)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"items": [proposal_to_dict(item) for item in items]}
+
+
+@router.post("/api/evolution/proposals")
+def create_evolution_proposal(
+    payload: EvolutionProposalCreateRequest,
+    db: Session = Depends(get_db),
+    service: EvolutionProposalService = Depends(get_evolution_proposal_service),
+    user: User = Depends(get_current_user),
+) -> dict:
+    try:
+        proposal = service.create(
+            db,
+            target_type=payload.target_type,
+            action=payload.action,
+            payload=payload.payload,
+            evidence={**payload.evidence, "actor": user.username},
+            risk_level=payload.risk_level,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return proposal_to_dict(proposal)
 
 
 @router.post("/api/evolution/proposals/{proposal_id}/apply")
@@ -306,6 +397,23 @@ def apply_evolution_proposal(
 ) -> dict:
     try:
         proposal = service.apply(db, proposal_id, actor=payload.actor or user.username)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return proposal_to_dict(proposal)
+
+
+@router.post("/api/evolution/proposals/{proposal_id}/reject")
+def reject_evolution_proposal(
+    proposal_id: uuid.UUID,
+    payload: EvolutionProposalRejectRequest,
+    db: Session = Depends(get_db),
+    service: EvolutionProposalService = Depends(get_evolution_proposal_service),
+    user: User = Depends(get_current_user),
+) -> dict:
+    try:
+        proposal = service.reject(db, proposal_id, actor=payload.actor or user.username, reason=payload.reason)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
@@ -529,7 +637,7 @@ def run_heartbeat(
 @router.get("/api/heartbeat/status")
 def heartbeat_status(
     db: Session = Depends(get_db),
-    workspace: WorkspaceService = Depends(get_workspace_service),
+    core_context: CoreContextService = Depends(get_core_context_service),
 ) -> dict:
     latest_job = db.scalar(
         select(BackgroundJob)
@@ -540,7 +648,7 @@ def heartbeat_status(
     from backend.api.admin.serializers import background_job_to_dict
 
     return {
-        "active_tasks": workspace.active_heartbeat_tasks(),
-        "history": workspace.read_history(limit=20),
+        "active_tasks": core_context.heartbeat_tasks(db),
+        "history": [],
         "latest_job": background_job_to_dict(latest_job) if latest_job else None,
     }

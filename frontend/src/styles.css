@@ -308,7 +308,14 @@ nav button.active {
   gap: 10px;
 }
 
+.graph-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 10px;
+}
+
 .list article,
+.graph-list article,
 .alert-list article {
   background: #ffffff;
   border: 1px solid #d9dfdd;
@@ -316,7 +323,19 @@ nav button.active {
   padding: 14px;
 }
 
-.list strong {
+.graph-list article.approval_required {
+  border-color: #f1b34d;
+  background: #fff8ec;
+}
+
+.graph-list article.failed,
+.graph-list article.rejected {
+  border-color: #df8b8b;
+  background: #fff2f2;
+}
+
+.list strong,
+.graph-list strong {
   display: block;
   margin-bottom: 4px;
 }

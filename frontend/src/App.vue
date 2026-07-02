@@ -18,38 +18,24 @@ import {
   Settings,
   ShieldCheck,
   Timer,
+  Workflow,
   Wrench
 } from "@lucide/vue";
 import { computed, onMounted, ref } from "vue";
-
-type ViewKey =
-  | "dashboard"
-  | "wiki"
-  | "memory"
-  | "skills"
-  | "tools"
-  | "cron"
-  | "mcp"
-  | "gateways"
-  | "heartbeat"
-  | "reliability"
-  | "sessions"
-  | "jobs"
-  | "proposals"
-  | "approvals"
-  | "runs"
-  | "audit"
-  | "settings";
+import { createApiClient } from "./apiClient";
+import type { ViewKey } from "./types";
 
 const navItems: Array<{ key: ViewKey; label: string; icon: unknown }> = [
   { key: "dashboard", label: "Dashboard", icon: Activity },
   { key: "wiki", label: "Wiki", icon: BookOpen },
+  { key: "context", label: "Context", icon: FileText },
   { key: "memory", label: "Memory", icon: Brain },
   { key: "skills", label: "Skills", icon: Wrench },
   { key: "tools", label: "Tools", icon: PlugZap },
   { key: "cron", label: "Cron", icon: Timer },
   { key: "mcp", label: "MCP", icon: PlugZap },
   { key: "gateways", label: "Gateways", icon: Globe2 },
+  { key: "a2a", label: "A2A", icon: Workflow },
   { key: "heartbeat", label: "Heartbeat", icon: Activity },
   { key: "reliability", label: "Reliability", icon: ServerCog },
   { key: "sessions", label: "Sessions", icon: FileText },
@@ -57,6 +43,9 @@ const navItems: Array<{ key: ViewKey; label: string; icon: unknown }> = [
   { key: "proposals", label: "Proposals", icon: CheckCircle2 },
   { key: "approvals", label: "Approvals", icon: ShieldCheck },
   { key: "runs", label: "Runs", icon: Play },
+  { key: "runGraph", label: "Run Graph", icon: Workflow },
+  { key: "vector", label: "Vector", icon: Database },
+  { key: "policy", label: "Policy", icon: ShieldCheck },
   { key: "audit", label: "Audit", icon: FileText },
   { key: "settings", label: "Settings", icon: Settings }
 ];
@@ -79,8 +68,14 @@ const mcpForm = ref({ name: "", transport: "stdio", command: "", url: "", enable
 const gatewayForm = ref({ name: "", kind: "local", endpoint: "", enabled: true, config: "{}" });
 const gatewayInbound = ref({ gateway_name: "", external_user_id: "console", text: "", channel_id: "", metadata: "{}" });
 const gatewaySendForm = ref({ gateway_name: "", target_id: "", text: "", metadata: "{}" });
+const a2aResumeDecision = ref("approve");
+const a2aResumePayload = ref("{}");
 const workspaceKind = ref("memory");
 const workspaceContent = ref("");
+const contextBlocks = ref<Array<Record<string, unknown>>>([]);
+const contextProjections = ref<Array<Record<string, unknown>>>([]);
+const contextBlockKey = ref("user");
+const contextDraft = ref("");
 
 const me = ref<Record<string, unknown> | null>(null);
 const settingsData = ref<Record<string, unknown>>({});
@@ -96,6 +91,8 @@ const tools = ref<Array<Record<string, unknown>>>([]);
 const cronJobs = ref<Array<Record<string, unknown>>>([]);
 const mcpServers = ref<Array<Record<string, unknown>>>([]);
 const gateways = ref<Array<Record<string, unknown>>>([]);
+const a2aConnections = ref<Array<Record<string, unknown>>>([]);
+const a2aTasks = ref<Array<Record<string, unknown>>>([]);
 const sessions = ref<Array<Record<string, unknown>>>([]);
 const jobs = ref<Array<Record<string, unknown>>>([]);
 const sessionMessages = ref<Array<Record<string, unknown>>>([]);
@@ -103,6 +100,13 @@ const selectedSession = ref("");
 const proposals = ref<Array<Record<string, unknown>>>([]);
 const approvals = ref<Array<Record<string, unknown>>>([]);
 const runs = ref<Array<Record<string, unknown>>>([]);
+const agentRuns = ref<Array<Record<string, unknown>>>([]);
+const selectedRunId = ref("");
+const runGraph = ref<Record<string, unknown> | null>(null);
+const vectorStatus = ref<Record<string, unknown>>({});
+const vectorRebuildResult = ref<Record<string, unknown> | null>(null);
+const policyStatus = ref<Record<string, unknown>>({});
+const policyRules = ref<Array<Record<string, unknown>>>([]);
 const events = ref<Array<Record<string, unknown>>>([]);
 const audit = ref<Array<Record<string, unknown>>>([]);
 const lastTurn = ref<Record<string, unknown> | null>(null);
@@ -111,6 +115,8 @@ const selectedSkill = ref<Record<string, unknown> | null>(null);
 const toolResult = ref<Record<string, unknown> | null>(null);
 const jobResult = ref<Record<string, unknown> | null>(null);
 const gatewayResult = ref<Record<string, unknown> | null>(null);
+const a2aResult = ref<Record<string, unknown> | null>(null);
+const selectedA2aTask = ref<Record<string, unknown> | null>(null);
 const memoryConflicts = ref<Array<Record<string, unknown>>>([]);
 const memoryProbes = ref<Array<Record<string, unknown>>>([]);
 const workspaceFiles = ref<Array<Record<string, unknown>>>([]);
@@ -145,17 +151,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 async function api(path: string, init: RequestInit = {}) {
-  const headers = new Headers(init.headers || {});
-  headers.set("Content-Type", "application/json");
-  if (token.value) headers.set("Authorization", `Bearer ${token.value}`);
-  const response = await fetch(path, { ...init, headers });
-  if (response.status === 401) {
-    logout();
-    throw new Error("Authentication expired");
-  }
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(payload.detail || payload.error || response.statusText);
-  return payload;
+  return createApiClient(() => token.value, logout)(path, init);
 }
 
 async function login() {
@@ -216,6 +212,11 @@ async function loadActive() {
     wikiOrientation.value = orientPayload;
   }
   if (active.value === "memory") memories.value = (await api("/api/memory")).items || [];
+  if (active.value === "context") {
+    const [blocks, projections] = await Promise.all([api("/api/context/blocks"), api("/api/context/projections")]);
+    contextBlocks.value = blocks.items || [];
+    contextProjections.value = projections.items || [];
+  }
   if (active.value === "skills") skills.value = (await api("/api/skills")).items || [];
   if (active.value === "tools") tools.value = (await api("/api/tools")).items || [];
   if (active.value === "cron") cronJobs.value = (await api("/api/cron")).items || [];
@@ -224,6 +225,14 @@ async function loadActive() {
     const [items, statuses] = await Promise.all([api("/api/gateways"), api("/api/gateways/status")]);
     gateways.value = items.items || [];
     gatewayStatuses.value = statuses.items || [];
+  }
+  if (active.value === "a2a") {
+    const [connections, tasks] = await Promise.all([api("/api/a2a/connections"), api("/api/a2a/tasks")]);
+    a2aConnections.value = connections.items || [];
+    a2aTasks.value = tasks.items || [];
+    if (selectedA2aTask.value?.task_id) {
+      await loadA2aTask(selectedA2aTask.value.task_id);
+    }
   }
   if (active.value === "heartbeat") {
     const [status, files] = await Promise.all([api("/api/heartbeat/status"), api("/api/workspace/files")]);
@@ -244,9 +253,20 @@ async function loadActive() {
   }
   if (active.value === "sessions") sessions.value = (await api("/api/sessions")).items || [];
   if (active.value === "jobs") jobs.value = (await api("/api/jobs")).items || [];
-  if (active.value === "proposals") proposals.value = (await api("/api/skills/proposals")).items || [];
+  if (active.value === "proposals") proposals.value = (await api("/api/evolution/proposals")).items || [];
   if (active.value === "approvals") approvals.value = (await api("/api/approvals")).items || [];
   if (active.value === "runs") runs.value = (await api("/api/runs")).items || [];
+  if (active.value === "runGraph") {
+    agentRuns.value = (await api("/api/agent-runs")).items || [];
+    if (!selectedRunId.value && agentRuns.value[0]?.run_id) selectedRunId.value = String(agentRuns.value[0].run_id);
+    if (selectedRunId.value) await loadRunGraph(selectedRunId.value);
+  }
+  if (active.value === "vector") vectorStatus.value = await api("/api/vector/status");
+  if (active.value === "policy") {
+    const [status, rules] = await Promise.all([api("/api/policy/status"), api("/api/policy/rules")]);
+    policyStatus.value = status;
+    policyRules.value = rules.items || [];
+  }
   if (active.value === "audit") {
     audit.value = (await api("/api/audit")).items || [];
     events.value = (await api("/api/events")).items || [];
@@ -285,7 +305,7 @@ async function readWiki(pageKey: string) {
 
 async function createMemory() {
   if (!newMemory.value.trim()) return;
-  await api("/api/memory", {
+  jobResult.value = await api("/api/memory", {
     method: "POST",
     body: JSON.stringify({
       kind: "agent_note",
@@ -300,15 +320,35 @@ async function createMemory() {
   await loadActive();
 }
 
+async function proposeContextBlock() {
+  if (!contextDraft.value.trim()) return;
+  jobResult.value = await api(`/api/context/blocks/${encodeURIComponent(contextBlockKey.value)}/proposals`, {
+    method: "POST",
+    body: JSON.stringify({
+      content: contextDraft.value,
+      action: "update",
+      risk_level: "medium",
+      evidence: { source: "console.context" }
+    })
+  });
+  contextDraft.value = "";
+  await loadActive();
+}
+
+function editContextBlock(item: Record<string, unknown>) {
+  contextBlockKey.value = String(item.block_key || "user");
+  contextDraft.value = String(item.content || "");
+}
+
 async function loadWorkspaceFile(kind = workspaceKind.value) {
   const item = await api(`/api/workspace/files/${encodeURIComponent(kind)}`);
   workspaceKind.value = String(item.kind || kind);
   workspaceContent.value = String(item.content || "");
 }
 
-async function saveWorkspaceFile() {
-  await api(`/api/workspace/files/${encodeURIComponent(workspaceKind.value)}`, {
-    method: "PUT",
+async function importWorkspaceDraft() {
+  jobResult.value = await api(`/api/workspace/files/${encodeURIComponent(workspaceKind.value)}/import-draft`, {
+    method: "POST",
     body: JSON.stringify({ content: workspaceContent.value })
   });
   await loadActive();
@@ -327,18 +367,21 @@ async function searchMemory() {
   memories.value = (payload.items || []).map((item: Record<string, unknown>) => item.memory).filter(Boolean) as Array<Record<string, unknown>>;
 }
 
-async function syncMemoryFile() {
-  jobResult.value = await api("/api/memory/sync", { method: "POST" });
+async function importMemoryDraft() {
+  jobResult.value = await api("/api/memory/import-draft", {
+    method: "POST",
+    body: JSON.stringify({ kind: workspaceKind.value, content: workspaceContent.value })
+  });
   await loadActive();
 }
 
 async function verifyMemory(id: unknown) {
-  await api(`/api/memory/${id}/verify`, { method: "POST" });
+  jobResult.value = await api(`/api/memory/${id}/verify`, { method: "POST" });
   await loadActive();
 }
 
 async function archiveMemory(id: unknown) {
-  await api(`/api/memory/${id}/archive`, { method: "POST" });
+  jobResult.value = await api(`/api/memory/${id}/archive`, { method: "POST" });
   await loadActive();
 }
 
@@ -386,7 +429,7 @@ async function applyProposal(id: unknown) {
 }
 
 async function rejectProposal(id: unknown) {
-  await api(`/api/skills/proposals/${id}/reject`, { method: "POST", body: JSON.stringify({ reason: "Rejected in console" }) });
+  await api(`/api/evolution/proposals/${id}/reject`, { method: "POST", body: JSON.stringify({ reason: "Rejected in console" }) });
   await loadActive();
 }
 
@@ -475,6 +518,50 @@ async function testGatewaySend() {
   await loadActive();
 }
 
+async function loadA2aTask(taskId: unknown) {
+  selectedA2aTask.value = await api(`/api/a2a/tasks/${encodeURIComponent(String(taskId))}`);
+}
+
+async function syncActiveA2aTasks() {
+  a2aResult.value = await api("/api/a2a/tasks/sync-active", {
+    method: "POST",
+    body: JSON.stringify({ enqueue: true, limit: 50 })
+  });
+  await loadActive();
+}
+
+async function syncA2aTask(taskId: unknown) {
+  a2aResult.value = await api(`/api/a2a/tasks/${encodeURIComponent(String(taskId))}/sync`, { method: "POST" });
+  await loadA2aTask(taskId);
+  await loadActive();
+}
+
+async function cancelA2aTask(taskId: unknown) {
+  a2aResult.value = await api(`/api/a2a/tasks/${encodeURIComponent(String(taskId))}/cancel`, { method: "POST" });
+  await loadA2aTask(taskId);
+  await loadActive();
+}
+
+async function resumeA2aRemoteApproval(taskId: unknown) {
+  jsonError.value = "";
+  let editedPayload: Record<string, unknown> = {};
+  if (a2aResumeDecision.value === "edit") {
+    const parsed = parseJson(a2aResumePayload.value);
+    if (parsed === null) return;
+    editedPayload = parsed;
+  }
+  a2aResult.value = await api(`/api/a2a/tasks/${encodeURIComponent(String(taskId))}/resume-remote-approval`, {
+    method: "POST",
+    body: JSON.stringify({
+      decision: a2aResumeDecision.value,
+      edited_payload: editedPayload,
+      response: a2aResumeDecision.value === "respond" ? a2aResumePayload.value : ""
+    })
+  });
+  await loadA2aTask(taskId);
+  await loadActive();
+}
+
 async function loadSession(sessionId: unknown) {
   selectedSession.value = String(sessionId);
   sessionMessages.value = (await api(`/api/sessions/${encodeURIComponent(selectedSession.value)}/messages`)).items || [];
@@ -487,6 +574,39 @@ async function runTurn() {
     body: JSON.stringify({ message: turnMessage.value, session_id: "console" })
   });
   await loadDashboard();
+  const turnContext = isRecord(lastTurn.value?.context) ? lastTurn.value.context : {};
+  const turnRun = isRecord(turnContext.run) ? turnContext.run : {};
+  const runId = String(turnRun.run_id || "");
+  if (runId) {
+    selectedRunId.value = runId;
+    agentRuns.value = (await api("/api/agent-runs")).items || [];
+  }
+}
+
+async function loadRunGraph(runId: unknown) {
+  selectedRunId.value = String(runId || "");
+  if (!selectedRunId.value) return;
+  runGraph.value = await api(`/api/runs/${encodeURIComponent(selectedRunId.value)}/graph`);
+}
+
+async function rebuildVectors(sourceType = "") {
+  vectorRebuildResult.value = await api("/api/vector/rebuild", {
+    method: "POST",
+    body: JSON.stringify({ source_type: sourceType, async_job: true })
+  });
+  vectorStatus.value = await api("/api/vector/status");
+}
+
+async function updatePolicyRule(rule: Record<string, unknown>, patch: Record<string, unknown>) {
+  const ruleId = String(rule.rule_id || "");
+  if (!ruleId) return;
+  await api(`/api/policy/rules/${encodeURIComponent(ruleId)}`, {
+    method: "PUT",
+    body: JSON.stringify(patch)
+  });
+  const [status, rules] = await Promise.all([api("/api/policy/status"), api("/api/policy/rules")]);
+  policyStatus.value = status;
+  policyRules.value = rules.items || [];
 }
 
 function parseJson(value: string): Record<string, unknown> | null {
@@ -581,7 +701,7 @@ onMounted(refreshAll);
           </article>
           <article>
             <span>Storage</span>
-            <strong>SQLite</strong>
+            <strong>{{ settingsData.database_backend || "Postgres" }}</strong>
           </article>
           <article>
             <span>Dream Review</span>
@@ -655,8 +775,8 @@ onMounted(refreshAll);
             <option value="heartbeat">HEARTBEAT.md</option>
           </select>
           <button class="secondary" @click="loadWorkspaceFile()">Open File</button>
-          <button class="primary" @click="saveWorkspaceFile">Save File</button>
-          <textarea v-model="workspaceContent" placeholder="Markdown authoritative memory file"></textarea>
+          <button class="primary" @click="importWorkspaceDraft">Import Projection Draft</button>
+          <textarea v-model="workspaceContent" placeholder="Generated projection or draft content"></textarea>
         </section>
         <div class="actions">
           <div class="searchbox">
@@ -664,14 +784,14 @@ onMounted(refreshAll);
             <input v-model="memoryQuery" @keyup.enter="searchMemory" placeholder="Search memory" />
           </div>
           <button class="secondary" @click="searchMemory">Search</button>
-          <button class="secondary" @click="syncMemoryFile">Sync File</button>
+          <button class="secondary" @click="importMemoryDraft">Import Draft</button>
           <button class="secondary" @click="loadMemoryDiagnostics">Diagnostics</button>
         </div>
         <section class="tool-surface">
           <textarea v-model="newMemory" placeholder="Add memory"></textarea>
           <button class="primary" @click="createMemory">
             <Brain :size="18" />
-            <span>Add</span>
+            <span>Propose</span>
           </button>
         </section>
         <section class="list">
@@ -686,6 +806,33 @@ onMounted(refreshAll);
           </article>
         </section>
         <pre v-if="memoryConflicts.length">{{ fmt({ conflicts: memoryConflicts, probes: memoryProbes }) }}</pre>
+      </section>
+
+      <section v-if="active === 'context'" class="stack">
+        <section class="tool-surface">
+          <select v-model="contextBlockKey">
+            <option value="soul">SOUL</option>
+            <option value="user">USER</option>
+            <option value="heartbeat">HEARTBEAT</option>
+          </select>
+          <textarea v-model="contextDraft" placeholder="Draft a core context update proposal"></textarea>
+          <button class="primary" @click="proposeContextBlock">Submit Proposal</button>
+        </section>
+        <section class="list">
+          <article v-for="item in contextBlocks" :key="String(item.id)">
+            <strong>{{ item.title || item.block_key }}</strong>
+            <span>{{ item.block_key }} · v{{ item.version }} · confidence {{ item.confidence }}</span>
+            <p>{{ item.content }}</p>
+            <button class="secondary fit" @click="editContextBlock(item)">Edit Draft</button>
+          </article>
+        </section>
+        <section class="list">
+          <article v-for="item in contextProjections" :key="String(item.path)">
+            <strong>{{ item.path }}</strong>
+            <span>Generated projection</span>
+            <pre>{{ item.content }}</pre>
+          </article>
+        </section>
       </section>
 
       <section v-if="active === 'skills'" class="stack">
@@ -809,15 +956,109 @@ onMounted(refreshAll);
         <pre v-if="gatewayStatuses.length">{{ fmt({ statuses: gatewayStatuses }) }}</pre>
       </section>
 
+      <section v-if="active === 'a2a'" class="stack">
+        <div class="actions">
+          <button class="primary" @click="syncActiveA2aTasks">
+            <RefreshCw :size="18" />
+            <span>Sync Active Remote Tasks</span>
+          </button>
+        </div>
+        <section class="settings-grid">
+          <article>
+            <span>Connections</span>
+            <strong>{{ a2aConnections.length }}</strong>
+          </article>
+          <article>
+            <span>Tasks</span>
+            <strong>{{ a2aTasks.length }}</strong>
+          </article>
+          <article>
+            <span>Working</span>
+            <strong>{{ a2aTasks.filter((item) => ['submitted', 'working', 'input-required', 'auth-required'].includes(String(item.status))).length }}</strong>
+          </article>
+          <article>
+            <span>Approval Bridge</span>
+            <strong>{{ a2aTasks.filter((item) => isRecord(item.metadata) && item.metadata.remote_approval_id).length }}</strong>
+          </article>
+        </section>
+        <section class="list">
+          <article v-for="item in a2aConnections" :key="String(item.id)">
+            <strong>{{ item.name }}</strong>
+            <span>{{ item.status }} · {{ item.enabled ? "enabled" : "disabled" }}</span>
+            <p>{{ item.rpc_url || item.endpoint }}</p>
+            <small v-if="item.last_error">{{ item.last_error }}</small>
+          </article>
+        </section>
+        <section class="list">
+          <article v-for="item in a2aTasks" :key="String(item.id)">
+            <strong>{{ item.capability }} · {{ item.status }}</strong>
+            <span>{{ item.connection_name }} · local {{ item.task_id }} · remote {{ item.remote_task_id || "-" }}</span>
+            <p>{{ item.input_text }}</p>
+            <div class="actions">
+              <button class="secondary" @click="loadA2aTask(item.task_id)">Open</button>
+              <button class="secondary" @click="syncA2aTask(item.task_id)" :disabled="!item.remote_task_id">Sync Remote</button>
+              <button class="secondary" @click="cancelA2aTask(item.task_id)" :disabled="['completed', 'failed', 'canceled', 'rejected'].includes(String(item.status))">Cancel</button>
+            </div>
+            <pre>{{ fmt({ remote_context_id: item.remote_context_id, error: item.error, metadata: item.metadata }) }}</pre>
+          </article>
+        </section>
+        <section v-if="selectedA2aTask" class="stack">
+          <section class="tool-surface">
+            <select v-model="a2aResumeDecision">
+              <option value="approve">approve</option>
+              <option value="edit">edit</option>
+              <option value="reject">reject</option>
+              <option value="respond">respond</option>
+            </select>
+            <textarea v-model="a2aResumePayload" placeholder="Edit JSON payload, or text response when decision=respond"></textarea>
+            <button class="primary" @click="resumeA2aRemoteApproval(selectedA2aTask.task_id)" :disabled="!(isRecord(selectedA2aTask.metadata) && selectedA2aTask.metadata.remote_approval_id)">Resume Remote Approval</button>
+          </section>
+          <section class="settings-grid">
+            <article>
+              <span>Status</span>
+              <strong>{{ selectedA2aTask.status }}</strong>
+            </article>
+            <article>
+              <span>Remote</span>
+              <strong>{{ selectedA2aTask.remote_task_id || "-" }}</strong>
+            </article>
+            <article>
+              <span>Artifacts</span>
+              <strong>{{ Array.isArray(selectedA2aTask.artifacts) ? selectedA2aTask.artifacts.length : 0 }}</strong>
+            </article>
+            <article>
+              <span>Events</span>
+              <strong>{{ Array.isArray(selectedA2aTask.events) ? selectedA2aTask.events.length : 0 }}</strong>
+            </article>
+          </section>
+          <pre>{{ fmt({ result: selectedA2aTask.result, error: selectedA2aTask.error, metadata: selectedA2aTask.metadata }) }}</pre>
+          <section class="list" v-if="Array.isArray(selectedA2aTask.artifacts)">
+            <article v-for="artifact in selectedA2aTask.artifacts" :key="String(artifact.id)">
+              <strong>{{ artifact.name || artifact.artifact_id }}</strong>
+              <span>{{ artifact.mime_type }} · {{ artifact.created_at }}</span>
+              <pre>{{ fmt({ content: artifact.content, parts: artifact.parts, metadata: artifact.metadata }) }}</pre>
+            </article>
+          </section>
+          <section class="list" v-if="Array.isArray(selectedA2aTask.events)">
+            <article v-for="event in selectedA2aTask.events" :key="String(event.id)">
+              <strong>{{ event.sequence }} · {{ event.event_type }}</strong>
+              <span>{{ event.created_at }}</span>
+              <pre>{{ fmt(event.payload) }}</pre>
+            </article>
+          </section>
+        </section>
+        <pre v-if="a2aResult">{{ fmt(a2aResult) }}</pre>
+      </section>
+
       <section v-if="active === 'heartbeat'" class="stack">
         <div class="actions">
           <button class="primary" @click="runHeartbeat(true)">Enqueue Heartbeat</button>
           <button class="secondary" @click="runHeartbeat(false)">Run Now</button>
-          <button class="secondary" @click="loadWorkspaceFile('heartbeat')">Open HEARTBEAT.md</button>
+          <button class="secondary" @click="loadWorkspaceFile('heartbeat')">Open Projection</button>
         </div>
         <section class="tool-surface">
-          <textarea v-model="workspaceContent" placeholder="HEARTBEAT.md"></textarea>
-          <button class="primary" @click="workspaceKind = 'heartbeat'; saveWorkspaceFile()">Save HEARTBEAT.md</button>
+          <textarea v-model="workspaceContent" placeholder="Heartbeat projection or draft"></textarea>
+          <button class="primary" @click="workspaceKind = 'heartbeat'; importWorkspaceDraft()">Import Heartbeat Draft</button>
         </section>
         <pre>{{ fmt({ status: heartbeatStatus, files: workspaceFiles, job: jobResult }) }}</pre>
       </section>
@@ -947,6 +1188,112 @@ onMounted(refreshAll);
           <span>{{ item.status }} · {{ item.turn_id }}</span>
           <pre>{{ fmt(item.result) }}</pre>
         </article>
+      </section>
+
+      <section v-if="active === 'runGraph'" class="stack">
+        <div class="actions">
+          <select v-model="selectedRunId" @change="loadRunGraph(selectedRunId)">
+            <option v-for="item in agentRuns" :key="String(item.run_id)" :value="String(item.run_id)">
+              {{ item.status }} · {{ item.turn_id }} · {{ item.started_at }}
+            </option>
+          </select>
+          <button class="secondary" @click="loadRunGraph(selectedRunId)" :disabled="!selectedRunId">Load Graph</button>
+        </div>
+        <section v-if="runGraph && isRecord(runGraph.run)" class="settings-grid">
+          <article>
+            <span>Run</span>
+            <strong>{{ runGraph.run.run_id }}</strong>
+          </article>
+          <article>
+            <span>Status</span>
+            <strong>{{ runGraph.run.status }}</strong>
+          </article>
+          <article>
+            <span>Engine</span>
+            <strong>{{ runGraph.run.engine }}</strong>
+          </article>
+          <article>
+            <span>Thread</span>
+            <strong>{{ runGraph.run.thread_id }}</strong>
+          </article>
+        </section>
+        <section v-if="runGraph && Array.isArray(runGraph.nodes)" class="graph-list">
+          <article v-for="node in runGraph.nodes" :key="String(node.sequence) + String(node.id)" :class="String(node.status)">
+            <strong>{{ node.id }}</strong>
+            <span>{{ node.status }} · {{ node.finished_at || node.started_at }}</span>
+            <pre>{{ fmt({ input: node.input, output: node.output, error: node.error }) }}</pre>
+          </article>
+        </section>
+      </section>
+
+      <section v-if="active === 'vector'" class="stack">
+        <div class="actions">
+          <button class="primary" @click="rebuildVectors('')">
+            <RefreshCw :size="18" />
+            <span>Rebuild All</span>
+          </button>
+          <button class="secondary" @click="rebuildVectors('wiki')">Wiki</button>
+          <button class="secondary" @click="rebuildVectors('memory')">Memory</button>
+          <button class="secondary" @click="rebuildVectors('skill')">Skills</button>
+        </div>
+        <section class="settings-grid">
+          <article>
+            <span>Mode</span>
+            <strong>{{ vectorStatus.mode }}</strong>
+          </article>
+          <article>
+            <span>Backend</span>
+            <strong>{{ vectorStatus.backend }}</strong>
+          </article>
+          <article>
+            <span>Model</span>
+            <strong>{{ vectorStatus.embedding_model }}</strong>
+          </article>
+          <article>
+            <span>Dimensions</span>
+            <strong>{{ vectorStatus.embedding_dimensions }}</strong>
+          </article>
+        </section>
+        <pre>{{ fmt({ status: vectorStatus, rebuild: vectorRebuildResult }) }}</pre>
+      </section>
+
+      <section v-if="active === 'policy'" class="stack">
+        <section class="settings-grid">
+          <article>
+            <span>Rules</span>
+            <strong>{{ policyStatus.rules }}</strong>
+          </article>
+          <article>
+            <span>Approval</span>
+            <strong>{{ policyStatus.approval_required }}</strong>
+          </article>
+          <article>
+            <span>Denied</span>
+            <strong>{{ policyStatus.denied }}</strong>
+          </article>
+          <article>
+            <span>Engine</span>
+            <strong>{{ policyStatus.enabled ? "Enabled" : "Off" }}</strong>
+          </article>
+        </section>
+        <section class="list">
+          <article v-for="rule in policyRules" :key="String(rule.rule_id)">
+            <strong>{{ rule.subject }}</strong>
+            <span>{{ rule.scope }} · {{ rule.risk_level }} · {{ rule.action }} · {{ rule.requires_approval ? "approval" : "direct" }}</span>
+            <div class="actions">
+              <button class="secondary" @click="updatePolicyRule(rule, { enabled: !rule.enabled })">
+                {{ rule.enabled ? "Disable" : "Enable" }}
+              </button>
+              <button class="secondary" @click="updatePolicyRule(rule, { requires_approval: !rule.requires_approval })">
+                {{ rule.requires_approval ? "Direct" : "Approval" }}
+              </button>
+              <button class="secondary" @click="updatePolicyRule(rule, { action: rule.action === 'deny' ? 'allow' : 'deny' })">
+                {{ rule.action === "deny" ? "Allow" : "Deny" }}
+              </button>
+            </div>
+            <pre>{{ fmt(rule.config) }}</pre>
+          </article>
+        </section>
       </section>
 
       <section v-if="active === 'audit'" class="stack">

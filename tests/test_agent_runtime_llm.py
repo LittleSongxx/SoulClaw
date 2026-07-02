@@ -65,6 +65,18 @@ class DummyToolExecutor:
         return {"tool_name": tool_name, "status": "succeeded", "result": {"items": [{"title": "Tool Hit"}]}}
 
 
+@dataclass
+class DummyA2AToolExecutor:
+    a2a: "DummyA2A"
+    calls: list[dict[str, Any]]
+
+    def execute(self, db, *, tool_name: str, arguments: dict[str, Any] | None = None, turn_id: str = "", approved: bool = False):
+        arguments = arguments or {}
+        self.calls.append({"tool_name": tool_name, "arguments": arguments, "turn_id": turn_id, "approved": approved})
+        request = type("Req", (), arguments)()
+        return {"tool_name": tool_name, "status": "succeeded", "result": self.a2a.delegate(db, request)}
+
+
 class DummyRegistry:
     def openai_tools(self):
         return [{"type": "function", "function": {"name": "wiki_search", "parameters": {"type": "object"}}}]
@@ -124,6 +136,32 @@ class RateLimitedLLM:
     def complete(self, *, messages, tools=None, temperature=0.2):
         del messages, tools, temperature
         raise RateLimitExceeded(key="llm", policy="llm", limit=1, retry_after=30)
+
+
+class DummyA2A:
+    def __init__(self, *, should_fail: bool = False, failed_result: bool = False) -> None:
+        self.should_fail = should_fail
+        self.failed_result = failed_result
+        self.requests = []
+
+    def delegate(self, db, request):
+        del db
+        self.requests.append(request)
+        if self.should_fail:
+            raise RuntimeError("SoulSearcher unavailable")
+        if self.failed_result:
+            return {
+                "task_id": "a2a_task_1",
+                "status": "failed",
+                "answer": "delegated research failed",
+                "artifacts": [],
+            }
+        return {
+            "task_id": "a2a_task_1",
+            "status": "completed",
+            "answer": "delegated research answer",
+            "artifacts": [{"artifact_id": "report"}],
+        }
 
 
 class ApprovalToolExecutor:
@@ -275,6 +313,80 @@ def test_agent_runtime_reports_llm_rate_limit_as_degraded_state() -> None:
     assert "rate limited" in result.answer
 
 
+def test_agent_runtime_plans_and_delegates_explicit_deep_research() -> None:
+    a2a = DummyA2A()
+    runtime = AgentRuntime(
+        wiki=DummyWiki(),
+        memory=DummyMemory(),
+        events=DummyEvents(),
+        tools=DummyA2AToolExecutor(a2a=a2a, calls=[]),
+        registry=DummyRegistry(),
+        a2a=a2a,
+    )
+
+    result = runtime.run_turn(None, "请深入调研这个主题并输出研究报告")
+
+    assert result.context["task_plan"]["route"] == "deep_research"
+    assert result.context["llm"]["status"] == "delegated_a2a"
+    assert "delegated research answer" in result.answer
+    assert a2a.requests[0].capability == "deep-research"
+    assert a2a.requests[0].context["task_plan"]["route"] == "deep_research"
+    assert a2a.requests[0].options["retrieval_policy"]["preserve_evidence"] is True
+
+
+def test_agent_runtime_falls_back_to_local_llm_when_delegation_fails() -> None:
+    llm = TwoStepLLM()
+    runtime = AgentRuntime(
+        wiki=DummyWiki(),
+        memory=DummyMemory(),
+        events=DummyEvents(),
+        tools=DummyA2AToolExecutor(a2a=DummyA2A(should_fail=True), calls=[]),
+        registry=DummyRegistry(),
+        llm=llm,
+    )
+
+    result = runtime.run_turn(None, "请全面调研这个主题")
+
+    assert result.context["task_plan"]["route"] == "deep_research"
+    assert result.context["a2a"]["status"] == "failed"
+    assert result.context["llm"]["status"] == "completed_with_tools"
+    assert result.answer == "final answer from tool result"
+
+
+def test_agent_runtime_falls_back_when_delegation_returns_failed_status() -> None:
+    llm = TwoStepLLM()
+    runtime = AgentRuntime(
+        wiki=DummyWiki(),
+        memory=DummyMemory(),
+        events=DummyEvents(),
+        tools=DummyA2AToolExecutor(a2a=DummyA2A(failed_result=True), calls=[]),
+        registry=DummyRegistry(),
+        llm=llm,
+    )
+
+    result = runtime.run_turn(None, "请输出调研报告")
+
+    assert result.context["task_plan"]["route"] == "deep_research"
+    assert result.context["a2a"]["status"] == "failed"
+    assert result.context["llm"]["status"] == "completed_with_tools"
+    assert result.answer == "final answer from tool result"
+
+
+def test_agent_runtime_respects_local_only_deep_research_suppressor() -> None:
+    a2a = DummyA2A()
+    runtime = AgentRuntime(
+        wiki=DummyWiki(),
+        memory=DummyMemory(),
+        events=DummyEvents(),
+        a2a=a2a,
+    )
+
+    result = runtime.run_turn(None, "不要联网，本地回答：请深入调研这个主题")
+
+    assert result.context["task_plan"]["route"] == "local_answer"
+    assert a2a.requests == []
+
+
 def test_agent_runtime_interrupts_and_resumes_approval_checkpoint() -> None:
     approval_id = uuid.uuid4()
     approval = Approval(
@@ -306,7 +418,7 @@ def test_agent_runtime_interrupts_and_resumes_approval_checkpoint() -> None:
     assert interrupted.status == "approval_required"
     assert interrupted.approval_id == str(approval_id)
     assert interrupted.resume_available is True
-    assert approval.turn_checkpoint["mode"] == "agent_tool_loop"
+    assert approval.turn_checkpoint["mode"] == "agent_turn"
     assert approval.resume_state["mode"] == "resume_turn"
 
     resumed = runtime.resume_turn(db, approval_id, decision="approve")

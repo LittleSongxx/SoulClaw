@@ -56,7 +56,7 @@ class Settings(BaseSettings):
     packages_dir: Path = Path(".packages")
 
     database_url: str = Field(
-        default="sqlite:///data/soulclaw.sqlite3",
+        default="postgresql+psycopg://soulclaw:soulclaw@localhost:5432/soulclaw",
         validation_alias=AliasChoices("SOULCLAW_DATABASE_URL", "DATABASE_URL"),
     )
     redis_url: str = "redis://localhost:6379/0"
@@ -83,6 +83,12 @@ class Settings(BaseSettings):
     openai_model: str | None = Field(default=None, validation_alias="OPENAI_MODEL")
     llm_provider: str = "openai-compatible"
     llm_context_window_tokens: int = 128000
+    agent_engine: str = "langgraph"
+    vector_mode: str = "required"
+    embedding_model: str = "text-embedding-3-small"
+    embedding_dimensions: int = 1536
+    embedding_batch_size: int = 32
+    embedding_pass_dimensions: bool = True
 
     mcp_refresh_on_startup: bool = True
     mcp_seed_on_startup: bool = True
@@ -111,6 +117,11 @@ class Settings(BaseSettings):
     a2a_soulsearcher_user_id: str = "soulclaw"
     a2a_public_api_key: str = ""
     a2a_require_public_auth: bool = True
+    a2a_poll_interval_seconds: float = 5.0
+    a2a_stalled_timeout_seconds: int = 900
+    a2a_callback_public_url: str = ""
+    a2a_callback_secret: str = ""
+    a2a_live_event_idle_seconds: int = 30
 
     @property
     def resolved_celery_broker_url(self) -> str:
@@ -172,7 +183,7 @@ class Settings(BaseSettings):
         if self.environment.lower() not in {"production", "prod"} or not self.require_production_secrets:
             return
         if self.database_url.startswith("sqlite"):
-            raise RuntimeError("SQLite is only allowed for development/local; set SOULCLAW_DATABASE_URL to Postgres in production")
+            raise RuntimeError("SQLite is only allowed for tests or explicit lightweight fallback; set SOULCLAW_DATABASE_URL to Postgres in production")
         if self.jwt_secret == "change-me-for-production":
             raise RuntimeError("SOULCLAW_JWT_SECRET must be changed in production")
         if self.admin_password == "soulclaw-admin":
@@ -181,6 +192,10 @@ class Settings(BaseSettings):
             raise RuntimeError("SOULCLAW_CORS_ORIGINS must be explicit in production")
         if not self.public_base_url:
             raise RuntimeError("SOULCLAW_PUBLIC_BASE_URL must be set in production")
+
+    @property
+    def vector_required(self) -> bool:
+        return self.vector_mode.lower() == "required"
 
 
 @lru_cache(maxsize=1)

@@ -1,3 +1,5 @@
 # USER
 
-This file stores durable user preferences, profile facts, and relationship context. Only write stable information here after review.
+> Generated projection template. Postgres core context is authoritative; propose edits through the console/API.
+
+No approved USER core context has been projected yet.

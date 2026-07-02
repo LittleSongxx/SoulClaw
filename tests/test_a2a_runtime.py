@@ -7,9 +7,11 @@ import pytest
 
 from backend.api.admin.a2a import _a2a_public_authorized, a2a_jsonrpc, get_a2a_task
 from backend.domain.a2a import A2AService
-from backend.domain.tools import ToolExecutor, ToolRegistry
+from backend.domain.policy import ToolPolicyEngine
+from backend.domain.platform import PlatformService
+from backend.domain.tools import ToolExecutor, ToolRegistry, ToolApprovalRequired
 from backend.infra.config import Settings
-from backend.infra.models import A2AAgentConnection, A2AArtifact, A2AEvent, A2ATask, ToolRun
+from backend.infra.models import A2AAgentConnection, A2AArtifact, A2AEvent, A2ATask, Approval, ToolRun
 from backend.runtime.a2a import A2ADelegateRequest, A2ARuntimeManager
 
 
@@ -457,6 +459,212 @@ def test_a2a_streaming_delegation_sends_current_method_and_persists_artifacts(mo
     assert any(item.event_type == "a2a.artifact_update" for item in events)
 
 
+def test_a2a_input_required_creates_remote_hitl_approval(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = FakeDB()
+    runtime = _runtime(db)
+    runtime.platform = PlatformService(events=DummyEvents())
+    frames = [
+        {
+            "jsonrpc": "2.0",
+            "id": "rpc-1",
+            "result": {
+                "task": {
+                    "id": "remote-task-hitl",
+                    "contextId": "remote-ctx-hitl",
+                    "status": {"state": "TASK_STATE_SUBMITTED"},
+                }
+            },
+        },
+        {
+            "jsonrpc": "2.0",
+            "id": "rpc-1",
+            "result": {
+                "statusUpdate": {
+                    "taskId": "remote-task-hitl",
+                    "contextId": "remote-ctx-hitl",
+                    "status": {
+                        "state": "TASK_STATE_INPUT_REQUIRED",
+                        "message": {"role": "ROLE_AGENT", "parts": [{"text": "approve plan"}]},
+                    },
+                    "metadata": {
+                        "hitl": {
+                            "kind": "a2a_remote_hitl",
+                            "message": "approve plan",
+                            "allowed_decisions": ["approve", "reject"],
+                            "action_requests": [{"name": "search", "args": {"q": "x"}}],
+                        }
+                    },
+                }
+            },
+        },
+    ]
+
+    class FakeStreamResponse:
+        def raise_for_status(self):
+            return None
+        def iter_lines(self):
+            for frame in frames:
+                yield "data: " + json.dumps(frame)
+                yield ""
+        def __enter__(self):
+            return self
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+        def __enter__(self):
+            return self
+        def __exit__(self, exc_type, exc, tb):
+            return False
+        def stream(self, *args, **kwargs):
+            return FakeStreamResponse()
+
+    monkeypatch.setattr("backend.runtime.a2a.httpx.Client", FakeClient)
+
+    result = runtime.delegate(db, A2ADelegateRequest(capability="deep-research", query="research"))
+
+    assert result["status"] == "input-required"
+    approvals = [item for item in db.objects if isinstance(item, Approval)]
+    assert approvals
+    assert approvals[0].subject_type == "a2a_remote_hitl"
+    assert approvals[0].payload["hitl"]["message"] == "approve plan"
+
+
+def test_a2a_remote_approval_resume_sends_followup_task_message(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = FakeDB()
+    runtime = _runtime(db)
+    runtime.platform = PlatformService(events=DummyEvents())
+    task = runtime.service.create_task(
+        db,
+        connection_name="soulsearcher-deep-research",
+        capability="deep-research",
+        input_text="research",
+    )
+    runtime.service.mark_task(db, task, status="input-required", remote_task_id="remote-task-1", remote_context_id="remote-ctx-1")
+    approval = runtime.platform.create_approval(
+        db,
+        subject_type="a2a_remote_hitl",
+        subject_id=task.task_id,
+        payload={"hitl": {"action_requests": [{"name": "search", "args": {"q": "x"}}]}},
+        resume_state={"hitl": {"action_requests": [{"name": "search", "args": {"q": "x"}}]}},
+    )
+    calls: list[dict] = []
+    frames = [
+        {
+            "jsonrpc": "2.0",
+            "id": "rpc-1",
+            "result": {
+                "statusUpdate": {
+                    "taskId": "remote-task-1",
+                    "contextId": "remote-ctx-1",
+                    "status": {"state": "TASK_STATE_COMPLETED", "message": {"role": "ROLE_AGENT", "parts": [{"text": "done"}]}},
+                }
+            },
+        }
+    ]
+
+    class FakeStreamResponse:
+        def raise_for_status(self):
+            return None
+        def iter_lines(self):
+            for frame in frames:
+                yield "data: " + json.dumps(frame)
+                yield ""
+        def __enter__(self):
+            return self
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+        def __enter__(self):
+            return self
+        def __exit__(self, exc_type, exc, tb):
+            return False
+        def stream(self, method, url, *, json=None, headers=None):
+            calls.append({"method": method, "url": url, "json": json, "headers": headers})
+            return FakeStreamResponse()
+
+    monkeypatch.setattr("backend.runtime.a2a.httpx.Client", FakeClient)
+
+    result = runtime.resume_remote_approval(db, approval.id, decision="approve")
+
+    message = calls[0]["json"]["params"]["message"]
+    assert message["taskId"] == "remote-task-1"
+    assert message["contextId"] == "remote-ctx-1"
+    assert json.loads(message["parts"][0]["text"])["tool_approved"] is True
+    assert result["result"]["status"] == "completed"
+    assert approval.status == "approved"
+
+
+def test_a2a_callback_updates_task_and_creates_hitl_approval() -> None:
+    db = FakeDB()
+    runtime = _runtime(db)
+    runtime.platform = PlatformService(events=DummyEvents())
+    task = runtime.service.create_task(
+        db,
+        connection_name="soulsearcher-deep-research",
+        capability="deep-research",
+        input_text="research",
+    )
+    runtime.service.mark_task(db, task, status="working", remote_task_id="remote-task-1", remote_context_id="remote-ctx-1")
+
+    result = runtime.handle_callback(
+        db,
+        {
+            "event": "task.input_required",
+            "task_id": "remote-task-1",
+            "context_id": "remote-ctx-1",
+            "metadata": {"soulclaw_task_id": task.task_id},
+            "hitl": {"kind": "a2a_remote_hitl", "message": "approve plan", "allowed_decisions": ["approve"]},
+        },
+    )
+
+    assert result["status"] == "input-required"
+    approvals = [item for item in db.objects if isinstance(item, Approval)]
+    assert approvals
+    assert approvals[0].subject_type == "a2a_remote_hitl"
+
+
+def test_a2a_sync_active_remote_tasks_polls_working_tasks(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = FakeDB()
+    runtime = _runtime(db)
+    task = runtime.service.create_task(
+        db,
+        connection_name="soulsearcher-deep-research",
+        capability="deep-research",
+        input_text="research",
+    )
+    runtime.service.mark_task(db, task, status="working", remote_task_id="remote-task-1", remote_context_id="remote-ctx-1")
+
+    def fake_call_jsonrpc(connection, method, params):
+        assert method == "GetTask"
+        assert params == {"id": "remote-task-1"}
+        return {
+            "jsonrpc": "2.0",
+            "result": {
+                "id": "remote-task-1",
+                "contextId": "remote-ctx-1",
+                "status": {
+                    "state": "TASK_STATE_COMPLETED",
+                    "message": {"role": "ROLE_AGENT", "parts": [{"text": "final report"}]},
+                },
+            },
+        }
+
+    monkeypatch.setattr(runtime, "_call_jsonrpc", fake_call_jsonrpc)
+
+    result = runtime.sync_active_remote_tasks(db)
+
+    assert result["synced"] == 1
+    assert result["errors"] == []
+    assert task.status == "completed"
+    assert task.result["answer"] == "final report"
+
+
 def test_a2a_delegation_falls_back_to_send_message_when_streaming_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
     db = FakeDB()
     service = A2AService(events=DummyEvents())
@@ -556,15 +764,14 @@ def test_a2a_delegate_tool_dynamic_approval(monkeypatch: pytest.MonkeyPatch) -> 
 
     executor = ToolExecutor(registry, events=DummyEvents(), platform=DummyPlatform())
 
-    with pytest.raises(PermissionError):
+    with pytest.raises(ToolApprovalRequired):
         executor.execute(
             db,
             tool_name="a2a_delegate",
             arguments={"capability": "code-writing", "query": "change repo"},
         )
 
-    run = next(item for item in db.objects if isinstance(item, ToolRun))
-    assert run.status == "approval_required"
+    assert not any(isinstance(item, ToolRun) for item in db.objects)
 
 
 def test_a2a_delegate_tool_runs_after_approval(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -598,6 +805,49 @@ def test_a2a_delegate_tool_runs_after_approval(monkeypatch: pytest.MonkeyPatch) 
 
     assert result["status"] == "succeeded"
     assert result["result"]["task_id"] == "approved-task"
+
+
+def test_a2a_delegate_tool_policy_can_allow_direct_execution(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = FakeDB()
+    runtime = _runtime(db)
+    monkeypatch.setattr(
+        runtime,
+        "delegate",
+        lambda db, request: {"task_id": "direct-task", "status": "completed", "capability": request.capability},
+    )
+
+    class DummyWiki:
+        pass
+
+    class DummyMemory:
+        pass
+
+    class DummySkills:
+        pass
+
+    class DirectPolicy(ToolPolicyEngine):
+        def decide(self, db, *, tool_name, scope, arguments=None, declared_requires_approval=False):
+            decision = super().decide(
+                db,
+                tool_name=tool_name,
+                scope=scope,
+                arguments=arguments,
+                declared_requires_approval=declared_requires_approval,
+            )
+            return type(decision)(True, False, decision.risk_level, "test direct allow", scope=scope)
+
+    registry = ToolRegistry(wiki=DummyWiki(), memory=DummyMemory(), skills=DummySkills(), events=DummyEvents())
+    registry.install_a2a(runtime)
+    executor = ToolExecutor(registry, events=DummyEvents(), policy=DirectPolicy(events=DummyEvents()))
+
+    result = executor.execute(
+        db,
+        tool_name="a2a_delegate",
+        arguments={"capability": "deep-research", "query": "research"},
+    )
+
+    assert result["status"] == "succeeded"
+    assert result["result"]["task_id"] == "direct-task"
 
 
 def test_a2a_public_auth_requires_key_when_required_without_public_base_url() -> None:

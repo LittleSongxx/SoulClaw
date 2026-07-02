@@ -82,6 +82,11 @@ class HostTaskRuntime(TaskRuntime):
                             f"{_ALLOWED_SCRIPT_SUFFIXES}"
                         ),
                     )
+                if target.suffix.lower() == ".sh" and not pol.allow_shell_scripts:
+                    return RuntimeResult(
+                        ok=False,
+                        error="policy: shell scripts require allow_shell_scripts=True",
+                    )
             elif kind == "snippet":
                 # Materialise to a tempfile inside the workspace so the
                 # policy ceiling on writable paths still applies.
@@ -107,8 +112,11 @@ class HostTaskRuntime(TaskRuntime):
         argv = self._argv_for(target)
         timeout = pol.effective_timeout_seconds
         max_bytes = pol.effective_max_output_bytes
-        run_env = self._merged_env(env)
-        run_cwd = str(self._resolve_cwd(cwd))
+        try:
+            run_env = self._merged_env(env, pol)
+            run_cwd = str(self._resolve_cwd(cwd))
+        except PolicyViolation as exc:
+            return RuntimeResult(ok=False, error=f"policy: {exc}")
 
         started = time.monotonic()
         proc: asyncio.subprocess.Process | None = None
@@ -185,8 +193,8 @@ class HostTaskRuntime(TaskRuntime):
         # Should be unreachable thanks to the suffix check above.
         raise ValueError(f"unsupported extension {suffix!r}")
 
-    def _merged_env(self, env: dict[str, str] | None) -> dict[str, str]:
-        merged = dict(os.environ)
+    def _merged_env(self, env: dict[str, str] | None, policy: SandboxPolicy) -> dict[str, str]:
+        merged = dict(os.environ) if policy.inherit_env else {"PATH": os.environ.get("PATH", ""), "PYTHONUNBUFFERED": "1"}
         for key, val in (env or {}).items():
             merged[str(key)] = str(val)
         return merged

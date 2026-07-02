@@ -17,6 +17,7 @@ def readiness_summary(settings: Settings, redis_client: Redis | None = None) -> 
         "database": _database_check(settings),
         "redis": _redis_check(redis_client, required=settings.redis_required),
         "migrations": _migration_check(settings),
+        "vector": _vector_check(settings),
         "directories": _directory_check(settings),
     }
     return {
@@ -71,6 +72,37 @@ def _migration_check(settings: Settings) -> dict[str, Any]:
         }
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc)}
+
+
+def _vector_check(settings: Settings) -> dict[str, Any]:
+    if settings.vector_mode.lower() == "disabled":
+        return {"ok": True, "enabled": False, "required": False, "status": "disabled"}
+    backend = database_backend(settings.database_url)
+    base = {
+        "enabled": True,
+        "required": settings.vector_required,
+        "backend": backend,
+        "embedding_model": settings.embedding_model,
+        "embedding_dimensions": settings.embedding_dimensions,
+        "embedding_configured": bool(settings.openai_api_key),
+    }
+    if backend == "sqlite":
+        return {**base, "ok": not settings.vector_required, "status": "test_fallback"}
+    if backend != "postgresql":
+        return {**base, "ok": not settings.vector_required, "status": "unsupported_backend"}
+    try:
+        engine = get_engine() if settings.database_url == get_settings().database_url else create_engine(
+            settings.database_url,
+            pool_pre_ping=True,
+            future=True,
+        )
+        with engine.connect() as connection:
+            has_vector = bool(
+                connection.exec_driver_sql("SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'vector')").scalar()
+            )
+        return {**base, "ok": has_vector, "pgvector": has_vector}
+    except Exception as exc:  # noqa: BLE001
+        return {**base, "ok": False, "error": str(exc)}
 
 
 def _directory_check(settings: Settings) -> dict[str, Any]:

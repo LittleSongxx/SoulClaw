@@ -196,8 +196,12 @@ def test_sqlite_reconciles_mixed_0011_schema_without_replaying_migrations(tmp_pa
 
     status = migration_status(settings)
     inspector = inspect(create_engine(settings.database_url))
-    assert status["current_revision"] == "0014_observability_trace_governance"
+    assert status["current_revision"] == "0016_core_context_blocks"
     assert status["is_current"] is True
+    assert {"agent_runs", "agent_run_steps", "knowledge_embeddings", "policy_rules", "core_context_blocks"} <= set(inspector.get_table_names())
+    assert {"block_key", "title", "content", "status", "version", "confidence", "source", "metadata"} <= _columns(
+        inspector, "core_context_blocks"
+    )
     assert {"claims", "source_refs", "stale_after"} <= _columns(inspector, "wiki_pages")
     assert {"target_checksum", "stale_reason"} <= _columns(inspector, "evolution_proposals")
     assert {"trace_id", "request_id", "idempotency_key", "dead_letter_reason"} <= _columns(inspector, "background_jobs")
@@ -230,7 +234,8 @@ def test_sqlite_alembic_upgrade_head_reconciles_and_stamps(tmp_path) -> None:
     status = migration_status(Settings(database_url=f"sqlite:///{db_path}"))
     inspector = inspect(create_engine(f"sqlite:///{db_path}"))
     assert "memory_history" in inspector.get_table_names()
-    assert status["current_revision"] == "0014_observability_trace_governance"
+    assert {"agent_runs", "agent_run_steps", "knowledge_embeddings", "policy_rules", "core_context_blocks"} <= set(inspector.get_table_names())
+    assert status["current_revision"] == "0016_core_context_blocks"
     assert status["is_current"] is True
 
 
@@ -242,6 +247,7 @@ def test_readiness_reports_component_failures(tmp_path) -> None:
         workspace_dir=tmp_path / "workspace",
         workspace_seed_dir=tmp_path / "workspace_seed",
         packages_dir=tmp_path / "packages",
+        vector_mode="disabled",
     )
     run_alembic_upgrade(settings)
 

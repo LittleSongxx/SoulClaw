@@ -25,6 +25,7 @@ from backend.infra.models import (
     WikiPage,
     WikiSource,
 )
+from backend.domain.vector import KnowledgeVectorService
 
 FRONTMATTER_RE = re.compile(r"\A---\s*\n(?P<yaml>.*?)\n---\s*\n(?P<body>.*)\Z", re.DOTALL)
 WIKILINK_RE = re.compile(r"\[\[([^\]|#]+)(?:#[^\]|]+)?(?:\|([^\]]+))?\]\]")
@@ -335,9 +336,11 @@ class WikiService:
         self,
         settings: Settings | None = None,
         events: RuntimeEventBus | None = None,
+        vector: KnowledgeVectorService | None = None,
     ) -> None:
         self.settings = settings or get_settings()
         self.events = events
+        self.vector = vector
 
     @property
     def root(self) -> Path:
@@ -530,6 +533,16 @@ class WikiService:
             if not errors
             else {"backend": self._db_backend(db), "available": False, "indexed_pages": 0, "fallback": True, "skipped": "compile_error"}
         )
+        vector_result = {"enabled": self.vector is not None, "embedded": 0, "failed": 0, "skipped": 0}
+        if self.vector is not None and not errors:
+            indexed_records = list(db.scalars(select(WikiPage).where(WikiPage.page_key.in_(current_page_keys))).all())
+            try:
+                vector_result = self.vector.upsert_wiki_pages(db, indexed_records, strict=False)
+                self.vector.purge_source(db, source_type="wiki", source_ids=current_page_keys)
+            except Exception as exc:  # noqa: BLE001
+                vector_result = {"enabled": True, "embedded": 0, "failed": len(indexed_records), "skipped": 0, "error": str(exc)}
+                if self.events:
+                    self.events.emit("wiki.vector.refresh_failed", vector_result, severity="warning")
         run.status = "ok" if not errors else "error"
         run.pages_seen = len(source_keys)
         run.pages_indexed = len(parsed_pages)
@@ -540,6 +553,7 @@ class WikiService:
             "errors": errors,
             "index": "page_mirror",
             "fts": fts_result,
+            "vector": vector_result,
         }
         if self.events:
             self.events.emit("wiki.compile", run.payload, severity="info" if not errors else "warning")
@@ -549,6 +563,7 @@ class WikiService:
             "pages_indexed": run.pages_indexed,
             "errors": run.errors,
             "fts": fts_result,
+            "vector": vector_result,
             "llm_wiki": self._wiki_shape(),
         }
 
@@ -628,7 +643,59 @@ class WikiService:
                 }
             )
 
-        records.sort(key=lambda item: (item["score"], _confidence(item.get("confidence")), item["page_key"]), reverse=True)
+        if self.vector is not None and query:
+            try:
+                vector_hits = self.vector.search(db, query=query, source_type="wiki", limit=max(limit * 3, 10))
+                by_key = {item["page_key"]: item for item in records}
+                for hit in vector_hits:
+                    page = self.read(db, str(hit.get("source_id") or ""))
+                    if page is None:
+                        continue
+                    vector_score = float(hit.get("vector_score") or 0.0)
+                    existing = by_key.get(page.page_key)
+                    if existing is not None:
+                        fts_score = float(existing.get("score") or 0.0)
+                        existing["vector_score"] = round(vector_score, 4)
+                        existing["fts_score"] = round(fts_score, 4)
+                        existing["hybrid_score"] = round(vector_score * 0.7 + fts_score * 0.3, 4)
+                        existing["chunk_key"] = hit.get("chunk_key") or ""
+                        existing["source"] = "wiki_hybrid"
+                        if "vector" not in existing["match_reasons"]:
+                            existing["match_reasons"].append("vector")
+                        continue
+                    constraints = self._constraints_for_pages(db, [page.page_key]) if include_constraints else []
+                    records.append(
+                        {
+                            "score": round(vector_score * 0.7, 4),
+                            "hybrid_score": round(vector_score * 0.7, 4),
+                            "vector_score": round(vector_score, 4),
+                            "fts_score": 0.0,
+                            "chunk_key": hit.get("chunk_key") or "",
+                            "source": "wiki_vector",
+                            "page_key": page.page_key,
+                            "title": page.title,
+                            "path": page.path,
+                            "summary": page.summary,
+                            "tags": page.tags or [],
+                            "page_type": page.page_type,
+                            "confidence": _confidence(page.confidence),
+                            "match_reasons": ["vector"],
+                            "matched_fields": ["embedding"],
+                            "snippet": self._page_snippet(page, query),
+                            "next_actions": self._next_actions_for_search_hit(page, strategy=strategy, constraints=constraints),
+                            "constraints": constraints,
+                            "page": page,
+                        }
+                    )
+            except Exception as exc:  # noqa: BLE001
+                if self.events:
+                    self.events.emit("wiki.vector.search_failed", {"query": query, "error": str(exc)}, severity="warning")
+        for record in records:
+            record.setdefault("fts_score", round(float(record.get("score") or 0.0), 4))
+            record.setdefault("vector_score", 0.0)
+            record.setdefault("hybrid_score", round(float(record.get("score") or 0.0), 4))
+            record.setdefault("chunk_key", "")
+        records.sort(key=lambda item: (item["hybrid_score"], _confidence(item.get("confidence")), item["page_key"]), reverse=True)
         return records[:limit]
 
     def route(self, db: Session, query: str, *, limit: int = 10) -> dict[str, Any]:

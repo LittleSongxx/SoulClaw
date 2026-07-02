@@ -22,3 +22,7 @@ opentelemetry-instrumentation-sqlalchemy>=0.50b0
 opentelemetry-exporter-otlp>=1.29.0
 mcp>=1.0.0
 a2a-sdk[fastapi]>=1.1.0,<2.0.0
+langgraph>=0.2.70
+langgraph-checkpoint-postgres>=2.0.0
+pgvector>=0.3.6
+psycopg-pool>=3.2.3

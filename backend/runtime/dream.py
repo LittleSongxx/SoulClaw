@@ -10,7 +10,7 @@ from typing import Any
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
-from backend.domain.skills import SkillService
+from backend.domain.evolution_proposals import EvolutionProposalService
 from backend.infra.events import RuntimeEventBus
 from backend.infra.models import EvolutionProposal, Memory, ToolRun
 
@@ -21,6 +21,9 @@ class DreamReviewResult:
     failed_tool_runs: int
     proposals_created: int
     proposal_ids: list[str]
+    learning_candidates: int = 0
+    skill_candidates: int = 0
+    skipped_skill_candidates: int = 0
 
 
 class DreamRuntime:
@@ -31,8 +34,8 @@ class DreamRuntime:
     lint/test before apply.
     """
 
-    def __init__(self, *, skills: SkillService, events: RuntimeEventBus) -> None:
-        self.skills = skills
+    def __init__(self, *, proposals: EvolutionProposalService, events: RuntimeEventBus) -> None:
+        self.proposals = proposals
         self.events = events
 
     def run_review(self, db: Session, *, window_hours: int = 24, limit: int = 50) -> DreamReviewResult:
@@ -43,45 +46,51 @@ class DreamRuntime:
 
         groups = self._group_evidence(memories, failed_runs)
         for group_key, evidence in groups.items():
-            if self._proposal_exists(db, group_key):
-                continue
-            proposal = self.skills.create_proposal(
-                db,
-                target_type="skill",
-                action="upsert",
-                risk_level="medium",
-                payload=self._proposal_payload(group_key, evidence),
-                evidence=evidence,
-            )
-            proposals.append(proposal)
-            memory_proposal = self.skills.create_proposal(
-                db,
-                target_type="memory",
-                action="create",
-                risk_level="low",
-                payload=self._memory_proposal_payload(group_key, evidence),
-                evidence=evidence,
-            )
-            proposals.append(memory_proposal)
-            wiki_proposal = self.skills.create_proposal(
-                db,
-                target_type="wiki",
-                action="append_log",
-                risk_level="low",
-                payload={
-                    "entry": f"Dream review found improvement opportunity `{group_key}`. Review proposal evidence before updating Wiki pages.",
-                    "dream_group_key": group_key,
-                },
-                evidence=evidence,
-            )
-            proposals.append(wiki_proposal)
+            evidence["learning_candidate"] = self._learning_candidate(group_key, evidence)
+            if self._should_propose_skill(evidence):
+                if not self._proposal_exists(db, group_key):
+                    proposal = self.proposals.create(
+                        db,
+                        target_type="skill",
+                        action="upsert",
+                        risk_level="medium",
+                        payload=self._proposal_payload(group_key, evidence),
+                        evidence=evidence,
+                    )
+                    proposals.append(proposal)
+            if not self._proposal_exists(db, group_key, target_type="memory"):
+                memory_proposal = self.proposals.create(
+                    db,
+                    target_type="memory",
+                    action="create",
+                    risk_level="low",
+                    payload=self._memory_proposal_payload(group_key, evidence),
+                    evidence=evidence,
+                )
+                proposals.append(memory_proposal)
+            if not self._proposal_exists(db, group_key, target_type="wiki"):
+                wiki_proposal = self.proposals.create(
+                    db,
+                    target_type="wiki",
+                    action="append_log",
+                    risk_level="low",
+                    payload={
+                        "entry": (
+                            f"Dream review recorded learning candidate `{group_key}`. "
+                            "Promote to Skill only after repeated evidence and review."
+                        ),
+                        "dream_group_key": group_key,
+                    },
+                    evidence=evidence,
+                )
+                proposals.append(wiki_proposal)
 
         for memory in self._low_stability_memories(db, since=since, limit=limit):
             group_key = f"verify-memory-{memory.id}"
             if self._proposal_exists(db, group_key, target_type="memory"):
                 continue
             proposals.append(
-                self.skills.create_proposal(
+                self.proposals.create(
                     db,
                     target_type="memory",
                     action="verify",
@@ -112,6 +121,9 @@ class DreamRuntime:
             failed_tool_runs=len(failed_runs),
             proposals_created=len(proposals),
             proposal_ids=[str(item.id) for item in proposals],
+            learning_candidates=len(groups),
+            skill_candidates=sum(1 for evidence in groups.values() if self._should_propose_skill(evidence)),
+            skipped_skill_candidates=sum(1 for evidence in groups.values() if not self._should_propose_skill(evidence)),
         )
         self.events.emit("dream.review.completed", result.__dict__)
         return result
@@ -178,6 +190,47 @@ class DreamRuntime:
             )
         return {key: evidence for key, evidence in groups.items() if evidence["memories"] or evidence["failed_tool_runs"]}
 
+    def _learning_candidate(self, group_key: str, evidence: dict[str, Any]) -> dict[str, Any]:
+        memory_count = len(evidence.get("memories", []) or [])
+        failed_run_count = len(evidence.get("failed_tool_runs", []) or [])
+        support_count = memory_count + failed_run_count
+        distinct_tools = sorted(
+            {
+                str(item.get("tool_name") or "")
+                for item in evidence.get("failed_tool_runs", [])
+                if str(item.get("tool_name") or "").strip()
+            }
+        )
+        has_skill_trace = any(item.get("kind") == "skill_trace" for item in evidence.get("memories", []))
+        should_promote = support_count >= 2 or failed_run_count >= 2 or (has_skill_trace and failed_run_count >= 1)
+        if support_count >= 3:
+            strength = "strong"
+        elif should_promote:
+            strength = "moderate"
+        else:
+            strength = "weak"
+        return {
+            "id": group_key,
+            "support_count": support_count,
+            "memory_count": memory_count,
+            "failed_tool_run_count": failed_run_count,
+            "distinct_tools": distinct_tools,
+            "strength": strength,
+            "promote_to_skill": should_promote,
+            "recommended_target": "skill" if should_promote else "memory",
+            "reason": (
+                "Repeated or mixed evidence supports procedural skill review."
+                if should_promote
+                else "Single weak signal should stay as memory/wiki review before becoming a skill."
+            ),
+        }
+
+    def _should_propose_skill(self, evidence: dict[str, Any]) -> bool:
+        candidate = evidence.get("learning_candidate")
+        if not isinstance(candidate, dict):
+            return False
+        return bool(candidate.get("promote_to_skill"))
+
     def _proposal_payload(self, group_key: str, evidence: dict[str, Any]) -> dict[str, Any]:
         title = group_key.replace("-", " ").title()
         summary = self._summary(evidence)
@@ -216,10 +269,12 @@ class DreamRuntime:
             "- If the issue involves tools, check availability, scope, approval requirements, and recent ToolRun errors.\n"
             "- Record any durable lesson as L2 memory first; promote to stable skill instructions only after repeated success.\n"
         )
+        candidate = evidence.get("learning_candidate") if isinstance(evidence.get("learning_candidate"), dict) else {}
         return {
             "skill_key": skill_key,
             "files": {"SKILL.md": skill_md},
             "dream_group_key": group_key,
+            "learning_candidate": candidate,
             "required_checks": [
                 "frontmatter",
                 "required_tools",
@@ -232,12 +287,15 @@ class DreamRuntime:
     def _memory_proposal_payload(self, group_key: str, evidence: dict[str, Any]) -> dict[str, Any]:
         return {
             "kind": "semantic",
-            "content": "Dream review lesson: " + self._plain_summary(evidence)[:1800],
+            "content": "Dream learning candidate: " + self._plain_summary(evidence)[:1800],
             "source": "dream",
-            "importance": 0.62,
+            "importance": 0.62 if self._should_propose_skill(evidence) else 0.52,
             "confidence": 0.55,
-            "stability": 0.45,
-            "metadata": {"dream_group_key": group_key},
+            "stability": 0.45 if self._should_propose_skill(evidence) else 0.35,
+            "metadata": {
+                "dream_group_key": group_key,
+                "learning_candidate": evidence.get("learning_candidate", {}),
+            },
             "dream_group_key": group_key,
         }
 

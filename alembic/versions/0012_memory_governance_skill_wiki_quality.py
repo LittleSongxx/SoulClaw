@@ -68,11 +68,11 @@ def upgrade() -> None:
             """
             CREATE INDEX IF NOT EXISTS ix_memories_fts
             ON memories
-            USING GIN (
+            USING GIN ((
                 setweight(to_tsvector('simple', coalesce(kind, '')), 'A') ||
                 setweight(to_tsvector('simple', coalesce(content, '')), 'B') ||
                 setweight(to_tsvector('simple', coalesce(source, '')), 'C')
-            )
+            ))
             """
         )
 

@@ -28,8 +28,10 @@ def dispatch_task(
         "wiki_lint": wiki_lint_task,
         "wiki_repair": wiki_repair_task,
         "skill_scan": skill_scan_task,
+        "embedding_rebuild": embedding_rebuild_task,
         "mcp_refresh": mcp_refresh_task,
         "heartbeat_check": heartbeat_check_task,
+        "a2a_sync": a2a_sync_task,
     }
     task = tasks.get(task_name)
     if task is None:
@@ -136,6 +138,13 @@ def skill_scan_task(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     return _run_job(job_id, lambda services, db: services.skills.scan(db))
 
 
+@celery_app.task(name="soulclaw.embedding_rebuild")
+def embedding_rebuild_task(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    source_type = str(payload.get("source_type") or "")
+    strict = bool(payload.get("strict", False))
+    return _run_job(job_id, lambda services, db: services.vector.rebuild_all(db, source_type=source_type, strict=strict))
+
+
 @celery_app.task(name="soulclaw.mcp_refresh")
 def mcp_refresh_task(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     async def refresh(services):
@@ -161,3 +170,18 @@ def heartbeat_check_task(job_id: str, payload: dict[str, Any]) -> dict[str, Any]
         }
 
     return _run_job(job_id, run)
+
+
+@celery_app.task(name="soulclaw.a2a_sync")
+def a2a_sync_task(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    statuses = payload.get("statuses")
+    parsed_statuses = [str(item) for item in statuses] if isinstance(statuses, list) else None
+    limit = int(payload.get("limit") or 50)
+    return _run_job(
+        job_id,
+        lambda services, db: services.a2a.sync_active_remote_tasks(
+            db,
+            statuses=parsed_statuses,
+            limit=limit,
+        ),
+    )

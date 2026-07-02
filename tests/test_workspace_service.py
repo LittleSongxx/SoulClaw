@@ -35,7 +35,7 @@ def test_workspace_seed_merge_copies_missing_files_without_overwrite(tmp_path: P
     assert (workspace / "knowledge" / "wiki" / "index.md").read_text(encoding="utf-8") == "# Seed Index"
 
 
-def test_workspace_ensure_files_uses_seed_and_creates_history(tmp_path: Path) -> None:
+def test_workspace_ensure_files_uses_projection_seed(tmp_path: Path) -> None:
     seed = tmp_path / "workspace_seed"
     (seed / "memory").mkdir(parents=True)
     (seed / "USER.md").write_text("seed user", encoding="utf-8")
@@ -54,4 +54,3 @@ def test_workspace_ensure_files_uses_seed_and_creates_history(tmp_path: Path) ->
 
     assert service.read("user").content == "seed user"
     assert service.read("memory").content == "seed memory"
-    assert service.history_path.exists()

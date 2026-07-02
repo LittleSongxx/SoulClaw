@@ -3,6 +3,7 @@ from __future__ import annotations
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
+from backend.domain.evolution_proposals import EvolutionProposalService
 from backend.domain.skills import SkillService
 from backend.infra.models import Base
 
@@ -90,10 +91,11 @@ def test_skill_proposal_stale_when_target_checksum_changes(tmp_path) -> None:
     engine = create_engine("sqlite:///:memory:", future=True)
     Base.metadata.create_all(engine)
     service = SkillService(settings=FakeSettings(tmp_path))
+    proposals = EvolutionProposalService(skills=service)
 
     with Session(engine) as db:
         service.scan(db)
-        proposal = service.create_proposal(
+        proposal = proposals.create(
             db,
             target_type="skill",
             action="upsert",
