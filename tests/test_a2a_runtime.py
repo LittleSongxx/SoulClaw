@@ -7,11 +7,18 @@ import pytest
 
 from backend.api.admin.a2a import _a2a_public_authorized, a2a_jsonrpc, get_a2a_task
 from backend.domain.a2a import A2AService
-from backend.domain.policy import ToolPolicyEngine
 from backend.domain.platform import PlatformService
-from backend.domain.tools import ToolExecutor, ToolRegistry, ToolApprovalRequired
+from backend.domain.policy import ToolPolicyEngine
+from backend.domain.tools import ToolApprovalRequired, ToolExecutor, ToolRegistry
 from backend.infra.config import Settings
-from backend.infra.models import A2AAgentConnection, A2AArtifact, A2AEvent, A2ATask, Approval, ToolRun
+from backend.infra.models import (
+    A2AAgentConnection,
+    A2AArtifact,
+    A2AEvent,
+    A2ATask,
+    Approval,
+    ToolRun,
+)
 from backend.runtime.a2a import A2ADelegateRequest, A2ARuntimeManager
 
 
@@ -145,6 +152,56 @@ def test_agent_card_exposes_a2a_interfaces() -> None:
         }
     ]
     assert any(skill["id"] == "deep-research" for skill in card["skills"])
+
+
+def test_soulsearcher_deep_research_delegate_metadata_contract() -> None:
+    db = FakeDB()
+    runtime = _runtime(db)
+    task = runtime.service.create_task(
+        db,
+        task_id="a2a_task_local",
+        connection_name="soulsearcher-deep-research",
+        capability="deep-research",
+        input_text="contract research",
+        context_id="ctx-local",
+    )
+    request = A2ADelegateRequest(
+        capability="deep-research",
+        query="contract research",
+        context={
+            "session_id": "local",
+            "turn_id": "turn-1",
+        },
+        options={
+            "client_request_id": "turn-1:deep-research",
+            "model": "contract-model",
+            "retrieval_policy": {"preserve_evidence": True},
+            "skill_ids": ["deep-research"],
+            "deepsearch_config": {"deepsearch_max_seconds": 30},
+            "user_id": "soulclaw",
+        },
+    )
+
+    metadata = runtime._delegate_metadata(task, request)
+    message = runtime._message(
+        "user",
+        request.query,
+        context_id=task.context_id,
+        metadata=metadata,
+    )
+
+    assert metadata["capability"] == "deep-research"
+    assert metadata["soulclaw_task_id"] == "a2a_task_local"
+    assert metadata["client_request_id"] == "turn-1:deep-research"
+    assert metadata["idempotency_key"] == "turn-1:deep-research"
+    assert metadata["user_id"] == "soulclaw"
+    assert metadata["session_id"] == "local"
+    assert metadata["turn_id"] == "turn-1"
+    assert metadata["options"]["retrieval_policy"] == {"preserve_evidence": True}
+    assert metadata["options"]["skill_ids"] == ["deep-research"]
+    assert metadata["options"]["deepsearch_config"] == {"deepsearch_max_seconds": 30}
+    assert message["metadata"] == metadata
+    assert message["contextId"] == "ctx-local"
 
 
 
